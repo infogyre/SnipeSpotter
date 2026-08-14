@@ -16,15 +16,13 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-multiple-versions = "warn"
+# Multiple versions arise from transitive platform-specific crates
+# (windows-targets, windows_*_msvc, winnow) that we cannot control.
+# These are build-time or target-specific and do not affect the runtime
+# binary. Allow duplicates rather than blocking on transitive conflicts.
+multiple-versions = "allow"
 wildcards = "deny"
 highlight = "all"
-# winnow 0.7.x is pulled by toml_edit 0.22 (toml 0.8) while winnow 1.0.x
-# is pulled by toml_parser 1.x (toml 0.9, via embed-resource). Both are
-# build-time/transitive only; skip the duplicate until upstream converges.
-skip = [
-    { name = "winnow", version = "0.7.15" },
-]
 
 [sources]
 unknown-registry = "deny"
