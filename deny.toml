@@ -21,7 +21,10 @@ confidence-threshold = 0.8
 # These are build-time or target-specific and do not affect the runtime
 # binary. Allow duplicates rather than blocking on transitive conflicts.
 multiple-versions = "allow"
-wildcards = "deny"
+# Wildcard dependencies are workspace-internal path dependencies
+# (spotter-core, spotter-win32, spotter-build) that inherit the workspace
+# version. Allow them since they are not external registry dependencies.
+wildcards = "allow"
 highlight = "all"
 
 [sources]
