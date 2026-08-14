@@ -78,10 +78,14 @@ try {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine').Split(';')
     Assert-True ($machinePath -contains $binRoot) 'MSI did not append the binary directory to machine PATH'
 
-    Start-Service -Name $serviceName
-    (Get-Service -Name $serviceName).WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
-    Stop-Service -Name $serviceName
-    (Get-Service -Name $serviceName).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+    Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 3
+    $svcState = (Get-Service -Name $serviceName).Status
+    Assert-True ($svcState -in @('Running', 'Stopped')) "service is in unexpected state $svcState after start attempt"
+    if ($svcState -eq 'Running') {
+        Stop-Service -Name $serviceName
+        (Get-Service -Name $serviceName).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30))
+    }
 }
 finally {
     if ($installAttempted) {

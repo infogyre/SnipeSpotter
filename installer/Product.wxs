@@ -26,7 +26,7 @@
       <Component Directory="BinFolder" Id="ServiceComponent" Bitness="always64">
         <File Id="ServiceExe" Source="$(var.StageDir)\spotter-svc.exe" KeyPath="yes" />
         <ServiceInstall Id="ServiceInstall" Name="SnipeSpotter" DisplayName="SnipeSpotter" Description="Synchronizes hardware inventory with Snipe-IT" Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" />
-        <ServiceControl Id="ServiceControl" Name="SnipeSpotter" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <ServiceControl Id="ServiceControl" Name="SnipeSpotter" Stop="both" Remove="uninstall" Wait="yes" />
       </Component>
       <Component Directory="BinFolder" Id="CliComponent" Bitness="always64">
         <File Id="CliExe" Source="$(var.StageDir)\spotter-cli.exe" KeyPath="yes" />
