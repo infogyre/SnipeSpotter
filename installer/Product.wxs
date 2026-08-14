@@ -32,13 +32,17 @@
         <File Id="CliExe" Source="$(var.StageDir)\spotter-cli.exe" KeyPath="yes" />
         <Environment Id="PathEntry" Name="PATH" Value="[BinFolder]" Action="set" Part="last" System="yes" Permanent="no" />
       </Component>
-      <Component Directory="BinFolder" Id="SymbolsComponent" Bitness="always64">
+      <Component Directory="BinFolder" Id="ServicePdbComponent" Bitness="always64">
         <File Id="ServicePdb" Source="$(var.StageDir)\spotter_svc.pdb" KeyPath="yes" />
-        <File Id="CliPdb" Source="$(var.StageDir)\spotter_cli.pdb" />
       </Component>
-      <Component Directory="SbomFolder" Id="SbomComponent" Bitness="always64">
+      <Component Directory="BinFolder" Id="CliPdbComponent" Bitness="always64">
+        <File Id="CliPdb" Source="$(var.StageDir)\spotter_cli.pdb" KeyPath="yes" />
+      </Component>
+      <Component Directory="SbomFolder" Id="ServiceSbomComponent" Bitness="always64">
         <File Id="ServiceSbom" Source="$(var.StageDir)\sbom\spotter-svc.cdx.json" KeyPath="yes" />
-        <File Id="CliSbom" Source="$(var.StageDir)\sbom\spotter-cli.cdx.json" />
+      </Component>
+      <Component Directory="SbomFolder" Id="CliSbomComponent" Bitness="always64">
+        <File Id="CliSbom" Source="$(var.StageDir)\sbom\spotter-cli.cdx.json" KeyPath="yes" />
       </Component>
       <Component Directory="DataFolder" Id="SettingsComponent" Bitness="always64" NeverOverwrite="yes">
         <CreateFolder>
