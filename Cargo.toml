@@ -17,7 +17,7 @@ license = "MIT"
 authors = ["infogyre"]
 
 [workspace.dependencies]
-anyhow = "=1.0.98"
+anyhow = "=1.0.104"
 base64 = "=0.22.1"
 clap = { version = "=4.5.37", features = ["derive"] }
 serde = { version = "=1.0.228", features = ["derive"] }
@@ -36,9 +36,9 @@ rpassword = "=7.4.0"
 secrecy = "=0.10.3"
 tempfile = "=3.20.0"
 tokio = { version = "=1.44.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "net"] }
-tracing = "=0.1.41"
+tracing = "=0.1.44"
 tracing-appender = "=0.2.3"
-tracing-subscriber = { version = "=0.3.19", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 wiremock = "=0.6.3"
 wmi = "=0.18.4"
 windows = { version = "=0.62.2", features = [
