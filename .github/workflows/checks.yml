@@ -18,7 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
       - name: Workspace formatting
@@ -43,7 +45,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --component clippy
       - name: Workspace tests
@@ -56,7 +60,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Verify workspace package contract
         shell: bash
         run: |
@@ -73,7 +79,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Require all checks to pass
+        env:
+          LINUX_RESULT: ${{ needs.linux-core.result }}
+          WINDOWS_RESULT: ${{ needs.windows-workspace.result }}
+          CONTRACT_RESULT: ${{ needs.package-contract.result }}
         run: |
-          test "${{ needs.linux-core.result }}" = success
-          test "${{ needs.windows-workspace.result }}" = success
-          test "${{ needs.package-contract.result }}" = success
+          test "${LINUX_RESULT}" = success
+          test "${WINDOWS_RESULT}" = success
+          test "${CONTRACT_RESULT}" = success

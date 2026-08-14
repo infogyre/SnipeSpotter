@@ -20,6 +20,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Verify version and main ancestry
         id: version
         shell: bash
@@ -44,6 +45,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
       - name: Test workspace
@@ -80,6 +83,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
       - name: Download binaries
@@ -111,18 +116,22 @@ jobs:
           Move-Item spotter-cli/spotter-cli.cdx.json release-stage/sbom/spotter-cli.cdx.json
       - name: Build MSI from staged binaries
         shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
           $stage = (Resolve-Path release-stage).Path
-          dotnet build installer/Product.wixproj -c Release -p:Platform=x64 -p:ProductVersion=${{ needs.verify.outputs.version }} -p:StageDir="$stage"
+          dotnet build installer/Product.wixproj -c Release -p:Platform=x64 -p:ProductVersion=$env:RELEASE_VERSION -p:StageDir="$stage"
           $msi = Get-ChildItem installer/bin -Recurse -Filter '*.msi' | Select-Object -First 1
           if (-not $msi) { throw 'WiX did not produce an MSI' }
           New-Item -ItemType Directory -Force packaged | Out-Null
-          Copy-Item $msi.FullName "packaged/SnipeSpotter-${{ needs.verify.outputs.version }}-x64.msi"
-          Compress-Archive -Path release-stage/* -DestinationPath "packaged/SnipeSpotter-${{ needs.verify.outputs.version }}-x64-symbols.zip"
+          Copy-Item $msi.FullName "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64.msi"
+          Compress-Archive -Path release-stage/* -DestinationPath "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64-symbols.zip"
       - name: Validate MSI lifecycle
         shell: pwsh
-        run: ./scripts/test-msi-lifecycle.ps1 -MsiPath "packaged/SnipeSpotter-${{ needs.verify.outputs.version }}-x64.msi"
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+        run: ./scripts/test-msi-lifecycle.ps1 -MsiPath "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64.msi"
       - name: Upload MSI lifecycle logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -149,10 +158,12 @@ jobs:
           path: dist
       - name: Generate checksums and inventory
         shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          test -f "dist/SnipeSpotter-${{ needs.verify.outputs.version }}-x64.msi"
-          test -f "dist/SnipeSpotter-${{ needs.verify.outputs.version }}-x64-symbols.zip"
+          test -f "dist/SnipeSpotter-${RELEASE_VERSION}-x64.msi"
+          test -f "dist/SnipeSpotter-${RELEASE_VERSION}-x64-symbols.zip"
           (cd dist && sha256sum SnipeSpotter-* > SHA256SUMS)
           test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
       - name: Upload closed release inventory
