@@ -75,7 +75,7 @@ try {
     Assert-True ($null -ne $systemRule) 'ProgramData ACL does not grant SYSTEM full control'
     Assert-True ($null -ne $adminRule) 'ProgramData ACL does not grant Administrators full control'
 
-    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine').Split(';')
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine').Split(';') | ForEach-Object { $_.TrimEnd('\') }
     Assert-True ($machinePath -contains $binRoot) 'MSI did not append the binary directory to machine PATH'
 
     Start-Service -Name $serviceName -ErrorAction SilentlyContinue
@@ -95,6 +95,6 @@ finally {
 
 Assert-True (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) 'service remains registered after uninstall'
 Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'Program Files installation remains after uninstall'
-$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine').Split(';')
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine').Split(';') | ForEach-Object { $_.TrimEnd('\') }
 Assert-True ($machinePath -notcontains $binRoot) 'machine PATH entry remains after uninstall'
 Write-Host 'MSI lifecycle validation passed'
