@@ -48,4 +48,4 @@ $result = [pscustomobject]@{
 }
 
 $result | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
-Write-Host "WMI monitors fixture written to $OutputPath ($(($entries | Measure-Object).Count) monitors)"
+Write-Output "WMI monitors fixture written to $OutputPath ($(($entries | Measure-Object).Count) monitors)"

@@ -12,12 +12,12 @@ $ErrorActionPreference = 'Stop'
 # Also usable standalone: pwsh scripts/lint-powershell.ps1 scripts/*.ps1
 
 if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
-    Write-Host 'PSScriptAnalyzer not installed — skipping PowerShell lint'
+    Write-Output 'PSScriptAnalyzer not installed -- skipping PowerShell lint'
     exit 0
 }
 
 if (-not $Files -or $Files.Count -eq 0) {
-    Write-Host 'No PowerShell files to lint'
+    Write-Output 'No PowerShell files to lint'
     exit 0
 }
 
@@ -38,4 +38,4 @@ if ($violations.Count -gt 0) {
     exit 1
 }
 
-Write-Host "PSScriptAnalyzer: $($Files.Count) file(s) clean"
+Write-Output "PSScriptAnalyzer: $($Files.Count) file(s) clean"

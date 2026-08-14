@@ -77,4 +77,4 @@ $result = [pscustomobject]@{
 }
 
 $result | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
-Write-Host "Chassis fixture written to $OutputPath (type $primaryType, $($result.type_name), portable=$($result.is_portable))"
+Write-Output "Chassis fixture written to $OutputPath (type $primaryType, $($result.type_name), portable=$($result.is_portable))"

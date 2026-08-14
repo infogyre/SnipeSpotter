@@ -37,7 +37,7 @@ $firmId = [BitConverter]::ToUInt32([System.Text.Encoding]::ASCII.GetBytes('FIRM'
 # First call to get required buffer size
 $size = $type::GetSystemFirmwareTable($type::RSMB, $firmId, $null, 0)
 if ($size -eq 0) {
-    throw "GetSystemFirmwareTable returned zero size — SMBIOS data may be unavailable"
+    throw "GetSystemFirmwareTable returned zero size -- SMBIOS data may be unavailable"
 }
 
 $buffer = New-Object byte[] $size
@@ -65,4 +65,4 @@ $result = [pscustomobject]@{
 }
 
 $result | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $OutputPath -Encoding UTF8
-Write-Host "SMBIOS fixture written to $OutputPath ($($buffer.Length) bytes)"
+Write-Output "SMBIOS fixture written to $OutputPath ($($buffer.Length) bytes)"

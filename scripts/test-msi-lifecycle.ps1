@@ -97,4 +97,4 @@ Assert-True (-not (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
 Assert-True (-not (Test-Path -LiteralPath $installRoot)) 'Program Files installation remains after uninstall'
 $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine').Split(';') | ForEach-Object { $_.TrimEnd('\') }
 Assert-True ($machinePath -notcontains $binRoot) 'machine PATH entry remains after uninstall'
-Write-Host 'MSI lifecycle validation passed'
+Write-Output 'MSI lifecycle validation passed'
