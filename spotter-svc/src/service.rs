@@ -538,8 +538,7 @@ mod tests {
         use spotter_core::{monitors::MonitorSyncEntry, state::AssetSummary};
 
         let seen = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-            .map(|value| value.to_utc())
-            .unwrap_or(DateTime::UNIX_EPOCH);
+            .map_or(DateTime::UNIX_EPOCH, |value| value.to_utc());
         let owner = CommandOwner {
             settings_path: std::path::PathBuf::new(),
             state_path: std::path::PathBuf::new(),

@@ -163,11 +163,11 @@ mod tests {
         release
             .send(())
             .map_err(|()| anyhow::anyhow!("failed to release sync handler"))?;
-        assert!(
-            first.await??
-                == IpcResponse::Ok {
-                    message: String::from("committed")
-                }
+        assert_eq!(
+            first.await??,
+            IpcResponse::Ok {
+                message: String::from("committed")
+            }
         );
         assert_eq!(
             handle.request(ServiceCommand::TriggerSync).await?,

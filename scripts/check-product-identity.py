@@ -4,8 +4,8 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]
 checks = {
     root / "spotter-core/src/identity.rs": ('"SnipeSpotter"', '"infogyre"'),
-    root / "installer/installer.en-us.wxl": (">SnipeSpotter<", ">infogyre<"),
-    root / "installer/Product.wxs": ('Name="SnipeSpotter"', 'Name="infogyre"'),
+    root / "installer/installer.en-us.wxl": ('Value="SnipeSpotter"', 'Value="infogyre"'),
+    root / "installer/Product.wxs": ('!(loc.ProductName)', '!(loc.Manufacturer)'),
 }
 for path, needles in checks.items():
     text = path.read_text(encoding="utf-8")
