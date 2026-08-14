@@ -32,6 +32,7 @@ pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
             .with_context(|| format!("failed to write {}", temporary.display()))?;
         file.sync_all()
             .with_context(|| format!("failed to flush {}", temporary.display()))?;
+        drop(file);
         replace(&temporary, path)?;
         if let Ok(directory) = fs::File::open(parent) {
             let _ = directory.sync_all();
