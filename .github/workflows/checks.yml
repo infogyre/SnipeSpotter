@@ -54,6 +54,26 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Workspace clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: PowerShell script lint
+        shell: pwsh
+        run: |
+          if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
+            Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
+          }
+          $files = Get-ChildItem -Recurse -Filter '*.ps1' -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch '\\target\\' -and $_.FullName -notmatch '\\\.git\\' }
+          if (-not $files) { Write-Host 'No PowerShell files to lint'; exit 0 }
+          $violations = @()
+          foreach ($f in $files) {
+            $r = Invoke-ScriptAnalyzer -Path $f.FullName -Severity Warning, Error
+            if ($r) { $violations += $r }
+          }
+          if ($violations.Count -gt 0) {
+            $violations | Format-Table -AutoSize
+            Write-Error "$($violations.Count) PSScriptAnalyzer violation(s) found"
+            exit 1
+          }
+          Write-Host "PSScriptAnalyzer: $($files.Count) file(s) clean"
 
   package-contract:
     name: Package contract
