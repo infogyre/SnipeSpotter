@@ -32,4 +32,3 @@ windows-service = { workspace = true }
 spotter-build = { path = "../spotter-build" }
 
 [dev-dependencies]
-

@@ -1,0 +1,31 @@
+# prek configuration for SnipeSpotter
+# See https://prek.j178.dev/reference/configuration/ for schema details.
+
+# Built-in offline hooks: zero network setup, Rust-native fast path.
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-added-large-files" },
+  { id = "check-merge-conflict" },
+  { id = "detect-private-key" },
+  { id = "check-toml" },
+  { id = "check-yaml" },
+  { id = "mixed-line-ending", args = ["--fix=lf"] },
+]
+
+# Local hook: lint all .ps1 files anywhere in the repo with PSScriptAnalyzer.
+# Delegates to scripts/lint-powershell.ps1 which gracefully skips when the
+# module is not installed (e.g. on Linux dev machines).
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "powershell-lint"
+name = "PSScriptAnalyzer (lint)"
+description = "Lint PowerShell scripts using PSScriptAnalyzer"
+entry = "pwsh -NoProfile -File scripts/lint-powershell.ps1"
+language = "system"
+files = "\\.ps1$"
+pass_filenames = true

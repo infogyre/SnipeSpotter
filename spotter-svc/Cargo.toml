@@ -43,4 +43,3 @@ spotter-build = { path = "../spotter-build" }
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
-
