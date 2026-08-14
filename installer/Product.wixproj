@@ -3,6 +3,7 @@
     <OutputName>SnipeSpotter</OutputName>
     <OutputType>Package</OutputType>
     <Platform>x64</Platform>
+    <DefineConstants>ProductVersion=$(ProductVersion);StageDir=$(StageDir)</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="WixToolset.Util.wixext" Version="6.0.0" />

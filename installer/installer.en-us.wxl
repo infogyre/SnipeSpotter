@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <WixLocalization xmlns="http://wixtoolset.org/schemas/v4/wxl" Culture="en-US">
-  <String Id="ProductName">SnipeSpotter</String>
-  <String Id="Manufacturer">infogyre</String>
+  <String Id="ProductName" Value="SnipeSpotter" />
+  <String Id="Manufacturer" Value="infogyre" />
 </WixLocalization>
