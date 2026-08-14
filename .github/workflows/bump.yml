@@ -1,0 +1,68 @@
+name: bump version
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: Semantic version component to increment.
+        required: true
+        type: choice
+        options: [patch, minor, major]
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Open version bump PR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Calculate and apply version
+        id: version
+        env:
+          LEVEL: ${{ inputs.level }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          next=$(python3 - "$current" "$LEVEL" <<'PY'
+          import sys
+          major, minor, patch = map(int, sys.argv[1].split('.'))
+          level = sys.argv[2]
+          if level == 'major': major, minor, patch = major + 1, 0, 0
+          elif level == 'minor': minor, patch = minor + 1, 0
+          elif level == 'patch': patch += 1
+          else: raise SystemExit(f'unsupported level: {level}')
+          print(f'{major}.{minor}.{patch}')
+          PY
+          )
+          python3 - "$current" "$next" <<'PY'
+          from pathlib import Path
+          import sys
+          path = Path('Cargo.toml')
+          text = path.read_text()
+          old = f'version = "{sys.argv[1]}"'
+          new = f'version = "{sys.argv[2]}"'
+          if text.count(old) != 1: raise SystemExit('workspace version occurrence is not unique')
+          path.write_text(text.replace(old, new))
+          PY
+          cargo update --workspace
+          cargo metadata --locked --no-deps --format-version 1 >/dev/null
+          printf 'version=%s\n' "$next" >> "$GITHUB_OUTPUT"
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@22a9089034f40e5a961c8808d113e2c98fb63676 # v7
+        with:
+          branch: release/v${{ steps.version.outputs.version }}
+          delete-branch: true
+          commit-message: 'chore(release): v${{ steps.version.outputs.version }}'
+          title: 'chore(release): v${{ steps.version.outputs.version }}'
+          body: |
+            Updates the workspace version and lockfile for `v${{ steps.version.outputs.version }}`.
+          labels: release

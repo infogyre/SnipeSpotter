@@ -1,0 +1,79 @@
+name: checks
+
+on:
+  workflow_call:
+    inputs:
+      force_all:
+        description: Run every check even when paths are unchanged.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  linux-core:
+    name: Linux core checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Workspace formatting
+        run: cargo fmt --all --check
+      - name: Product identity consistency
+        run: python3 scripts/check-product-identity.py
+      - name: Core clippy
+        run: cargo clippy -p spotter-core --all-targets -- -D warnings
+      - name: Core tests
+        run: cargo test -p spotter-core
+      - name: Dependency policy
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
+      - name: Core coverage
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo llvm-cov --package spotter-core --all-features --fail-under-lines 80
+
+  windows-workspace:
+    name: Windows workspace checks
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Workspace tests
+        run: cargo test --workspace --all-targets
+      - name: Workspace clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  package-contract:
+    name: Package contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Verify workspace package contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(len(json.load(sys.stdin)["packages"]))')" -eq 5
+          for package in spotter-core spotter-win32 spotter-build spotter-svc spotter-cli; do
+            cargo metadata --no-deps --format-version 1 | grep -q '"name":"'"$package"'"'
+          done
+
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [linux-core, windows-workspace, package-contract]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all checks to pass
+        run: |
+          test "${{ needs.linux-core.result }}" = success
+          test "${{ needs.windows-workspace.result }}" = success
+          test "${{ needs.package-contract.result }}" = success

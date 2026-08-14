@@ -1,0 +1,17 @@
+[snipeit]
+url = ""
+api_token_encrypted = ""
+checkout_status_id = 0
+checkin_status_id = 0
+
+[polling]
+interval_hours = 4
+
+[logging]
+level = "info"
+max_size_mb = 10
+max_files = 5
+
+[monitors]
+checkin_policy = "manual"
+checkin_threshold_hours = 24

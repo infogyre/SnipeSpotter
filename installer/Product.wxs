@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="!(loc.ProductName)" Manufacturer="!(loc.Manufacturer)" Version="$(var.ProductVersion)" UpgradeCode="8A835AA3-7597-4B65-B10B-7CC41BEE60C4" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of !(loc.ProductName) is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="CompanyFolder" Name="infogyre">
+        <Directory Id="InstallFolder" Name="SnipeSpotter">
+          <Directory Id="BinFolder" Name="bin" />
+          <Directory Id="SbomFolder" Name="sbom" />
+          <Directory Id="SwidFolder" Name="swidtag" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DataCompanyFolder" Name="infogyre">
+        <Directory Id="DataFolder" Name="SnipeSpotter" />
+      </Directory>
+    </StandardDirectory>
+    <Feature Id="MainFeature" Title="!(loc.ProductName)" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+    <Fragment>
+      <ComponentGroup Id="ProductComponents">
+        <Component Directory="BinFolder" Id="ServiceComponent" Bitness="always64">
+          <File Id="ServiceExe" Source="$(var.StageDir)\spotter-svc.exe" KeyPath="yes" />
+          <ServiceInstall Id="ServiceInstall" Name="SnipeSpotter" DisplayName="SnipeSpotter" Description="Synchronizes hardware inventory with Snipe-IT" Type="ownProcess" Start="auto" ErrorControl="normal" Account="LocalSystem" />
+          <ServiceControl Id="ServiceControl" Name="SnipeSpotter" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        </Component>
+        <Component Directory="BinFolder" Id="CliComponent" Bitness="always64">
+          <File Id="CliExe" Source="$(var.StageDir)\spotter-cli.exe" KeyPath="yes" />
+          <Environment Id="PathEntry" Name="PATH" Value="[BinFolder]" Action="set" Part="last" System="yes" Permanent="no" />
+        </Component>
+        <Component Directory="BinFolder" Id="SymbolsComponent" Bitness="always64">
+          <File Id="ServicePdb" Source="$(var.StageDir)\spotter_svc.pdb" KeyPath="yes" />
+          <File Id="CliPdb" Source="$(var.StageDir)\spotter_cli.pdb" />
+        </Component>
+        <Component Directory="SbomFolder" Id="SbomComponent" Bitness="always64">
+          <File Id="ServiceSbom" Source="$(var.StageDir)\sbom\spotter-svc.cdx.json" KeyPath="yes" />
+          <File Id="CliSbom" Source="$(var.StageDir)\sbom\spotter-cli.cdx.json" />
+        </Component>
+        <Component Directory="DataFolder" Id="SettingsComponent" Bitness="always64" NeverOverwrite="yes">
+          <CreateFolder>
+            <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+            <util:PermissionEx User="Administrators" GenericAll="yes" />
+          </CreateFolder>
+          <File Id="SettingsTemplate" Source="settings.toml" Name="settings.toml" KeyPath="yes" />
+        </Component>
+      </ComponentGroup>
+    </Fragment>
+  </Package>
+</Wix>

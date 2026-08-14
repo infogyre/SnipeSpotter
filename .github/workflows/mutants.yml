@@ -1,0 +1,23 @@
+name: mutation tests
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  core-mutants:
+    name: Core mutation tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run core mutation tests
+        run: cargo mutants -p spotter-core --in-place --locked --timeout 120

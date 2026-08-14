@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      run_checks: ${{ steps.filter.outputs.run_checks }}
+      force_all: ${{ steps.filter.outputs.force_all }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Filter paths
+        id: filter
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.30
+        with:
+          filters: |
+            run_checks:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+              - '.github/workflows/**'
+              - 'spotter-*/**'
+              - 'scripts/**'
+            force_all:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'deny.toml'
+              - '.github/workflows/**'
+
+  checks:
+    name: Reusable checks
+    needs: changes
+    if: needs.changes.outputs.run_checks == 'true'
+    uses: ./.github/workflows/checks.yml
+    with:
+      force_all: ${{ needs.changes.outputs.force_all == 'true' }}
+
+  ci-success:
+    name: CI success
+    if: always()
+    needs: [changes, checks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require checks when applicable
+        run: |
+          if [ "${{ needs.changes.outputs.run_checks }}" = "true" ]; then
+            test "${{ needs.checks.result }}" = success
+          fi

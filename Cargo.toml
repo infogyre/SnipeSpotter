@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "spotter-core",
+    "spotter-win32",
+    "spotter-build",
+    "spotter-svc",
+    "spotter-cli",
+]
+default-members = ["spotter-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+authors = ["infogyre"]
+
+[workspace.dependencies]
+anyhow = "=1.0.98"
+base64 = "=0.22.1"
+clap = { version = "=4.5.37", features = ["derive"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.145"
+thiserror = "=2.0.12"
+chrono = { version = "=0.4.41", features = ["serde", "clock"] }
+embed-resource = "=3.0.5"
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
+subtle = "=2.6.1"
+toml = "=0.8.23"
+proptest = "=1.6.0"
+getrandom = "=0.3.3"
+reqwest = { version = "=0.12.15", default-features = false, features = ["json"] }
+rpassword = "=7.4.0"
+secrecy = "=0.10.3"
+tempfile = "=3.20.0"
+tokio = { version = "=1.44.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "net"] }
+tracing = "=0.1.41"
+tracing-appender = "=0.2.3"
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter", "fmt"] }
+wiremock = "=0.6.3"
+wmi = "=0.18.4"
+windows = { version = "=0.62.2", features = [
+    "Foundation",
+    "Security",
+    "Storage",
+    "System",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Services",
+] }
+windows-service = "=0.8.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(windows)"] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+format_push_string = "deny"
+
+[profile.release]
+debug = "limited"

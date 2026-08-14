@@ -1,0 +1,22 @@
+/target/
+/.env
+/.env.op
+/.envrc
+/.direnv/
+
+# WiX and .NET build output
+/installer/bin/
+/installer/obj/
+
+# Release staging and generated artifacts
+/release-stage/
+/packaged/
+/dist/
+*.msi
+*.wixpdb
+
+# Editor and OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
