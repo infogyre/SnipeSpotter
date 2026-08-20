@@ -211,4 +211,51 @@ mod tests {
         assert!(BLANK_SETTINGS_TOML.contains("checkin_policy = \"manual\""));
         Ok(())
     }
+
+    #[test]
+    fn old_settings_with_missing_sections_use_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        let settings: Settings = toml::from_str(
+            r#"[snipeit]
+url = "https://snipe-it.example.com"
+api_token_encrypted = "c2VjcmV0"
+checkout_status_id = 1
+checkin_status_id = 2
+"#,
+        )?;
+        assert_eq!(settings.snipeit.url, "https://snipe-it.example.com");
+        assert_eq!(settings.polling, PollingSettings::default());
+        assert_eq!(settings.logging, LoggingSettings::default());
+        assert_eq!(settings.monitors, MonitorSettings::default());
+        Ok(())
+    }
+
+    #[test]
+    fn partial_section_settings_fill_field_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        let settings: Settings = toml::from_str(
+            r"[polling]
+interval_hours = 12
+",
+        )?;
+        assert_eq!(settings.polling.interval_hours, 12);
+        assert_eq!(settings.logging, LoggingSettings::default());
+        assert_eq!(settings.monitors, MonitorSettings::default());
+        assert!(settings.snipeit.url.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_future_fields_are_ignored() -> Result<(), Box<dyn std::error::Error>> {
+        let settings: Settings = toml::from_str(
+            r#"future_option = true
+
+[logging]
+level = "debug"
+future_retention_mode = "size"
+"#,
+        )?;
+        assert_eq!(settings.logging.level, "debug");
+        assert_eq!(settings.logging.max_size_mb, 10);
+        assert_eq!(settings.logging.max_files, 5);
+        Ok(())
+    }
 }
