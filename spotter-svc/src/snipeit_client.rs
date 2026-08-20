@@ -272,7 +272,7 @@ mod tests {
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path, query_param},
+        matchers::{body_json, header, method, path, query_param},
     };
 
     #[tokio::test]
@@ -419,20 +419,21 @@ mod tests {
             ..Default::default()
         };
         for (status, header, expected) in [
-            (
-                401,
-                None,
-                SnipeItError::AuthFailure,
-            ),
+            (401, None, SnipeItError::AuthFailure),
             (
                 429,
                 Some(("Retry-After", "5")),
-                SnipeItError::RateLimited { retry_after: Some(5) },
+                SnipeItError::RateLimited {
+                    retry_after: Some(5),
+                },
             ),
             (
                 500,
                 None,
-                SnipeItError::ServerError { status: 500, message: String::from("internal") },
+                SnipeItError::ServerError {
+                    status: 500,
+                    message: String::from("internal"),
+                },
             ),
         ] {
             let server = MockServer::start().await;
@@ -446,8 +447,7 @@ mod tests {
                 .respond_with(template)
                 .mount(&server)
                 .await;
-            let client =
-                SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
             assert_eq!(client.patch_asset(7, &request).await, Err(expected));
         }
         Ok(())
@@ -459,8 +459,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/hardware/200/checkout"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"rows":[{"id":100}]})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"rows":[{"id":100}]})),
             )
             .mount(&server)
             .await;
@@ -481,12 +480,14 @@ mod tests {
             (
                 429,
                 Some(("Retry-After", "12")),
-                SnipeItError::RateLimited { retry_after: Some(12) },
+                SnipeItError::RateLimited {
+                    retry_after: Some(12),
+                },
             ),
         ] {
             let server = MockServer::start().await;
-            let mut template = ResponseTemplate::new(status)
-                .set_body_json(serde_json::json!({"message":"err"}));
+            let mut template =
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({"message":"err"}));
             if let Some((k, v)) = header {
                 template = template.insert_header(k, v);
             }
@@ -495,8 +496,7 @@ mod tests {
                 .respond_with(template)
                 .mount(&server)
                 .await;
-            let client =
-                SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
             let request = CheckoutRequest {
                 checkout_to_type: String::from("asset"),
                 assigned_asset: 1,
@@ -513,9 +513,8 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/hardware/300/checkin"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({"status":"success","payload":{"id":300}}),
-                ),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"status":"success","payload":{"id":300}})),
             )
             .mount(&server)
             .await;
@@ -531,8 +530,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/v1/hardware/301/checkin"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"rows":[{"id":301}]})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"rows":[{"id":301}]})),
             )
             .mount(&server)
             .await;
@@ -550,17 +548,22 @@ mod tests {
             (
                 429,
                 Some(("Retry-After", "30")),
-                SnipeItError::RateLimited { retry_after: Some(30) },
+                SnipeItError::RateLimited {
+                    retry_after: Some(30),
+                },
             ),
             (
                 500,
                 None,
-                SnipeItError::ServerError { status: 500, message: String::from("err") },
+                SnipeItError::ServerError {
+                    status: 500,
+                    message: String::from("err"),
+                },
             ),
         ] {
             let server = MockServer::start().await;
-            let mut template = ResponseTemplate::new(status)
-                .set_body_json(serde_json::json!({"message":"err"}));
+            let mut template =
+                ResponseTemplate::new(status).set_body_json(serde_json::json!({"message":"err"}));
             if let Some((k, v)) = header {
                 template = template.insert_header(k, v);
             }
@@ -569,8 +572,7 @@ mod tests {
                 .respond_with(template)
                 .mount(&server)
                 .await;
-            let client =
-                SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
             let request = CheckinRequest { status_id: 1 };
             assert_eq!(client.checkin_asset(9, &request).await, Err(expected));
         }
@@ -583,11 +585,9 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/manufacturers"))
             .and(query_param("search", "Dell"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({"rows":[{"id":1,"name":"Dell Inc"},{"id":2,"name":"Dell EMC"}]}),
-                ),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"rows":[{"id":1,"name":"Dell Inc"},{"id":2,"name":"Dell EMC"}]}),
+            ))
             .mount(&server)
             .await;
         let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
@@ -609,8 +609,7 @@ mod tests {
             .and(query_param("search", "ThinkPad"))
             .and(query_param("offset", "0"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"rows": rows_page1})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"rows": rows_page1})),
             )
             .mount(&server)
             .await;
@@ -649,6 +648,121 @@ mod tests {
             client.find_categories("Monitor").await,
             Err(SnipeItError::AuthFailure)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutations_send_bearer_auth_and_expected_json_bodies() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/hardware/42"))
+            .and(header("authorization", "Bearer token"))
+            .and(body_json(serde_json::json!({"serial":"NEW"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"payload":{"id":42,"serial":"NEW"}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hardware/42/checkout"))
+            .and(header("authorization", "Bearer token"))
+            .and(body_json(serde_json::json!({
+                "checkout_to_type": "asset",
+                "assigned_asset": 100,
+                "status_id": 3
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"rows":[{"id":42}]})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hardware/42/checkin"))
+            .and(header("authorization", "Bearer token"))
+            .and(body_json(serde_json::json!({"status_id":4})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"status":"success","payload":{"id":42}})),
+            )
+            .mount(&server)
+            .await;
+
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("token")))?;
+        let patch = AssetPatchRequest {
+            serial: Some(String::from("NEW")),
+            ..Default::default()
+        };
+        client.patch_asset(42, &patch).await?;
+        client
+            .checkout_asset(
+                42,
+                &CheckoutRequest {
+                    checkout_to_type: String::from("asset"),
+                    assigned_asset: 100,
+                    status_id: 3,
+                },
+            )
+            .await?;
+        client
+            .checkin_asset(42, &CheckinRequest { status_id: 4 })
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutation_timeouts_are_network_errors() -> Result<()> {
+        for (endpoint, method_name) in [
+            ("/api/v1/hardware/42", "PATCH"),
+            ("/api/v1/hardware/42/checkout", "POST"),
+            ("/api/v1/hardware/42/checkin", "POST"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method(method_name))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(2))
+                        .set_body_json(serde_json::json!({"status":"success","payload":{"id":42}})),
+                )
+                .mount(&server)
+                .await;
+            let client = SnipeItClient::with_timeout(
+                server.uri(),
+                SecretString::from(String::from("token")),
+                Duration::from_millis(100),
+            )?;
+            let result = match method_name {
+                "PATCH" => client
+                    .patch_asset(
+                        42,
+                        &AssetPatchRequest {
+                            serial: Some(String::from("X")),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ()),
+                _ if endpoint.ends_with("checkout") => {
+                    client
+                        .checkout_asset(
+                            42,
+                            &CheckoutRequest {
+                                checkout_to_type: String::from("asset"),
+                                assigned_asset: 100,
+                                status_id: 3,
+                            },
+                        )
+                        .await
+                }
+                _ => {
+                    client
+                        .checkin_asset(42, &CheckinRequest { status_id: 4 })
+                        .await
+                }
+            };
+            assert!(matches!(result, Err(SnipeItError::NetworkError { .. })));
+        }
         Ok(())
     }
 }
