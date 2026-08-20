@@ -189,4 +189,21 @@ mod tests {
             .is_err()
         );
     }
+
+    #[tokio::test]
+    async fn reports_unavailable_loop_when_sender_is_closed() -> Result<()> {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let handle = FsmHandle {
+            sender,
+            sync_pending: Arc::new(AtomicBool::new(false)),
+        };
+
+        let error = handle
+            .request(ServiceCommand::GetStatus)
+            .await
+            .expect_err("closed loop");
+        assert!(error.to_string().contains("unavailable"));
+        Ok(())
+    }
 }
