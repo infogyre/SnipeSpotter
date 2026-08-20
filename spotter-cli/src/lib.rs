@@ -492,6 +492,33 @@ mod tests {
             })
         }
     }
+
+    struct ResponseTransport {
+        sent: Vec<ServiceCommand>,
+        response: IpcResponse,
+    }
+    impl IpcTransport for ResponseTransport {
+        fn send(&mut self, command: &ServiceCommand) -> Result<IpcResponse> {
+            self.sent.push(command.clone());
+            Ok(self.response.clone())
+        }
+    }
+
+    struct RecordingRegistrar {
+        installs: usize,
+        uninstalls: usize,
+    }
+    impl ServiceRegistrar for RecordingRegistrar {
+        fn install(&mut self) -> Result<()> {
+            self.installs += 1;
+            Ok(())
+        }
+
+        fn uninstall(&mut self) -> Result<()> {
+            self.uninstalls += 1;
+            Ok(())
+        }
+    }
     impl TokenReader for Fake {
         fn read_token(&mut self) -> Result<String> {
             Ok(String::from("secret"))
@@ -658,5 +685,166 @@ mod tests {
         let error = anyhow::Error::new(ServiceUnavailable);
         assert_eq!(exit_code(&error), EXIT_SERVICE_UNAVAILABLE);
         assert_eq!(exit_code(&anyhow::anyhow!("other")), 1);
+    }
+
+    #[test]
+    fn config_commands_validate_and_send_typed_requests() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "spotter-cli",
+            "config",
+            "set",
+            "polling.interval_hours",
+            "12",
+        ])?;
+        let mut transport = Fake { sent: Vec::new() };
+        let mut tokens = Fake { sent: Vec::new() };
+        let mut registrar = Fake { sent: Vec::new() };
+        let mut confirmation = Confirmation {
+            answer: true,
+            prompts: 0,
+        };
+        dispatch(
+            &cli,
+            &mut transport,
+            &mut tokens,
+            &mut registrar,
+            &Elevated(true),
+            &mut confirmation,
+        )?;
+        assert_eq!(
+            transport.sent,
+            vec![ServiceCommand::SetConfig {
+                field: String::from("polling.interval_hours"),
+                value: String::from("12"),
+            }]
+        );
+
+        let invalid = Cli::try_parse_from([
+            "spotter-cli",
+            "config",
+            "set",
+            "polling.interval_hours",
+            "0",
+        ])?;
+        let error = dispatch(
+            &invalid,
+            &mut transport,
+            &mut tokens,
+            &mut registrar,
+            &Elevated(true),
+            &mut confirmation,
+        )
+        .expect_err("invalid setting must be rejected before transport");
+        assert!(error.to_string().contains("between 1 and 168"));
+        assert_eq!(transport.sent.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn status_full_and_json_render_expected_fields() -> Result<()> {
+        let response = IpcResponse::StatusFull {
+            state: String::from("Idle"),
+            last_sync: Some(String::from("2026-01-02T00:00:00Z")),
+            next_sync: None,
+            snipeit_url: String::from("https://snipe.example.test"),
+            matched_asset: None,
+            monitors: Vec::new(),
+        };
+        let mut transport = ResponseTransport {
+            sent: Vec::new(),
+            response,
+        };
+        let mut tokens = Fake { sent: Vec::new() };
+        let mut registrar = Fake { sent: Vec::new() };
+        let mut confirmation = Confirmation {
+            answer: true,
+            prompts: 0,
+        };
+        let cli = Cli::try_parse_from(["spotter-cli", "status", "--full"])?;
+        let output = dispatch(
+            &cli,
+            &mut transport,
+            &mut tokens,
+            &mut registrar,
+            &Elevated(true),
+            &mut confirmation,
+        )?;
+        assert!(output.contains("State: Idle"));
+        assert!(output.contains("Snipe-IT Instance: https://snipe.example.test"));
+        assert_eq!(transport.sent, vec![ServiceCommand::GetStatusFull]);
+
+        let json_cli = Cli::try_parse_from(["spotter-cli", "--json", "status"])?;
+        let json = dispatch(
+            &json_cli,
+            &mut transport,
+            &mut tokens,
+            &mut registrar,
+            &Elevated(true),
+            &mut confirmation,
+        )?;
+        assert!(json.contains("\"type\": \"status_full\""));
+        Ok(())
+    }
+
+    #[test]
+    fn checkin_all_yes_sends_force_command_without_prompt() -> Result<()> {
+        let cli = Cli::try_parse_from(["spotter-cli", "checkin", "--all", "-y"])?;
+        let mut transport = Fake { sent: Vec::new() };
+        let mut tokens = Fake { sent: Vec::new() };
+        let mut registrar = Fake { sent: Vec::new() };
+        let mut confirmation = Confirmation {
+            answer: false,
+            prompts: 0,
+        };
+        dispatch(
+            &cli,
+            &mut transport,
+            &mut tokens,
+            &mut registrar,
+            &Elevated(true),
+            &mut confirmation,
+        )?;
+        assert_eq!(confirmation.prompts, 0);
+        assert_eq!(transport.sent, vec![ServiceCommand::CheckinAll]);
+        Ok(())
+    }
+
+    #[test]
+    fn service_commands_call_the_matching_registrar_operation() -> Result<()> {
+        let mut transport = Fake { sent: Vec::new() };
+        let mut tokens = Fake { sent: Vec::new() };
+        let mut registrar = RecordingRegistrar {
+            installs: 0,
+            uninstalls: 0,
+        };
+        let mut confirmation = Confirmation {
+            answer: true,
+            prompts: 0,
+        };
+        let install = Cli::try_parse_from(["spotter-cli", "service", "install"])?;
+        assert_eq!(
+            dispatch(
+                &install,
+                &mut transport,
+                &mut tokens,
+                &mut registrar,
+                &Elevated(true),
+                &mut confirmation,
+            )?,
+            "ok"
+        );
+        let uninstall = Cli::try_parse_from(["spotter-cli", "service", "uninstall"])?;
+        dispatch(
+            &uninstall,
+            &mut transport,
+            &mut tokens,
+            &mut registrar,
+            &Elevated(true),
+            &mut confirmation,
+        )?;
+        assert_eq!(registrar.installs, 1);
+        assert_eq!(registrar.uninstalls, 1);
+        assert!(transport.sent.is_empty());
+        Ok(())
     }
 }
