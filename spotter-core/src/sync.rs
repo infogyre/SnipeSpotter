@@ -264,6 +264,35 @@ mod tests {
         }
     }
 
+    fn matching_asset() -> Asset {
+        Asset {
+            serial: Some(String::from("SYS")),
+            model: Some(AssetModel {
+                id: 4,
+                ..AssetModel::default()
+            }),
+            ..asset()
+        }
+    }
+
+    fn monitor(serial: &str) -> MonitorInfo {
+        MonitorInfo {
+            manufacturer_code: String::from("DEL"),
+            product_code: String::from("1"),
+            serial: String::from(serial),
+            manufacture_week: 1,
+            manufacture_year: 2026,
+        }
+    }
+
+    fn resolved_monitor(serial: &str, asset_id: Option<u64>) -> ResolvedMonitor {
+        ResolvedMonitor {
+            monitor: monitor(serial),
+            asset_id,
+            taxonomy: taxonomy(4),
+        }
+    }
+
     #[test]
     fn patches_resolved_model_and_preserves_checkout_ids() {
         let monitor = ResolvedMonitor {
@@ -301,6 +330,124 @@ mod tests {
             plan.next_monitor_state.entries[0].snipeit_asset_id,
             Some(200)
         );
+        assert!(plan.next_monitor_state.entries[0].checked_out);
+    }
+
+    #[test]
+    fn no_changes_produce_empty_plan() {
+        let monitor_state = MonitorSyncState {
+            entries: vec![MonitorSyncEntry {
+                serial: String::from("MON"),
+                snipeit_asset_id: Some(200),
+                last_seen: now(),
+                absent_since: None,
+                checked_out: true,
+            }],
+        };
+        let plan = plan_sync(
+            &system(3),
+            &taxonomy(4),
+            &[resolved_monitor("MON", Some(200))],
+            Some(&matching_asset()),
+            &monitor_state,
+            &MonitorSettings::default(),
+            &ResolvedStatusIds {
+                checkout: 5,
+                checkin: 6,
+            },
+            now(),
+        );
+
+        assert!(plan.asset_update.is_none());
+        assert!(plan.monitor_checkouts.is_empty());
+        assert!(plan.monitor_checkins.is_empty());
+        assert!(plan.warnings.is_empty());
+        assert_eq!(plan.next_monitor_state, monitor_state);
+    }
+
+    #[test]
+    fn missing_computer_asset_suppresses_monitor_checkout() {
+        let plan = plan_sync(
+            &system(3),
+            &taxonomy(4),
+            &[resolved_monitor("MON", Some(200))],
+            None,
+            &MonitorSyncState::default(),
+            &MonitorSettings::default(),
+            &ResolvedStatusIds {
+                checkout: 5,
+                checkin: 6,
+            },
+            now(),
+        );
+
+        assert!(plan.asset_update.is_none());
+        assert!(plan.monitor_checkouts.is_empty());
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("computer asset is missing"))
+        );
+        assert_eq!(
+            plan.next_monitor_state.entries[0].snipeit_asset_id,
+            Some(200)
+        );
+        assert!(!plan.next_monitor_state.entries[0].checked_out);
+    }
+
+    #[test]
+    fn missing_monitor_asset_suppresses_checkout() {
+        let plan = plan_sync(
+            &system(3),
+            &taxonomy(4),
+            &[resolved_monitor("MON", None)],
+            Some(&matching_asset()),
+            &MonitorSyncState::default(),
+            &MonitorSettings::default(),
+            &ResolvedStatusIds {
+                checkout: 5,
+                checkin: 6,
+            },
+            now(),
+        );
+
+        assert!(plan.asset_update.is_none());
+        assert!(plan.monitor_checkouts.is_empty());
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("has no matching Snipe-IT asset"))
+        );
+        assert_eq!(plan.next_monitor_state.entries[0].snipeit_asset_id, None);
+    }
+
+    #[test]
+    fn already_checked_out_monitor_is_not_checked_out_again() {
+        let monitor_state = MonitorSyncState {
+            entries: vec![MonitorSyncEntry {
+                serial: String::from("MON"),
+                snipeit_asset_id: Some(200),
+                last_seen: now(),
+                absent_since: None,
+                checked_out: true,
+            }],
+        };
+        let plan = plan_sync(
+            &system(3),
+            &taxonomy(4),
+            &[resolved_monitor("MON", Some(200))],
+            Some(&matching_asset()),
+            &monitor_state,
+            &MonitorSettings::default(),
+            &ResolvedStatusIds {
+                checkout: 5,
+                checkin: 6,
+            },
+            now(),
+        );
+
+        assert!(plan.monitor_checkouts.is_empty());
+        assert!(plan.warnings.is_empty());
         assert!(plan.next_monitor_state.entries[0].checked_out);
     }
 
