@@ -272,7 +272,7 @@ mod tests {
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{method, path, query_param},
     };
 
     #[tokio::test]
@@ -368,6 +368,286 @@ mod tests {
             Err(SnipeItError::RateLimited {
                 retry_after: Some(9)
             })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn byserial_collection_response_returns_first_row() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hardware/byserial/SER1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"total":2,"rows":[{"id":11,"serial":"SER1"},{"id":12,"serial":"SER1"}]}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        assert_eq!(client.find_asset_by_serial("SER1").await?.id, 11);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn patch_asset_returns_updated_asset() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/api/v1/hardware/42"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"payload":{"id":42,"serial":"NEW","name":"PC"}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let request = AssetPatchRequest {
+            serial: Some(String::from("NEW")),
+            ..Default::default()
+        };
+        let asset = client.patch_asset(42, &request).await?;
+        assert_eq!(asset.id, 42);
+        assert_eq!(asset.serial.as_deref(), Some("NEW"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn patch_asset_propagates_auth_and_rate_limit_errors() -> Result<()> {
+        let request = AssetPatchRequest {
+            serial: Some(String::from("X")),
+            ..Default::default()
+        };
+        for (status, header, expected) in [
+            (
+                401,
+                None,
+                SnipeItError::AuthFailure,
+            ),
+            (
+                429,
+                Some(("Retry-After", "5")),
+                SnipeItError::RateLimited { retry_after: Some(5) },
+            ),
+            (
+                500,
+                None,
+                SnipeItError::ServerError { status: 500, message: String::from("internal") },
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let mut template = ResponseTemplate::new(status)
+                .set_body_json(serde_json::json!({"message":"internal"}));
+            if let Some((k, v)) = header {
+                template = template.insert_header(k, v);
+            }
+            Mock::given(method("PATCH"))
+                .and(path("/api/v1/hardware/7"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let client =
+                SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            assert_eq!(client.patch_asset(7, &request).await, Err(expected));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkout_asset_succeeds_on_rows_response() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hardware/200/checkout"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"rows":[{"id":100}]})),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let request = CheckoutRequest {
+            checkout_to_type: String::from("asset"),
+            assigned_asset: 100,
+            status_id: 3,
+        };
+        client.checkout_asset(200, &request).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkout_asset_propagates_errors() -> Result<()> {
+        for (status, header, expected) in [
+            (401, None, SnipeItError::AuthFailure),
+            (
+                429,
+                Some(("Retry-After", "12")),
+                SnipeItError::RateLimited { retry_after: Some(12) },
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let mut template = ResponseTemplate::new(status)
+                .set_body_json(serde_json::json!({"message":"err"}));
+            if let Some((k, v)) = header {
+                template = template.insert_header(k, v);
+            }
+            Mock::given(method("POST"))
+                .and(path("/api/v1/hardware/5/checkout"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let client =
+                SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let request = CheckoutRequest {
+                checkout_to_type: String::from("asset"),
+                assigned_asset: 1,
+                status_id: 1,
+            };
+            assert_eq!(client.checkout_asset(5, &request).await, Err(expected));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkin_asset_succeeds_on_status_success_response() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hardware/300/checkin"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"status":"success","payload":{"id":300}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let request = CheckinRequest { status_id: 4 };
+        client.checkin_asset(300, &request).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkin_asset_succeeds_on_rows_response() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/hardware/301/checkin"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"rows":[{"id":301}]})),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let request = CheckinRequest { status_id: 4 };
+        client.checkin_asset(301, &request).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkin_asset_propagates_errors() -> Result<()> {
+        for (status, header, expected) in [
+            (401, None, SnipeItError::AuthFailure),
+            (403, None, SnipeItError::PermissionDenied),
+            (
+                429,
+                Some(("Retry-After", "30")),
+                SnipeItError::RateLimited { retry_after: Some(30) },
+            ),
+            (
+                500,
+                None,
+                SnipeItError::ServerError { status: 500, message: String::from("err") },
+            ),
+        ] {
+            let server = MockServer::start().await;
+            let mut template = ResponseTemplate::new(status)
+                .set_body_json(serde_json::json!({"message":"err"}));
+            if let Some((k, v)) = header {
+                template = template.insert_header(k, v);
+            }
+            Mock::given(method("POST"))
+                .and(path("/api/v1/hardware/9/checkin"))
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let client =
+                SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let request = CheckinRequest { status_id: 1 };
+            assert_eq!(client.checkin_asset(9, &request).await, Err(expected));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_manufacturers_returns_all_rows() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/manufacturers"))
+            .and(query_param("search", "Dell"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"rows":[{"id":1,"name":"Dell Inc"},{"id":2,"name":"Dell EMC"}]}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let results = client.find_manufacturers("Dell").await?;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn find_models_paginates_across_pages() -> Result<()> {
+        let server = MockServer::start().await;
+        // First page: exactly 100 rows
+        let rows_page1: Vec<_> = (1_u64..=100)
+            .map(|id| serde_json::json!({"id": id, "name": format!("Model{id}")}))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/models"))
+            .and(query_param("search", "ThinkPad"))
+            .and(query_param("offset", "0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"rows": rows_page1})),
+            )
+            .mount(&server)
+            .await;
+        // Second page: 2 rows (stops pagination)
+        Mock::given(method("GET"))
+            .and(path("/api/v1/models"))
+            .and(query_param("search", "ThinkPad"))
+            .and(query_param("offset", "100"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"rows":[{"id":101,"name":"ThinkPad T14"},{"id":102,"name":"ThinkPad T15"}]}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let results = client.find_models("ThinkPad").await?;
+        assert_eq!(results.len(), 102);
+        assert_eq!(results[100].id, 101);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn taxonomy_lookup_propagates_auth_error() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/categories"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_body_json(serde_json::json!({"message":"unauthorized"})),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        assert_eq!(
+            client.find_categories("Monitor").await,
+            Err(SnipeItError::AuthFailure)
         );
         Ok(())
     }
