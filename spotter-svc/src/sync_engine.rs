@@ -137,7 +137,7 @@ pub async fn execute_plan(
 ) -> Result<ExecutionOutcome> {
     let mut confirmed = Vec::new();
     if let (Some(request), Some(asset_id)) = (&plan.asset_update, computer_asset_id) {
-        let operation_id = format!("patch:{asset_id}:{}", stable_json(request)?);
+        let operation_id = format!("patch:{asset_id}:{}", serialize_operation(request)?);
         prepare(journal_path, &operation_id, request)?;
         remote.patch_asset(asset_id, request).await?;
         confirm(journal_path, &operation_id)?;
@@ -266,7 +266,7 @@ fn patch_asset_id(operation_id: &str) -> Result<Option<u64>> {
     Ok(Some(asset_id))
 }
 
-fn stable_json<T: serde::Serialize>(value: &T) -> Result<String> {
+fn serialize_operation<T: serde::Serialize>(value: &T) -> Result<String> {
     Ok(serde_json::to_string(value)?)
 }
 
