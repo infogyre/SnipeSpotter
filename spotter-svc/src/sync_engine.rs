@@ -275,12 +275,13 @@ mod tests {
     use super::*;
     use spotter_core::{
         monitors::MonitorSyncState,
-        snipeit::{CheckoutRequest, MonitorCheckout},
+        snipeit::{CheckinRequest, CheckoutRequest, MonitorCheckin, MonitorCheckout},
     };
 
     #[derive(Default)]
     struct FakeRemote {
         fail_checkout: bool,
+        fail_checkin: bool,
         calls: Vec<String>,
     }
     impl RemoteMutations for FakeRemote {
@@ -312,6 +313,9 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
             Box::pin(async move {
                 self.calls.push(operation.operation_id.clone());
+                if self.fail_checkin {
+                    anyhow::bail!("injected check-in failure")
+                }
                 Ok(())
             })
         }
@@ -332,6 +336,14 @@ mod tests {
             monitor_checkins: Vec::new(),
             next_monitor_state: MonitorSyncState::default(),
             warnings: Vec::new(),
+        }
+    }
+
+    fn checkin_operation() -> MonitorCheckin {
+        MonitorCheckin {
+            operation_id: String::from("checkin:1"),
+            source_asset_id: 1,
+            request: CheckinRequest { status_id: 4 },
         }
     }
 
@@ -528,6 +540,125 @@ mod tests {
             .checkout(&checkout_plan().monitor_checkouts[0])
             .await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn execute_plan_orders_patch_checkout_and_checkin() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("journal");
+        let mut plan = checkout_plan();
+        plan.asset_update = Some(AssetPatchRequest {
+            serial: Some(String::from("SYS")),
+            ..AssetPatchRequest::default()
+        });
+        plan.monitor_checkins.push(checkin_operation());
+        let mut remote = FakeRemote::default();
+        let outcome = execute_plan(plan, Some(9), &path, &mut remote).await?;
+
+        assert_eq!(
+            remote.calls,
+            vec![
+                String::from("patch:9"),
+                String::from("checkout:1"),
+                String::from("checkin:1"),
+            ]
+        );
+        assert_eq!(
+            outcome.confirmed_operations,
+            vec![
+                String::from("patch:9:{\"serial\":\"SYS\"}"),
+                String::from("checkout:1"),
+                String::from("checkin:1"),
+            ]
+        );
+        assert!(operation_journal::pending(&operation_journal::load(&path)?).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkin_failure_leaves_only_failing_operation_prepared() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("journal");
+        let mut plan = checkout_plan();
+        plan.monitor_checkins.push(checkin_operation());
+        let mut remote = FakeRemote {
+            fail_checkin: true,
+            ..FakeRemote::default()
+        };
+        assert!(
+            execute_plan(plan, Some(2), &path, &mut remote)
+                .await
+                .is_err()
+        );
+        let pending = operation_journal::pending(&operation_journal::load(&path)?);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "checkin:1");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_replays_checkin_and_compacts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("journal");
+        let operation = checkin_operation();
+        operation_journal::append(
+            &path,
+            &JournalRecord::Prepared {
+                operation_id: operation.operation_id.clone(),
+                operation: serde_json::to_value(&operation)?,
+            },
+        )?;
+        let mut remote = FakeRemote::default();
+        let confirmed = recover_pending(&path, &mut remote).await?;
+        assert_eq!(confirmed, vec![String::from("checkin:1")]);
+        assert_eq!(remote.calls, vec![String::from("checkin:1")]);
+        assert!(operation_journal::load(&path)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn desired_checkout_and_checkin_state_require_both_assignment_fields() {
+        use spotter_core::snipeit::NamedReference;
+
+        let checkout = checkout_plan().monitor_checkouts[0].clone();
+        let assigned_only = Asset {
+            assigned_to: Some(NamedReference {
+                id: 2,
+                name: String::from("computer"),
+            }),
+            ..Asset::default()
+        };
+        assert!(!checkout_is_applied(&assigned_only, &checkout));
+        let checked_out = Asset {
+            assigned_to: Some(NamedReference {
+                id: 2,
+                name: String::from("computer"),
+            }),
+            status_label: Some(NamedReference {
+                id: 3,
+                name: String::from("deployed"),
+            }),
+            ..Asset::default()
+        };
+        assert!(checkout_is_applied(&checked_out, &checkout));
+
+        let checkin = checkin_operation();
+        let available = Asset {
+            status_label: Some(NamedReference {
+                id: 4,
+                name: String::from("available"),
+            }),
+            ..Asset::default()
+        };
+        assert!(checkin_is_applied(&available, &checkin));
+        let wrong_status = Asset {
+            status_label: Some(NamedReference {
+                id: 5,
+                name: String::from("ready"),
+            }),
+            ..Asset::default()
+        };
+        assert!(!checkin_is_applied(&wrong_status, &checkin));
     }
 
     #[tokio::test]
