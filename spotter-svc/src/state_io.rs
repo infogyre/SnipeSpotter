@@ -88,4 +88,26 @@ mod tests {
         assert!(load_state(&path, &key).is_err());
         Ok(())
     }
+
+    #[test]
+    fn missing_state_defaults_and_invalid_key_is_rejected() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state_path = dir.path().join("state.toml");
+        let state = load_state(&state_path, &[1; 32])?;
+        assert!(state.last_sync_time.is_none());
+        assert!(state.known_monitors.is_empty());
+        let key_path = dir.path().join("key.bin");
+        fs::write(&key_path, [0_u8; 31])?;
+        assert!(load_or_create_key(&key_path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_state_is_rejected() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.toml");
+        fs::write(&path, b"not = [valid")?;
+        assert!(load_state(&path, &[1; 32]).is_err());
+        Ok(())
+    }
 }

@@ -116,4 +116,17 @@ mod tests {
         assert_eq!(fs::read(path)?, b"second");
         Ok(())
     }
+
+    #[test]
+    fn failed_replacement_cleans_temporary_file() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("state.toml");
+        fs::create_dir(&path)?;
+        assert!(write(&path, b"cannot replace directory").is_err());
+        let temporary = directory
+            .path()
+            .join(format!("state.toml.tmp.{}", std::process::id()));
+        assert!(!temporary.exists());
+        Ok(())
+    }
 }

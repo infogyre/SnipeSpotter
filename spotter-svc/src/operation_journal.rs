@@ -131,4 +131,19 @@ mod tests {
         assert_eq!(load(&path)?.len(), 1);
         Ok(())
     }
+
+    #[test]
+    fn malformed_and_partial_records_are_rejected() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("operations.jsonl");
+        fs::write(&path, b"{\"phase\":\"prepared\"}\nnot-json\n")?;
+        assert!(load(&path).is_err());
+
+        fs::write(
+            &path,
+            b"{\"phase\":\"prepared\",\"operation_id\":\"a\",\"operation\":{}}\n",
+        )?;
+        assert_eq!(load(&path)?.len(), 1);
+        Ok(())
+    }
 }

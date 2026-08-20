@@ -101,4 +101,29 @@ mod tests {
         assert_eq!(load_settings(&path)?.snipeit.url, "https://example.test");
         Ok(())
     }
+
+    #[test]
+    fn malformed_settings_are_rejected() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("settings.toml");
+        fs::write(&path, b"[snipeit\nurl = \"unterminated\"")?;
+        assert!(load_settings(&path).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn censored_display_reveals_only_token_presence() {
+        let mut settings = Settings::default();
+        settings.snipeit.url = String::from("https://example.test");
+        settings.snipeit.api_token_encrypted = b"do-not-log-me".to_vec();
+        let display = censored_display(&settings);
+        assert!(display.iter().any(|(key, value)| {
+            key == "snipeit.api_token_encrypted" && value == "<configured>"
+        }));
+        assert!(
+            display
+                .iter()
+                .all(|(_, value)| !value.contains("do-not-log-me"))
+        );
+    }
 }
