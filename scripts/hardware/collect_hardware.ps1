@@ -29,7 +29,6 @@ if ($ImageAlias -ne $Image) { throw 'image alias must match image' }
 $MaxReportBytes = 32768
 $MaxRows = 32
 $MaxTypes = 128
-$Stopwatch = [Diagnostics.Stopwatch]::StartNew()
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $runtimePrincipal = $identity.Name
