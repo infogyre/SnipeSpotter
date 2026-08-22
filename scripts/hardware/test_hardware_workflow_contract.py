@@ -35,6 +35,15 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         self.assertIn("$configOutput -join", workflow)
         self.assertNotIn("Start-Service -Name $serviceName -ErrorAction Stop", workflow)
 
+    def test_cleanup_waits_for_service_disappearance_and_is_idempotent(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        cleanup = workflow.split("- name: Cleanup ephemeral reports", 1)[1]
+        self.assertIn("$service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue", cleanup)
+        self.assertIn("$deleteOutput = & sc.exe delete $serviceName 2>&1", cleanup)
+        self.assertIn("Wait-ForCondition -Description \"LocalSystem service deletion\"", cleanup)
+        self.assertIn("$deleteOutput -notmatch '1060|does not exist'", cleanup)
+
     def test_local_system_host_is_a_precompiled_support_binary(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
