@@ -39,8 +39,8 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn("$hostExecutable = Join-Path $env:RUNNER_TEMP", workflow)
-        self.assertIn("-OutputType ConsoleApplication", workflow)
         self.assertIn("-OutputAssembly $hostExecutable", workflow)
+        self.assertNotIn("-OutputType ConsoleApplication", workflow)
         self.assertIn("$hostExecutable", workflow)
         self.assertNotIn("$binPath = \"`\"$pwsh`\" -NoLogo", workflow)
 
