@@ -144,7 +144,9 @@ jobs:
           if ($env:IMAGE_ALIAS -ne $env:IMAGE) { throw 'matrix image alias does not match selected image' }
           $serviceName = "SpotterHardware-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
           $argumentsPath = Join-Path $env:RUNNER_TEMP "$serviceName.json"
-          $hostPath = Join-Path $env:RUNNER_TEMP "$serviceName.ps1"
+          $hostPath = Join-Path $env:RUNNER_TEMP "$serviceName.cs"
+          $hostExecutable = Join-Path $env:RUNNER_TEMP "$serviceName.exe"
+          $workerPath = Join-Path $env:RUNNER_TEMP "$serviceName-worker.ps1"
 
           function Wait-ForCondition {
             param([scriptblock]$Condition, [string]$Description, [int]$TimeoutSeconds = 120)
@@ -178,33 +180,79 @@ jobs:
             output_path = (Join-Path $reportDirectory "$env:IMAGE-LocalSystem-$env:REPETITION.json")
           }
           $arguments | ConvertTo-Json -Compress | Set-Content -LiteralPath $argumentsPath -Encoding utf8
-          $serviceScript = @'
+          $workerScript = @'
           param([Parameter(Mandatory = $true)][string]$ArgumentsPath)
           Set-StrictMode -Version Latest
           $ErrorActionPreference = 'Stop'
-          Add-Type -AssemblyName System.ServiceProcess.ServiceController
-          Add-Type -TypeDefinition @"
+          $arguments = Get-Content -LiteralPath $ArgumentsPath -Raw | ConvertFrom-Json
+          & $arguments.collector -Image $arguments.image -ImageAlias $arguments.image_alias -Context $arguments.context -Repetition ([int]$arguments.repetition) -SessionId ([Diagnostics.Process]::GetCurrentProcess().SessionId) -HmacKeyPath $arguments.key_path -OutputPath $arguments.output_path
+          '@
+          Set-Content -LiteralPath $workerPath -Value $workerScript -Encoding utf8
+          $hostSource = @'
           using System;
+          using System.Diagnostics;
           using System.ServiceProcess;
           using System.Threading.Tasks;
+
           public sealed class SpotterHardwareService : ServiceBase
           {
-              private readonly Action work;
-              public SpotterHardwareService(string name, Action work) { ServiceName = name; CanStop = true; this.work = work; }
-              protected override void OnStart(string[] args) { Task.Run(() => { try { work(); } finally { Stop(); } }); }
+              private readonly string argumentsPath;
+              private readonly string workerPath;
+
+              public SpotterHardwareService(string argumentsPath, string workerPath)
+              {
+                  ServiceName = "__SERVICE_NAME__";
+                  CanStop = true;
+                  this.argumentsPath = argumentsPath;
+                  this.workerPath = workerPath;
+              }
+
+              protected override void OnStart(string[] args)
+              {
+                  Task.Run(() =>
+                  {
+                      var psi = new ProcessStartInfo
+                      {
+                          FileName = "__PWSH_PATH__",
+                          UseShellExecute = false,
+                          CreateNoWindow = true
+                      };
+                      psi.ArgumentList.Add("-NoLogo");
+                      psi.ArgumentList.Add("-NoProfile");
+                      psi.ArgumentList.Add("-NonInteractive");
+                      psi.ArgumentList.Add("-File");
+                      psi.ArgumentList.Add(workerPath);
+                      psi.ArgumentList.Add(argumentsPath);
+                      using (var process = Process.Start(psi))
+                      {
+                          process.WaitForExit();
+                          if (process.ExitCode != 0) throw new InvalidOperationException("collector exited with code " + process.ExitCode);
+                      }
+                      Stop();
+                  });
+              }
+
               protected override void OnStop() { }
-              public static void Run(string name, Action work) { ServiceBase.Run(new SpotterHardwareService(name, work)); }
+
+              public static void Run(string argumentsPath, string workerPath)
+              {
+                  ServiceBase.Run(new SpotterHardwareService(argumentsPath, workerPath));
+              }
           }
-          "@
-          $arguments = Get-Content -LiteralPath $ArgumentsPath -Raw | ConvertFrom-Json
-          [SpotterHardwareService]::Run($arguments.service_name, [Action] {
-              $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
-              & $arguments.collector -Image $arguments.image -ImageAlias $arguments.image_alias -Context $arguments.context -Repetition ([int]$arguments.repetition) -SessionId $sessionId -HmacKeyPath $arguments.key_path -OutputPath $arguments.output_path
-          })
+
+          public static class Program
+          {
+              public static void Main(string[] args)
+              {
+                  SpotterHardwareService.Run(args[0], args[1]);
+              }
+          }
           '@
-          Set-Content -LiteralPath $hostPath -Value $serviceScript -Encoding utf8
           $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
-          $binPath = "`"$pwsh`" -NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$hostPath`" -ArgumentsPath `"$argumentsPath`""
+          $hostSource = $hostSource.Replace('__SERVICE_NAME__', $serviceName).Replace('__PWSH_PATH__', $pwsh.Replace('\\', '\\\\'))
+          Set-Content -LiteralPath $hostPath -Value $hostSource -Encoding utf8
+          Add-Type -TypeDefinition $hostSource -Language CSharp -OutputAssembly $hostExecutable -OutputType ConsoleApplication -ReferencedAssemblies 'System.ServiceProcess.ServiceController'
+          $binPath = "`"$hostExecutable`" `"$argumentsPath`" `"$workerPath`""
           $scOutput = & sc.exe create $serviceName 'binPath=' $binPath 'obj=' 'LocalSystem' 'start=' 'demand' 'type=' 'own' 2>&1
           if ($LASTEXITCODE -ne 0) {
             throw "failed to create LocalSystem service ${serviceName}: $($scOutput -join ' ')"
@@ -229,7 +277,7 @@ jobs:
             Wait-ForCondition -Description "LocalSystem service deletion" -Condition {
               $null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
             }
-            Remove-Item -LiteralPath $argumentsPath, $hostPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $argumentsPath, $hostPath, $hostExecutable, $workerPath -Force -ErrorAction SilentlyContinue
           }
       - name: Upload validated redacted reports
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -258,7 +306,9 @@ jobs:
           }
           foreach ($path in @(
             (Join-Path $env:RUNNER_TEMP "$serviceName.json"),
-            (Join-Path $env:RUNNER_TEMP "$serviceName.ps1"),
+            (Join-Path $env:RUNNER_TEMP "$serviceName.cs"),
+            (Join-Path $env:RUNNER_TEMP "$serviceName.exe"),
+            (Join-Path $env:RUNNER_TEMP "$serviceName-worker.ps1"),
             (Join-Path $env:RUNNER_TEMP "snipespotter-hardware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION.key")
           )) {
             try { Remove-Item -LiteralPath $path -Force -ErrorAction Stop } catch { if (Test-Path -LiteralPath $path) { $cleanupFailures += $_.Exception.Message } }

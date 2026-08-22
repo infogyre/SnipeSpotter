@@ -35,6 +35,29 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         self.assertIn("$configOutput -join", workflow)
         self.assertNotIn("Start-Service -Name $serviceName -ErrorAction Stop", workflow)
 
+    def test_local_system_host_is_a_compiled_service_executable(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("$hostExecutable = Join-Path $env:RUNNER_TEMP", workflow)
+        self.assertIn("-OutputType ConsoleApplication", workflow)
+        self.assertIn("-OutputAssembly $hostExecutable", workflow)
+        self.assertIn("$hostExecutable", workflow)
+        self.assertNotIn("$binPath = \"`\"$pwsh`\" -NoLogo", workflow)
+
+    def test_compiled_host_uses_a_separate_worker_and_argument_boundaries(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("$workerPath = Join-Path $env:RUNNER_TEMP", workflow)
+        self.assertIn("$workerScript = @'", workflow)
+        self.assertIn('psi.ArgumentList.Add("-File")', workflow)
+        self.assertIn('psi.ArgumentList.Add(workerPath)', workflow)
+        self.assertNotIn('Arguments = "-NoLogo -NoProfile -NonInteractive -Command', workflow)
+        self.assertIn("$hostExecutable`\" `\"$argumentsPath`\" `\"$workerPath`\"", workflow)
+        self.assertIn("Remove-Item -LiteralPath $argumentsPath, $hostPath, $hostExecutable, $workerPath", workflow)
+        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName.cs"', workflow)
+        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName.exe"', workflow)
+        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName-worker.ps1"', workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
