@@ -198,13 +198,15 @@ jobs:
           {
               private readonly string argumentsPath;
               private readonly string workerPath;
+              private readonly string pwshPath;
 
-              public SpotterHardwareService(string argumentsPath, string workerPath)
+              public SpotterHardwareService(string argumentsPath, string workerPath, string pwshPath)
               {
                   ServiceName = "__SERVICE_NAME__";
                   CanStop = true;
                   this.argumentsPath = argumentsPath;
                   this.workerPath = workerPath;
+                  this.pwshPath = pwshPath;
               }
 
               protected override void OnStart(string[] args)
@@ -213,7 +215,7 @@ jobs:
                   {
                       var psi = new ProcessStartInfo
                       {
-                          FileName = "__PWSH_PATH__",
+                          FileName = pwshPath,
                           UseShellExecute = false,
                           CreateNoWindow = true
                       };
@@ -234,9 +236,9 @@ jobs:
 
               protected override void OnStop() { }
 
-              public static void Run(string argumentsPath, string workerPath)
+              public static void Run(string argumentsPath, string workerPath, string pwshPath)
               {
-                  ServiceBase.Run(new SpotterHardwareService(argumentsPath, workerPath));
+                  ServiceBase.Run(new SpotterHardwareService(argumentsPath, workerPath, pwshPath));
               }
           }
 
@@ -244,15 +246,15 @@ jobs:
           {
               public static void Main(string[] args)
               {
-                  SpotterHardwareService.Run(args[0], args[1]);
+                  SpotterHardwareService.Run(args[0], args[1], args[2]);
               }
           }
           '@
           $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
-          $hostSource = $hostSource.Replace('__SERVICE_NAME__', $serviceName).Replace('__PWSH_PATH__', $pwsh.Replace('\\', '\\\\'))
+          $hostSource = $hostSource.Replace('__SERVICE_NAME__', $serviceName)
           Set-Content -LiteralPath $hostPath -Value $hostSource -Encoding utf8
           Add-Type -TypeDefinition $hostSource -Language CSharp -OutputAssembly $hostExecutable -ReferencedAssemblies 'System.ServiceProcess.ServiceController'
-          $binPath = "`"$hostExecutable`" `"$argumentsPath`" `"$workerPath`""
+          $binPath = "`"$hostExecutable`" `"$argumentsPath`" `"$workerPath`" `"$pwsh`""
           $scOutput = & sc.exe create $serviceName 'binPath=' $binPath 'obj=' 'LocalSystem' 'start=' 'demand' 'type=' 'own' 2>&1
           if ($LASTEXITCODE -ne 0) {
             throw "failed to create LocalSystem service ${serviceName}: $($scOutput -join ' ')"
