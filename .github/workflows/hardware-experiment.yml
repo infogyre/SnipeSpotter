@@ -253,7 +253,9 @@ jobs:
           $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
           $hostSource = $hostSource.Replace('__SERVICE_NAME__', $serviceName)
           Set-Content -LiteralPath $hostPath -Value $hostSource -Encoding utf8
-          Add-Type -TypeDefinition $hostSource -Language CSharp -OutputAssembly $hostExecutable -ReferencedAssemblies 'System.ServiceProcess.ServiceController'
+          $serviceAssembly = [System.ServiceProcess.ServiceBase].Assembly.Location
+          $componentAssembly = [System.ComponentModel.Component].Assembly.Location
+          Add-Type -TypeDefinition $hostSource -Language CSharp -OutputAssembly $hostExecutable -ReferencedAssemblies @($serviceAssembly, $componentAssembly)
           $binPath = "`"$hostExecutable`" `"$argumentsPath`" `"$workerPath`" `"$pwsh`""
           $scOutput = & sc.exe create $serviceName 'binPath=' $binPath 'obj=' 'LocalSystem' 'start=' 'demand' 'type=' 'own' 2>&1
           if ($LASTEXITCODE -ne 0) {
