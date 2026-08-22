@@ -232,9 +232,19 @@ jobs:
           if ($null -ne $service -and $service.Status -ne 'Stopped') {
             try { Stop-Service -Name $serviceName -Force -ErrorAction Stop } catch { $cleanupFailures += $_.Exception.Message }
           }
-          & sc.exe delete $serviceName | Out-Null
-          if ($LASTEXITCODE -ne 0 -and $null -ne (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
-            $cleanupFailures += "failed to delete LocalSystem service $serviceName"
+          $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+          if ($null -ne $service) {
+            $deleteOutput = & sc.exe delete $serviceName 2>&1
+            if ($LASTEXITCODE -ne 0 -and $deleteOutput -notmatch '1060|does not exist') {
+              $cleanupFailures += "failed to request LocalSystem service deletion ${serviceName}: $($deleteOutput -join ' ')"
+            }
+            try {
+              Wait-ForCondition -Description "LocalSystem service deletion" -Condition {
+                $null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
+              }
+            } catch {
+              $cleanupFailures += $_.Exception.Message
+            }
           }
           foreach ($path in @(
             (Join-Path $env:RUNNER_TEMP "$serviceName.json"),
