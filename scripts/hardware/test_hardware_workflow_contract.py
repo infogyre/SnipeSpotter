@@ -56,7 +56,7 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         self.assertIn("Start-Sleep -Seconds 2", helper)
         self.assertIn("timed out waiting for $Description", helper)
 
-    def test_native_collector_and_validator_failures_stop_the_cell(self) -> None:
+    def test_collector_and_validator_failures_stop_the_cell(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
         self.assertIn(
@@ -66,7 +66,7 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn(
             """& $collector -Image $env:IMAGE -ImageAlias $env:IMAGE_ALIAS -Context interactive-admin -Repetition ([int]$env:REPETITION) -SessionId $directSessionId -HmacKeyPath $keyPath -OutputPath $directOutput
-          if ($LASTEXITCODE -ne 0) { throw 'hardware collector failed for interactive-admin' }""",
+          if (-not $?) { throw 'hardware collector failed for interactive-admin' }""",
             workflow,
         )
 
