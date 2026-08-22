@@ -1,0 +1,279 @@
+name: hosted Windows hardware experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      images:
+        description: Comma-separated runner labels; windows-2022 and windows-latest are required.
+        required: false
+        default: windows-2022,windows-latest
+        type: string
+      confirmed_optional_images:
+        description: Optional labels confirmed available by the repository or organization, such as windows-2025.
+        required: false
+        default: ''
+        type: string
+      repetitions:
+        description: Fresh repetitions per image and context; this workflow requires exactly three.
+        required: false
+        default: '3'
+        type: string
+      operator_acknowledgement:
+        description: Type APPROVE to authorize the protected observation checkpoint.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hardware-experiment-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate requested hardware matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      skipped_images: ${{ steps.matrix.outputs.skipped_images }}
+      selection_status: ${{ steps.matrix.outputs.selection_status }}
+    steps:
+      - name: Parse images and repetitions
+        id: matrix
+        env:
+          REQUESTED_IMAGES: ${{ inputs.images }}
+          CONFIRMED_OPTIONAL_IMAGES: ${{ inputs.confirmed_optional_images }}
+          REQUESTED_REPETITIONS: ${{ inputs.repetitions }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          required = {"windows-2022", "windows-latest"}
+          optional = {"windows-2025"}
+          supported = required | optional
+          requested = [item.strip() for item in os.environ["REQUESTED_IMAGES"].split(",") if item.strip()]
+          confirmed_optional = {
+              item.strip()
+              for item in os.environ.get("CONFIRMED_OPTIONAL_IMAGES", "").split(",")
+              if item.strip()
+          }
+          if not confirmed_optional.issubset(optional):
+              raise SystemExit("confirmed optional image labels are unsupported")
+          if not required.issubset(requested):
+              raise SystemExit("windows-2022 and windows-latest are required")
+          if len(requested) != len(set(requested)):
+              raise SystemExit("images must not contain duplicates")
+          invalid = sorted(set(requested) - supported)
+          if invalid:
+              raise SystemExit("unsupported image label(s): " + ", ".join(invalid))
+          if os.environ["REQUESTED_REPETITIONS"] != "3":
+              raise SystemExit("repetitions must be exactly 3")
+
+          selected = sorted(required | (set(requested) & confirmed_optional))
+          skipped = sorted(optional - set(selected))
+          matrix = {
+              "include": [
+                  {"image": image, "image_alias": image, "repetition": repetition}
+                  for image in selected
+                  for repetition in range(1, 4)
+              ]
+          }
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+              handle.write(f"skipped_images={json.dumps(sorted(skipped), separators=(',', ':'))}\n")
+              handle.write("selection_status=ready\n")
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a", encoding="utf-8") as handle:
+              handle.write("### Hardware image selection\n\n")
+              handle.write("Selected: " + ", ".join(selected) + "\n\n")
+              if skipped:
+                  handle.write("Skipped optional images: " + ", ".join(skipped) + "\n")
+              else:
+                  handle.write("Skipped optional images: none\n")
+          PY
+
+  matrix:
+    name: Redacted hardware observation (${{ matrix.image }} / repetition ${{ matrix.repetition }})
+    needs: prepare
+    runs-on: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Generate protected per-image repetition HMAC key
+        shell: pwsh
+        env:
+          IMAGE: ${{ matrix.image }}
+          REPETITION: ${{ matrix.repetition }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $keyPath = Join-Path $env:RUNNER_TEMP "snipespotter-hardware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION.key"
+          $bytes = New-Object byte[] 32
+          try {
+            [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+            [IO.File]::WriteAllText($keyPath, [Convert]::ToHexString($bytes).ToLowerInvariant())
+            & icacls.exe $keyPath /inheritance:r /grant:r '*S-1-5-18:R' '*S-1-5-32-544:F' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "failed to protect HMAC key ACL: $keyPath" }
+          } finally {
+            $bytes = $null
+          }
+      - name: Collect and validate direct and LocalSystem reports
+        shell: pwsh
+        env:
+          IMAGE: ${{ matrix.image }}
+          IMAGE_ALIAS: ${{ matrix.image_alias }}
+          REPETITION: ${{ matrix.repetition }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          $reportDirectory = Join-Path $env:GITHUB_WORKSPACE 'hardware-reports'
+          New-Item -ItemType Directory -Force -Path $reportDirectory | Out-Null
+          $keyPath = Join-Path $env:RUNNER_TEMP "snipespotter-hardware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION.key"
+          if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) { throw "HMAC key was not created: $keyPath" }
+          $collector = Join-Path $env:GITHUB_WORKSPACE 'scripts/hardware/collect_hardware.ps1'
+          if ($env:IMAGE_ALIAS -ne $env:IMAGE) { throw 'matrix image alias does not match selected image' }
+          $serviceName = "SpotterHardware-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
+          $argumentsPath = Join-Path $env:RUNNER_TEMP "$serviceName.json"
+          $hostPath = Join-Path $env:RUNNER_TEMP "$serviceName.ps1"
+
+          function Wait-ForCondition {
+            param([scriptblock]$Condition, [string]$Description, [int]$TimeoutSeconds = 120)
+            $deadline = [Diagnostics.Stopwatch]::GetTimestamp() + ([int64]$TimeoutSeconds * [Diagnostics.Stopwatch]::Frequency)
+            while ([Diagnostics.Stopwatch]::GetTimestamp() -lt $deadline) {
+              if (& $Condition) { return }
+              Start-Sleep -Seconds 2
+            }
+            throw "timed out waiting for $Description"
+          }
+
+          function Invoke-ReportValidation {
+            param([Parameter(Mandatory = $true)][string]$Context)
+            $reportPath = Join-Path $reportDirectory "$env:IMAGE-$Context-$env:REPETITION.json"
+            python (Join-Path $env:GITHUB_WORKSPACE 'scripts/hardware/validate_report.py') --input $reportPath
+          }
+
+          $directOutput = Join-Path $reportDirectory "$env:IMAGE-interactive-admin-$env:REPETITION.json"
+          $directSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+          & $collector -Image $env:IMAGE -ImageAlias $env:IMAGE_ALIAS -Context interactive-admin -Repetition ([int]$env:REPETITION) -SessionId $directSessionId -HmacKeyPath $keyPath -OutputPath $directOutput
+          Invoke-ReportValidation -Context interactive-admin
+
+          $arguments = [ordered]@{
+            service_name = $serviceName
+            collector = $collector
+            image = $env:IMAGE
+            image_alias = $env:IMAGE_ALIAS
+            context = 'LocalSystem'
+            repetition = [int]$env:REPETITION
+            key_path = $keyPath
+            output_path = (Join-Path $reportDirectory "$env:IMAGE-LocalSystem-$env:REPETITION.json")
+          }
+          $arguments | ConvertTo-Json -Compress | Set-Content -LiteralPath $argumentsPath -Encoding utf8
+          $serviceScript = @'
+          param([Parameter(Mandatory = $true)][string]$ArgumentsPath)
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.ServiceProcess.ServiceController
+          Add-Type -TypeDefinition @"
+          using System;
+          using System.ServiceProcess;
+          using System.Threading.Tasks;
+          public sealed class SpotterHardwareService : ServiceBase
+          {
+              private readonly Action work;
+              public SpotterHardwareService(string name, Action work) { ServiceName = name; CanStop = true; this.work = work; }
+              protected override void OnStart(string[] args) { Task.Run(() => { try { work(); } finally { Stop(); } }); }
+              protected override void OnStop() { }
+              public static void Run(string name, Action work) { ServiceBase.Run(new SpotterHardwareService(name, work)); }
+          }
+          "@
+          $arguments = Get-Content -LiteralPath $ArgumentsPath -Raw | ConvertFrom-Json
+          [SpotterHardwareService]::Run($arguments.service_name, [Action] {
+              $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+              & $arguments.collector -Image $arguments.image -ImageAlias $arguments.image_alias -Context $arguments.context -Repetition ([int]$arguments.repetition) -SessionId $sessionId -HmacKeyPath $arguments.key_path -OutputPath $arguments.output_path
+          })
+          '@
+          Set-Content -LiteralPath $hostPath -Value $serviceScript -Encoding utf8
+          $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+          $binPath = "`"$pwsh`" -NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$hostPath`" -ArgumentsPath `"$argumentsPath`""
+          & sc.exe create $serviceName "binPath= $binPath" 'obj= LocalSystem' 'start= demand' 'type= own' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to create LocalSystem service $serviceName" }
+          try {
+            Start-Service -Name $serviceName -ErrorAction Stop
+            Wait-ForCondition -Description "LocalSystem report" -Condition { Test-Path -LiteralPath $arguments.output_path -PathType Leaf }
+            Wait-ForCondition -Description "LocalSystem service to stop" -Condition {
+              $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+              $null -eq $service -or $service.Status -eq 'Stopped'
+            }
+            Invoke-ReportValidation -Context LocalSystem
+          } finally {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            if ($null -ne $service -and $service.Status -ne 'Stopped') { Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue }
+            & sc.exe delete $serviceName | Out-Null
+            Wait-ForCondition -Description "LocalSystem service deletion" -Condition {
+              $null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
+            }
+            Remove-Item -LiteralPath $argumentsPath, $hostPath -Force -ErrorAction SilentlyContinue
+          }
+      - name: Upload validated redacted reports
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardware-report-${{ matrix.image }}-${{ matrix.repetition }}
+          path: hardware-reports/${{ matrix.image }}-*.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Cleanup ephemeral reports, service files, and key
+        if: always()
+        shell: pwsh
+        env:
+          IMAGE: ${{ matrix.image }}
+          REPETITION: ${{ matrix.repetition }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $serviceName = "SpotterHardware-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
+          $cleanupFailures = @()
+          $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+          if ($null -ne $service -and $service.Status -ne 'Stopped') {
+            try { Stop-Service -Name $serviceName -Force -ErrorAction Stop } catch { $cleanupFailures += $_.Exception.Message }
+          }
+          & sc.exe delete $serviceName | Out-Null
+          if ($LASTEXITCODE -ne 0 -and $null -ne (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) {
+            $cleanupFailures += "failed to delete LocalSystem service $serviceName"
+          }
+          foreach ($path in @(
+            (Join-Path $env:RUNNER_TEMP "$serviceName.json"),
+            (Join-Path $env:RUNNER_TEMP "$serviceName.ps1"),
+            (Join-Path $env:RUNNER_TEMP "snipespotter-hardware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION.key")
+          )) {
+            try { Remove-Item -LiteralPath $path -Force -ErrorAction Stop } catch { if (Test-Path -LiteralPath $path) { $cleanupFailures += $_.Exception.Message } }
+          }
+          Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'hardware-reports') -Filter "${env:IMAGE}-*.json" -File -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { $cleanupFailures += $_.Exception.Message }
+            }
+          if ($cleanupFailures.Count -gt 0) { throw ('hardware cleanup failed: ' + ($cleanupFailures -join '; ')) }
+  checkpoint:
+    name: awaiting_operator_hardware_approval
+    needs: matrix
+    if: always()
+    runs-on: ubuntu-latest
+    environment: hardware-experiment-approval
+    steps:
+      - name: Require matrix mechanics and privacy success
+        env:
+          MATRIX_RESULT: ${{ needs.matrix.result }}
+          OPERATOR_ACKNOWLEDGEMENT: ${{ inputs.operator_acknowledgement }}
+        run: |
+          set -euo pipefail
+          test "${MATRIX_RESULT}" = success
+          test "${OPERATOR_ACKNOWLEDGEMENT}" = APPROVE
+          printf '%s\n' 'Hosted observations are evidence only. No runner-specific gate, fixture, or physical matrix is promoted by this workflow.'
