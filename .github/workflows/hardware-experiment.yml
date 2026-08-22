@@ -210,7 +210,12 @@ jobs:
             throw "failed to create LocalSystem service ${serviceName}: $($scOutput -join ' ')"
           }
           try {
-            Start-Service -Name $serviceName -ErrorAction Stop
+            $startOutput = & sc.exe start $serviceName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              $queryOutput = & sc.exe queryex $serviceName 2>&1
+              $configOutput = & sc.exe qc $serviceName 2>&1
+              throw "failed to start LocalSystem service ${serviceName}: start=$($startOutput -join ' ') queryex=$($queryOutput -join ' ') qc=$($configOutput -join ' ')"
+            }
             Wait-ForCondition -Description "LocalSystem report" -Condition { Test-Path -LiteralPath $arguments.output_path -PathType Leaf }
             Wait-ForCondition -Description "LocalSystem service to stop" -Condition {
               $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
