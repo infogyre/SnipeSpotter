@@ -159,11 +159,13 @@ jobs:
             param([Parameter(Mandatory = $true)][string]$Context)
             $reportPath = Join-Path $reportDirectory "$env:IMAGE-$Context-$env:REPETITION.json"
             python (Join-Path $env:GITHUB_WORKSPACE 'scripts/hardware/validate_report.py') --input $reportPath
+            if ($LASTEXITCODE -ne 0) { throw "report validation failed for $Context (exit code $LASTEXITCODE)" }
           }
 
           $directOutput = Join-Path $reportDirectory "$env:IMAGE-interactive-admin-$env:REPETITION.json"
           $directSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
           & $collector -Image $env:IMAGE -ImageAlias $env:IMAGE_ALIAS -Context interactive-admin -Repetition ([int]$env:REPETITION) -SessionId $directSessionId -HmacKeyPath $keyPath -OutputPath $directOutput
+          if ($LASTEXITCODE -ne 0) { throw 'hardware collector failed for interactive-admin' }
           Invoke-ReportValidation -Context interactive-admin
 
           cargo build --locked --release -p spotter-hardware-service --features hardware-experiment
@@ -226,7 +228,19 @@ jobs:
           REPETITION: ${{ matrix.repetition }}
         run: |
           $ErrorActionPreference = 'Continue'
+          Set-StrictMode -Version Latest
           $serviceName = "SpotterHardware-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
+
+          function Wait-ForCondition {
+            param([scriptblock]$Condition, [string]$Description, [int]$TimeoutSeconds = 120)
+            $deadline = [Diagnostics.Stopwatch]::GetTimestamp() + ([int64]$TimeoutSeconds * [Diagnostics.Stopwatch]::Frequency)
+            while ([Diagnostics.Stopwatch]::GetTimestamp() -lt $deadline) {
+              if (& $Condition) { return }
+              Start-Sleep -Seconds 2
+            }
+            throw "timed out waiting for $Description"
+          }
+
           $cleanupFailures = @()
           $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
           if ($null -ne $service -and $service.Status -ne 'Stopped') {
