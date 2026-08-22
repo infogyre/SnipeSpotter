@@ -6,6 +6,7 @@ members = [
     "spotter-build",
     "spotter-svc",
     "spotter-cli",
+    "spotter-hardware-service",
 ]
 default-members = ["spotter-core"]
 

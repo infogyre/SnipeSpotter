@@ -54,6 +54,8 @@ jobs:
         run: cargo test --workspace --all-targets
       - name: Workspace clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Compile hardware experiment service host
+        run: cargo check -p spotter-hardware-service --features hardware-experiment --locked
       - name: PowerShell script lint
         shell: pwsh
         run: |
@@ -91,8 +93,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(len(json.load(sys.stdin)["packages"]))')" -eq 5
-          for package in spotter-core spotter-win32 spotter-build spotter-svc spotter-cli; do
+          test "$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json, sys; print(len(json.load(sys.stdin)["packages"]))')" -eq 6
+          for package in spotter-core spotter-win32 spotter-build spotter-svc spotter-cli spotter-hardware-service; do
             cargo metadata --no-deps --format-version 1 | grep -q '"name":"'"$package"'"'
           done
 

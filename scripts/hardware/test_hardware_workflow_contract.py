@@ -35,34 +35,29 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         self.assertIn("$configOutput -join", workflow)
         self.assertNotIn("Start-Service -Name $serviceName -ErrorAction Stop", workflow)
 
-    def test_local_system_host_is_a_compiled_service_executable(self) -> None:
+    def test_local_system_host_is_a_precompiled_support_binary(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
-        self.assertIn("$hostExecutable = Join-Path $env:RUNNER_TEMP", workflow)
-        self.assertIn("-OutputAssembly $hostExecutable", workflow)
-        self.assertIn("$componentAssembly = [System.ComponentModel.Component].Assembly.Location", workflow)
-        self.assertIn("$serviceAssembly = [System.ServiceProcess.ServiceBase].Assembly.Location", workflow)
-        self.assertIn("-ReferencedAssemblies @($serviceAssembly, $componentAssembly)", workflow)
-        self.assertNotIn("-OutputType ConsoleApplication", workflow)
-        self.assertIn("$hostExecutable", workflow)
-        self.assertNotIn("$binPath = \"`\"$pwsh`\" -NoLogo", workflow)
+        self.assertIn("cargo build --locked --release -p spotter-hardware-service --features hardware-experiment", workflow)
+        self.assertIn("spotter-hardware-service.exe", workflow)
+        self.assertIn("$supportExecutable", workflow)
+        self.assertIn("Copy-Item -LiteralPath 'target/release/spotter-hardware-service.exe'", workflow)
+        self.assertIn("$supportExecutable`\" --service-name `\"$serviceName`\" --config `\"$argumentsPath`\"", workflow)
+        self.assertNotIn("Add-Type -TypeDefinition", workflow)
+        self.assertNotIn("$hostSource = @'", workflow)
+        self.assertNotIn("$workerScript = @'", workflow)
 
-    def test_compiled_host_uses_a_separate_worker_and_argument_boundaries(self) -> None:
+    def test_support_binary_is_excluded_from_product_packaging(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
+        release = (WORKFLOW.parents[1] / "workflows" / "release.yml").read_text(encoding="utf-8")
+        installer = (WORKFLOW.parents[2] / "installer" / "Product.wxs").read_text(encoding="utf-8")
+        manifest = (WORKFLOW.parents[2] / "Cargo.toml").read_text(encoding="utf-8")
 
-        self.assertIn("$workerPath = Join-Path $env:RUNNER_TEMP", workflow)
-        self.assertIn("$workerScript = @'", workflow)
-        self.assertIn('psi.ArgumentList.Add("-File")', workflow)
-        self.assertIn('psi.ArgumentList.Add(workerPath)', workflow)
-        self.assertNotIn('Arguments = "-NoLogo -NoProfile -NonInteractive -Command', workflow)
-        self.assertIn('FileName = pwshPath', workflow)
-        self.assertIn('SpotterHardwareService.Run(args[0], args[1], args[2])', workflow)
-        self.assertIn("$hostExecutable`\" `\"$argumentsPath`\" `\"$workerPath`\" `\"$pwsh`\"", workflow)
-        self.assertNotIn("Replace('__PWSH_PATH__'", workflow)
-        self.assertIn("Remove-Item -LiteralPath $argumentsPath, $hostPath, $hostExecutable, $workerPath", workflow)
-        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName.cs"', workflow)
-        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName.exe"', workflow)
-        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName-worker.ps1"', workflow)
+        self.assertNotIn("spotter-hardware-service", release)
+        self.assertNotIn("spotter-hardware-service", installer)
+        self.assertNotIn("spotter-hardware-service", workflow.split("jobs:", 1)[0])
+        self.assertIn('"spotter-hardware-service"', manifest)
+        self.assertIn('"spotter-hardware-service"', (WORKFLOW.parents[2] / "Cargo.lock").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
