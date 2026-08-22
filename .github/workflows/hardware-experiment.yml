@@ -165,7 +165,7 @@ jobs:
           $directOutput = Join-Path $reportDirectory "$env:IMAGE-interactive-admin-$env:REPETITION.json"
           $directSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
           & $collector -Image $env:IMAGE -ImageAlias $env:IMAGE_ALIAS -Context interactive-admin -Repetition ([int]$env:REPETITION) -SessionId $directSessionId -HmacKeyPath $keyPath -OutputPath $directOutput
-          if ($LASTEXITCODE -ne 0) { throw 'hardware collector failed for interactive-admin' }
+          if (-not $?) { throw 'hardware collector failed for interactive-admin' }
           Invoke-ReportValidation -Context interactive-admin
 
           cargo build --locked --release -p spotter-hardware-service --features hardware-experiment
