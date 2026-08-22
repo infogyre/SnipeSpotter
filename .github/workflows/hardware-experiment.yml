@@ -205,8 +205,10 @@ jobs:
           Set-Content -LiteralPath $hostPath -Value $serviceScript -Encoding utf8
           $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
           $binPath = "`"$pwsh`" -NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$hostPath`" -ArgumentsPath `"$argumentsPath`""
-          & sc.exe create $serviceName "binPath= $binPath" 'obj= LocalSystem' 'start= demand' 'type= own' | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "failed to create LocalSystem service $serviceName" }
+          $scOutput = & sc.exe create $serviceName 'binPath=' $binPath 'obj=' 'LocalSystem' 'start=' 'demand' 'type=' 'own' 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            throw "failed to create LocalSystem service ${serviceName}: $($scOutput -join ' ')"
+          }
           try {
             Start-Service -Name $serviceName -ErrorAction Stop
             Wait-ForCondition -Description "LocalSystem report" -Condition { Test-Path -LiteralPath $arguments.output_path -PathType Leaf }
