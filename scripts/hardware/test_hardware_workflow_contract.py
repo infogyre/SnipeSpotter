@@ -44,6 +44,32 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         self.assertIn("Wait-ForCondition -Description \"LocalSystem service deletion\"", cleanup)
         self.assertIn("$deleteOutput -notmatch '1060|does not exist'", cleanup)
 
+    def test_cleanup_defines_its_condition_wait_helper(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        cleanup = workflow.split("- name: Cleanup ephemeral reports", 1)[1]
+        helper_start = cleanup.index("function Wait-ForCondition {")
+        first_helper_use = cleanup.index("Wait-ForCondition -Description")
+        helper = cleanup[helper_start:first_helper_use]
+        self.assertLess(helper_start, first_helper_use)
+        self.assertIn("while ([Diagnostics.Stopwatch]::GetTimestamp() -lt $deadline)", helper)
+        self.assertIn("Start-Sleep -Seconds 2", helper)
+        self.assertIn("timed out waiting for $Description", helper)
+
+    def test_native_collector_and_validator_failures_stop_the_cell(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn(
+            """python (Join-Path $env:GITHUB_WORKSPACE 'scripts/hardware/validate_report.py') --input $reportPath
+            if ($LASTEXITCODE -ne 0) { throw "report validation failed for $Context (exit code $LASTEXITCODE)" }""",
+            workflow,
+        )
+        self.assertIn(
+            """& $collector -Image $env:IMAGE -ImageAlias $env:IMAGE_ALIAS -Context interactive-admin -Repetition ([int]$env:REPETITION) -SessionId $directSessionId -HmacKeyPath $keyPath -OutputPath $directOutput
+          if ($LASTEXITCODE -ne 0) { throw 'hardware collector failed for interactive-admin' }""",
+            workflow,
+        )
+
     def test_local_system_host_is_a_precompiled_support_binary(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
