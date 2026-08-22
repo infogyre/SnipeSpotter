@@ -24,6 +24,17 @@ class HardwareWorkflowContractTests(unittest.TestCase):
             workflow,
         )
 
+    def test_local_system_start_failure_keeps_native_scm_diagnostics(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("$startOutput = & sc.exe start $serviceName 2>&1", workflow)
+        self.assertIn("$queryOutput = & sc.exe queryex $serviceName 2>&1", workflow)
+        self.assertIn("$configOutput = & sc.exe qc $serviceName 2>&1", workflow)
+        self.assertIn("$startOutput -join", workflow)
+        self.assertIn("$queryOutput -join", workflow)
+        self.assertIn("$configOutput -join", workflow)
+        self.assertNotIn("Start-Service -Name $serviceName -ErrorAction Stop", workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
