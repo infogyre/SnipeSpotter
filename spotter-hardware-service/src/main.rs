@@ -15,7 +15,7 @@ mod windows_service_host {
         env,
         ffi::OsString,
         fs,
-        path::{Path, PathBuf},
+        path::PathBuf,
         process::{Command, Stdio},
         sync::mpsc,
         time::Duration,
@@ -157,7 +157,7 @@ mod windows_service_host {
             .map_err(|error| format!("failed to launch hardware collector: {error}"))
     }
 
-    fn load_config(path: &Path) -> Result<ServiceConfig, String> {
+    fn load_config(path: &str) -> Result<ServiceConfig, String> {
         let bytes =
             fs::read(path).map_err(|error| format!("failed to read service config: {error}"))?;
         let config = serde_json::from_slice::<ServiceConfig>(&bytes)
