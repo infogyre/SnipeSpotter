@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/infogyre/SnipeSpotter/hardware-report.schema.json",
+  "title": "Privacy-safe hosted hardware experiment report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experiment", "build", "process", "privacy", "api_results", "smbios", "wmi", "chassis", "hmac_fragments"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "experiment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "context", "repetition", "caller_class", "session_id"],
+      "properties": {
+        "image": {"enum": ["windows-2022", "windows-latest", "windows-2025"]},
+        "context": {"enum": ["interactive-admin", "LocalSystem"]},
+        "repetition": {"type": "integer", "minimum": 1, "maximum": 3},
+        "caller_class": {"enum": ["interactive-admin", "LocalSystem"]},
+        "session_id": {"type": "integer", "minimum": 0, "maximum": 10000}
+      }
+    },
+    "build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "image_alias", "image_os", "image_version", "os_build", "powershell_version", "runner_architecture"],
+      "properties": {
+        "image": {"enum": ["windows-2022", "windows-latest", "windows-2025"]},
+        "image_alias": {"enum": ["windows-2022", "windows-latest", "windows-2025"]},
+        "image_os": {"type": "string", "minLength": 1, "maxLength": 256},
+        "image_version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "os_build": {"type": "integer", "minimum": 0, "maximum": 10000000},
+        "powershell_version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "runner_architecture": {"enum": ["X64", "ARM64"]}
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bitness"],
+      "properties": {"bitness": {"enum": [32, 64]}}
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hmac_algorithm", "hmac_key_uploaded", "raw_identifiers_emitted", "raw_payloads_emitted", "max_report_bytes"],
+      "properties": {
+        "hmac_algorithm": {"const": "HMAC-SHA256"},
+        "hmac_key_uploaded": {"const": false},
+        "raw_identifiers_emitted": {"const": false},
+        "raw_payloads_emitted": {"const": false},
+        "max_report_bytes": {"type": "integer", "minimum": 1, "maximum": 32768}
+      }
+    },
+    "api_results": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["api", "result", "duration_ms"],
+        "properties": {
+          "api": {"type": "string", "minLength": 1, "maxLength": 256},
+          "result": {"enum": ["ok", "unavailable", "access_denied", "error", "timeout", "not_run"]},
+          "duration_ms": {"type": "integer", "minimum": 0, "maximum": 120000}
+        }
+      }
+    },
+    "smbios": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "length", "structure_count", "type_histogram", "capped"],
+      "properties": {
+        "status": {"enum": ["ok", "unavailable", "access_denied", "error", "timeout", "not_run"]},
+        "length": {"type": "integer", "minimum": 0, "maximum": 16384},
+        "structure_count": {"type": "integer", "minimum": 0, "maximum": 256},
+        "type_histogram": {"type": "object", "maxProperties": 64, "additionalProperties": {"type": "integer", "minimum": 0, "maximum": 256}},
+        "capped": {"type": "boolean"}
+      }
+    },
+    "wmi": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "count", "array_lengths", "placeholder_classes", "capped"],
+      "properties": {
+        "status": {"enum": ["ok", "unavailable", "access_denied", "error", "timeout", "not_run"]},
+        "count": {"type": "integer", "minimum": 0, "maximum": 32},
+        "array_lengths": {"type": "object", "additionalProperties": false, "required": ["manufacturer_name", "product_code_id", "serial_number_id", "week_of_manufacture", "year_of_manufacture"], "properties": {"manufacturer_name": {"type": "array", "maxItems": 32, "items": {"type": "integer", "minimum": 0, "maximum": 64}}, "product_code_id": {"type": "array", "maxItems": 32, "items": {"type": "integer", "minimum": 0, "maximum": 64}}, "serial_number_id": {"type": "array", "maxItems": 32, "items": {"type": "integer", "minimum": 0, "maximum": 64}}, "week_of_manufacture": {"type": "array", "maxItems": 32, "items": {"type": "integer", "minimum": 0, "maximum": 64}}, "year_of_manufacture": {"type": "array", "maxItems": 32, "items": {"type": "integer", "minimum": 0, "maximum": 64}}}},
+        "placeholder_classes": {"type": "array", "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
+        "capped": {"type": "boolean"}
+      }
+    },
+    "chassis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "count", "class_counts", "capped"],
+      "properties": {
+        "status": {"enum": ["ok", "unavailable", "access_denied", "error", "timeout", "not_run"]},
+        "count": {"type": "integer", "minimum": 0, "maximum": 16},
+        "class_counts": {"type": "object", "additionalProperties": false, "required": ["portable", "desktop", "server", "enclosure", "unknown"], "properties": {"portable": {"type": "integer", "minimum": 0, "maximum": 16}, "desktop": {"type": "integer", "minimum": 0, "maximum": 16}, "server": {"type": "integer", "minimum": 0, "maximum": 16}, "enclosure": {"type": "integer", "minimum": 0, "maximum": 16}, "unknown": {"type": "integer", "minimum": 0, "maximum": 16}}},
+        "capped": {"type": "boolean"}
+      }
+    },
+    "hmac_fragments": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "fragment"],
+        "properties": {"kind": {"enum": ["machine", "monitor", "smbios", "chassis"]}, "fragment": {"type": "string", "pattern": "^(?!0{16}$)[0-9a-f]{16}$"}}
+      }
+    }
+  }
+}
