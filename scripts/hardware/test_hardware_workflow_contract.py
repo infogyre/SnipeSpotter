@@ -40,6 +40,9 @@ class HardwareWorkflowContractTests(unittest.TestCase):
 
         self.assertIn("$hostExecutable = Join-Path $env:RUNNER_TEMP", workflow)
         self.assertIn("-OutputAssembly $hostExecutable", workflow)
+        self.assertIn("$componentAssembly = [System.ComponentModel.Component].Assembly.Location", workflow)
+        self.assertIn("$serviceAssembly = [System.ServiceProcess.ServiceBase].Assembly.Location", workflow)
+        self.assertIn("-ReferencedAssemblies @($serviceAssembly, $componentAssembly)", workflow)
         self.assertNotIn("-OutputType ConsoleApplication", workflow)
         self.assertIn("$hostExecutable", workflow)
         self.assertNotIn("$binPath = \"`\"$pwsh`\" -NoLogo", workflow)
