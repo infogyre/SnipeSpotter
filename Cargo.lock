@@ -1424,6 +1424,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "spotter-hardware-service"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "spotter-build",
+ "windows",
+ "windows-service",
+]
+
+[[package]]
 name = "spotter-svc"
 version = "0.1.0"
 dependencies = [

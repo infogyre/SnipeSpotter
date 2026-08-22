@@ -1,0 +1,29 @@
+[package]
+name = "spotter-hardware-service"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[features]
+hardware-experiment = []
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "spotter-hardware-service"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_RemoteDesktop", "Win32_System_Threading"] }
+windows-service = { workspace = true }
+
+[build-dependencies]
+spotter-build = { path = "../spotter-build" }

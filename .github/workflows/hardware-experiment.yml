@@ -144,9 +144,6 @@ jobs:
           if ($env:IMAGE_ALIAS -ne $env:IMAGE) { throw 'matrix image alias does not match selected image' }
           $serviceName = "SpotterHardware-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
           $argumentsPath = Join-Path $env:RUNNER_TEMP "$serviceName.json"
-          $hostPath = Join-Path $env:RUNNER_TEMP "$serviceName.cs"
-          $hostExecutable = Join-Path $env:RUNNER_TEMP "$serviceName.exe"
-          $workerPath = Join-Path $env:RUNNER_TEMP "$serviceName-worker.ps1"
 
           function Wait-ForCondition {
             param([scriptblock]$Condition, [string]$Description, [int]$TimeoutSeconds = 120)
@@ -169,6 +166,12 @@ jobs:
           & $collector -Image $env:IMAGE -ImageAlias $env:IMAGE_ALIAS -Context interactive-admin -Repetition ([int]$env:REPETITION) -SessionId $directSessionId -HmacKeyPath $keyPath -OutputPath $directOutput
           Invoke-ReportValidation -Context interactive-admin
 
+          cargo build --locked --release -p spotter-hardware-service --features hardware-experiment
+          $supportExecutable = Join-Path $env:RUNNER_TEMP 'spotter-hardware-service.exe'
+          Copy-Item -LiteralPath 'target/release/spotter-hardware-service.exe' -Destination $supportExecutable -Force
+          if (-not (Test-Path -LiteralPath $supportExecutable -PathType Leaf)) { throw "hardware support service was not built: $supportExecutable" }
+          $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+          if (-not [IO.Path]::IsPathFullyQualified($pwsh)) { throw "PowerShell host path is not absolute: $pwsh" }
           $arguments = [ordered]@{
             service_name = $serviceName
             collector = $collector
@@ -178,85 +181,10 @@ jobs:
             repetition = [int]$env:REPETITION
             key_path = $keyPath
             output_path = (Join-Path $reportDirectory "$env:IMAGE-LocalSystem-$env:REPETITION.json")
+            pwsh_path = $pwsh
           }
           $arguments | ConvertTo-Json -Compress | Set-Content -LiteralPath $argumentsPath -Encoding utf8
-          $workerScript = @'
-          param([Parameter(Mandatory = $true)][string]$ArgumentsPath)
-          Set-StrictMode -Version Latest
-          $ErrorActionPreference = 'Stop'
-          $arguments = Get-Content -LiteralPath $ArgumentsPath -Raw | ConvertFrom-Json
-          & $arguments.collector -Image $arguments.image -ImageAlias $arguments.image_alias -Context $arguments.context -Repetition ([int]$arguments.repetition) -SessionId ([Diagnostics.Process]::GetCurrentProcess().SessionId) -HmacKeyPath $arguments.key_path -OutputPath $arguments.output_path
-          '@
-          Set-Content -LiteralPath $workerPath -Value $workerScript -Encoding utf8
-          $hostSource = @'
-          using System;
-          using System.Diagnostics;
-          using System.ServiceProcess;
-          using System.Threading.Tasks;
-
-          public sealed class SpotterHardwareService : ServiceBase
-          {
-              private readonly string argumentsPath;
-              private readonly string workerPath;
-              private readonly string pwshPath;
-
-              public SpotterHardwareService(string argumentsPath, string workerPath, string pwshPath)
-              {
-                  ServiceName = "__SERVICE_NAME__";
-                  CanStop = true;
-                  this.argumentsPath = argumentsPath;
-                  this.workerPath = workerPath;
-                  this.pwshPath = pwshPath;
-              }
-
-              protected override void OnStart(string[] args)
-              {
-                  Task.Run(() =>
-                  {
-                      var psi = new ProcessStartInfo
-                      {
-                          FileName = pwshPath,
-                          UseShellExecute = false,
-                          CreateNoWindow = true
-                      };
-                      psi.ArgumentList.Add("-NoLogo");
-                      psi.ArgumentList.Add("-NoProfile");
-                      psi.ArgumentList.Add("-NonInteractive");
-                      psi.ArgumentList.Add("-File");
-                      psi.ArgumentList.Add(workerPath);
-                      psi.ArgumentList.Add(argumentsPath);
-                      using (var process = Process.Start(psi))
-                      {
-                          process.WaitForExit();
-                          if (process.ExitCode != 0) throw new InvalidOperationException("collector exited with code " + process.ExitCode);
-                      }
-                      Stop();
-                  });
-              }
-
-              protected override void OnStop() { }
-
-              public static void Run(string argumentsPath, string workerPath, string pwshPath)
-              {
-                  ServiceBase.Run(new SpotterHardwareService(argumentsPath, workerPath, pwshPath));
-              }
-          }
-
-          public static class Program
-          {
-              public static void Main(string[] args)
-              {
-                  SpotterHardwareService.Run(args[0], args[1], args[2]);
-              }
-          }
-          '@
-          $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
-          $hostSource = $hostSource.Replace('__SERVICE_NAME__', $serviceName)
-          Set-Content -LiteralPath $hostPath -Value $hostSource -Encoding utf8
-          $serviceAssembly = [System.ServiceProcess.ServiceBase].Assembly.Location
-          $componentAssembly = [System.ComponentModel.Component].Assembly.Location
-          Add-Type -TypeDefinition $hostSource -Language CSharp -OutputAssembly $hostExecutable -ReferencedAssemblies @($serviceAssembly, $componentAssembly)
-          $binPath = "`"$hostExecutable`" `"$argumentsPath`" `"$workerPath`" `"$pwsh`""
+          $binPath = "`"$supportExecutable`" --service-name `"$serviceName`" --config `"$argumentsPath`""
           $scOutput = & sc.exe create $serviceName 'binPath=' $binPath 'obj=' 'LocalSystem' 'start=' 'demand' 'type=' 'own' 2>&1
           if ($LASTEXITCODE -ne 0) {
             throw "failed to create LocalSystem service ${serviceName}: $($scOutput -join ' ')"
@@ -281,7 +209,7 @@ jobs:
             Wait-ForCondition -Description "LocalSystem service deletion" -Condition {
               $null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
             }
-            Remove-Item -LiteralPath $argumentsPath, $hostPath, $hostExecutable, $workerPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $argumentsPath -Force -ErrorAction SilentlyContinue
           }
       - name: Upload validated redacted reports
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -310,9 +238,7 @@ jobs:
           }
           foreach ($path in @(
             (Join-Path $env:RUNNER_TEMP "$serviceName.json"),
-            (Join-Path $env:RUNNER_TEMP "$serviceName.cs"),
-            (Join-Path $env:RUNNER_TEMP "$serviceName.exe"),
-            (Join-Path $env:RUNNER_TEMP "$serviceName-worker.ps1"),
+            (Join-Path $env:RUNNER_TEMP "spotter-hardware-service.exe"),
             (Join-Path $env:RUNNER_TEMP "snipespotter-hardware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION.key")
           )) {
             try { Remove-Item -LiteralPath $path -Force -ErrorAction Stop } catch { if (Test-Path -LiteralPath $path) { $cleanupFailures += $_.Exception.Message } }
