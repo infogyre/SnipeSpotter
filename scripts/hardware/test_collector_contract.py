@@ -162,7 +162,10 @@ class CollectorContractTests(unittest.TestCase):
         """Run the real producer functions with bounded synthetic inputs."""
         pwsh = shutil.which("pwsh")
         if pwsh is None:
-            self.skipTest("pwsh is required for the PowerShell contract probe")
+            self.fail(
+                "pwsh is required for the PowerShell contract probe; "
+                "install PowerShell 7 and ensure pwsh is on PATH"
+            )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             probe_path = Path(temporary_directory) / "collector-contract-probe.ps1"
