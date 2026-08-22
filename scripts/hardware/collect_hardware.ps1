@@ -59,7 +59,7 @@ function Get-HmacFragment {
     }
 }
 
-function Get-ClassifiedError { 
+function Get-ClassifiedError {
     param([System.Management.Automation.ErrorRecord]$ErrorRecord)
     $message = $ErrorRecord.Exception.Message.ToLowerInvariant()
     if ($message -match 'access is denied|unauthorized|permission') { return 'access_denied' }
@@ -222,9 +222,9 @@ $apiResults = @(
 $smbiosResult = Get-RsmbSummary
 $wmiResult = Get-WmiSummary
 $chassisResult = Get-ChassisSummary
-$smbios = $smbiosResult.summary
-$wmi = $wmiResult.summary
-$chassis = $chassisResult.summary
+$smbios = $smbiosResult['summary']
+$wmi = $wmiResult['summary']
+$chassis = $chassisResult['summary']
 $apiResults[1].result = $smbiosResult.status
 $apiResults[2].result = $wmiResult.status
 $apiResults[3].result = $chassisResult.status
