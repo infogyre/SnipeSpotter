@@ -1,0 +1,69 @@
+"""Static contract checks for hosted Windows service registration diagnostics."""
+
+import unittest
+from pathlib import Path
+
+WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "hardware-experiment.yml"
+
+
+class HardwareWorkflowContractTests(unittest.TestCase):
+    """Keep temporary LocalSystem registration observable and correctly tokenized."""
+
+    def test_local_system_registration_preserves_sc_diagnostics_and_argument_boundaries(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("$scOutput = & sc.exe create", workflow)
+        self.assertIn("2>&1", workflow)
+        self.assertIn("binPath=", workflow)
+        self.assertIn("'obj=' 'LocalSystem'", workflow)
+        self.assertIn("'start=' 'demand'", workflow)
+        self.assertIn("'type=' 'own'", workflow)
+        self.assertIn("$scOutput -join", workflow)
+        self.assertNotIn(
+            '& sc.exe create $serviceName "binPath= $binPath"',
+            workflow,
+        )
+
+    def test_local_system_start_failure_keeps_native_scm_diagnostics(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("$startOutput = & sc.exe start $serviceName 2>&1", workflow)
+        self.assertIn("$queryOutput = & sc.exe queryex $serviceName 2>&1", workflow)
+        self.assertIn("$configOutput = & sc.exe qc $serviceName 2>&1", workflow)
+        self.assertIn("$startOutput -join", workflow)
+        self.assertIn("$queryOutput -join", workflow)
+        self.assertIn("$configOutput -join", workflow)
+        self.assertNotIn("Start-Service -Name $serviceName -ErrorAction Stop", workflow)
+
+    def test_local_system_host_is_a_compiled_service_executable(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("$hostExecutable = Join-Path $env:RUNNER_TEMP", workflow)
+        self.assertIn("-OutputAssembly $hostExecutable", workflow)
+        self.assertIn("$componentAssembly = [System.ComponentModel.Component].Assembly.Location", workflow)
+        self.assertIn("$serviceAssembly = [System.ServiceProcess.ServiceBase].Assembly.Location", workflow)
+        self.assertIn("-ReferencedAssemblies @($serviceAssembly, $componentAssembly)", workflow)
+        self.assertNotIn("-OutputType ConsoleApplication", workflow)
+        self.assertIn("$hostExecutable", workflow)
+        self.assertNotIn("$binPath = \"`\"$pwsh`\" -NoLogo", workflow)
+
+    def test_compiled_host_uses_a_separate_worker_and_argument_boundaries(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("$workerPath = Join-Path $env:RUNNER_TEMP", workflow)
+        self.assertIn("$workerScript = @'", workflow)
+        self.assertIn('psi.ArgumentList.Add("-File")', workflow)
+        self.assertIn('psi.ArgumentList.Add(workerPath)', workflow)
+        self.assertNotIn('Arguments = "-NoLogo -NoProfile -NonInteractive -Command', workflow)
+        self.assertIn('FileName = pwshPath', workflow)
+        self.assertIn('SpotterHardwareService.Run(args[0], args[1], args[2])', workflow)
+        self.assertIn("$hostExecutable`\" `\"$argumentsPath`\" `\"$workerPath`\" `\"$pwsh`\"", workflow)
+        self.assertNotIn("Replace('__PWSH_PATH__'", workflow)
+        self.assertIn("Remove-Item -LiteralPath $argumentsPath, $hostPath, $hostExecutable, $workerPath", workflow)
+        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName.cs"', workflow)
+        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName.exe"', workflow)
+        self.assertIn('Join-Path $env:RUNNER_TEMP "$serviceName-worker.ps1"', workflow)
+
+
+if __name__ == "__main__":
+    unittest.main()

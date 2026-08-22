@@ -59,7 +59,7 @@ function Get-HmacFragment {
     }
 }
 
-function Get-ClassifiedError { 
+function Get-ClassifiedError {
     param([System.Management.Automation.ErrorRecord]$ErrorRecord)
     $message = $ErrorRecord.Exception.Message.ToLowerInvariant()
     if ($message -match 'access is denied|unauthorized|permission') { return 'access_denied' }
@@ -181,8 +181,14 @@ function Get-WmiSummary {
             capped = ($rows.Count -ge $MaxRows)
         }
     }
-    if ($result.result -eq 'ok') { return $result.value }
-    return [ordered]@{ status = $result.result; count = 0; array_lengths = [ordered]@{ manufacturer_name = @(); product_code_id = @(); serial_number_id = @(); week_of_manufacture = @(); year_of_manufacture = @() }; placeholder_classes = @(); capped = $false }
+    if ($result.result -eq 'ok') {
+        return [ordered]@{ summary = $result.value; status = $result.result; duration_ms = $result.duration_ms }
+    }
+    return [ordered]@{
+        summary = [ordered]@{ status = $result.result; count = 0; array_lengths = [ordered]@{ manufacturer_name = @(); product_code_id = @(); serial_number_id = @(); week_of_manufacture = @(); year_of_manufacture = @() }; placeholder_classes = @(); capped = $false }
+        status = $result.result
+        duration_ms = $result.duration_ms
+    }
 }
 
 function Get-ChassisSummary {
@@ -200,8 +206,14 @@ function Get-ChassisSummary {
         }
         [ordered]@{ status = 'ok'; count = $rows.Count; class_counts = $counts; capped = ($rows.Count -ge 16) }
     }
-    if ($result.result -eq 'ok') { return $result.value }
-    return [ordered]@{ status = $result.result; count = 0; class_counts = [ordered]@{ portable = 0; desktop = 0; server = 0; enclosure = 0; unknown = 0 }; capped = $false }
+    if ($result.result -eq 'ok') {
+        return [ordered]@{ summary = $result.value; status = $result.result; duration_ms = $result.duration_ms }
+    }
+    return [ordered]@{
+        summary = [ordered]@{ status = $result.result; count = 0; class_counts = [ordered]@{ portable = 0; desktop = 0; server = 0; enclosure = 0; unknown = 0 }; capped = $false }
+        status = $result.result
+        duration_ms = $result.duration_ms
+    }
 }
 
 $build = [ordered]@{
@@ -222,9 +234,9 @@ $apiResults = @(
 $smbiosResult = Get-RsmbSummary
 $wmiResult = Get-WmiSummary
 $chassisResult = Get-ChassisSummary
-$smbios = $smbiosResult.summary
-$wmi = $wmiResult.summary
-$chassis = $chassisResult.summary
+$smbios = $smbiosResult['summary']
+$wmi = $wmiResult['summary']
+$chassis = $chassisResult['summary']
 $apiResults[1].result = $smbiosResult.status
 $apiResults[2].result = $wmiResult.status
 $apiResults[3].result = $chassisResult.status

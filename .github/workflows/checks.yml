@@ -75,6 +75,10 @@ jobs:
           }
           Write-Host "PSScriptAnalyzer: $($files.Count) file(s) clean"
 
+      - name: Hardware collector contract
+        shell: pwsh
+        run: python -m unittest discover -s scripts/hardware -p 'test_*.py' -v
+
   package-contract:
     name: Package contract
     runs-on: ubuntu-latest
