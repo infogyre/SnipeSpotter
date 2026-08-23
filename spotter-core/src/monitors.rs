@@ -170,4 +170,55 @@ mod tests {
             .find(|entry| entry.serial == "B");
         assert!(entry.is_some_and(|entry| entry.absent_since.is_none()));
     }
+
+    /// Real WMI monitor data captured from a Dell Precision 3460 with two
+    /// monitors. All identifiers redacted to deterministic placeholders.
+    /// Proves `diff_monitors` handles real monitor shapes from physical hardware.
+    #[test]
+    fn diff_handles_real_physical_wmi_fixture() {
+        let raw = include_str!("../../tests/fixtures/physical/wmi_monitors.json");
+        let fixture: Vec<serde_json::Value> =
+            serde_json::from_str(raw).expect("fixture must be valid JSON");
+
+        let monitors: Vec<MonitorInfo> = fixture
+            .iter()
+            .filter(|m| {
+                m.get("active")
+                    .and_then(serde_json::Value::as_bool)
+                    .is_some_and(std::convert::identity)
+            })
+            .map(|m| MonitorInfo {
+                manufacturer_code: m["manufacturer_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                product_code: m["product_code"].as_str().unwrap_or_default().to_owned(),
+                serial: m["serial"].as_str().unwrap_or_default().to_owned(),
+                manufacture_week: u8::try_from(
+                    m["week_of_manufacture"].as_u64().unwrap_or_default(),
+                )
+                .unwrap_or_default(),
+                manufacture_year: u16::try_from(
+                    m["year_of_manufacture"].as_u64().unwrap_or_default(),
+                )
+                .unwrap_or_default(),
+            })
+            .collect();
+
+        assert_eq!(monitors.len(), 2, "fixture has 2 active monitors");
+        assert!(
+            monitors[0].serial.starts_with("SER"),
+            "serials must be redacted"
+        );
+        assert!(
+            monitors[1].serial.starts_with("SER"),
+            "serials must be redacted"
+        );
+
+        // Feed through the planner to prove it handles real shapes.
+        let diff = diff_monitors(&monitors, &MonitorSyncState::default(), at(1));
+        assert_eq!(diff.new_monitors.len(), 2);
+        assert!(diff.removed_monitors.is_empty());
+        assert_eq!(diff.next_state.entries.len(), 2);
+    }
 }

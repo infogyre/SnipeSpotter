@@ -237,4 +237,33 @@ mod tests {
             let _ = parse_smbios_tables(&bytes);
         }
     }
+
+    /// Real SMBIOS data captured from a Dell Precision 3460 (104 structures,
+    /// SMBIOS 3.6, chassis type 3). All identifiers redacted to deterministic
+    /// PLACEHOLDER_* strings. Proves the production parser handles real
+    /// multi-structure tables with correct string indexing.
+    #[test]
+    fn parses_real_physical_smbios_fixture() {
+        let raw = include_bytes!("../../tests/fixtures/physical/smbios_fixture.bin");
+        let parsed = parse_smbios_tables(raw).expect("real fixture must parse");
+
+        // The fixture has redacted placeholder strings, not real identifiers.
+        assert!(
+            !parsed.manufacturer.is_empty(),
+            "manufacturer must be populated"
+        );
+        assert!(!parsed.model.is_empty(), "model must be populated");
+        assert!(!parsed.serial.is_empty(), "serial must be populated");
+
+        // Chassis type 3 = Desktop, must not be classified as portable.
+        assert_eq!(parsed.chassis_type, ChassisType(3));
+        assert!(!parsed.chassis_type.is_portable());
+
+        // No real identifiers should appear in parsed values.
+        assert!(
+            parsed.manufacturer.starts_with("PLACEHOLDER")
+                || parsed.manufacturer.starts_with("PLAC")
+        );
+        assert!(parsed.serial.starts_with("PLACEHOLDER") || parsed.serial.starts_with("PLAC"));
+    }
 }

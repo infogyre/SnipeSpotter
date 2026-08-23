@@ -1,0 +1,28 @@
+[
+  {
+    "index": 0,
+    "active": true,
+    "manufacturer_name": "MFR0",
+    "manufacturer_name_array_length": 16,
+    "product_code": "PROD0",
+    "product_code_array_length": 16,
+    "serial": "SER0XXX",
+    "serial_array_length": 16,
+    "week_of_manufacture": 45,
+    "year_of_manufacture": 2023,
+    "instance_name": "MONITOR_0"
+  },
+  {
+    "index": 1,
+    "active": true,
+    "manufacturer_name": "MFR1",
+    "manufacturer_name_array_length": 16,
+    "product_code": "PROD1",
+    "product_code_array_length": 16,
+    "serial": "SER1XXX",
+    "serial_array_length": 16,
+    "week_of_manufacture": 45,
+    "year_of_manufacture": 2023,
+    "instance_name": "MONITOR_1"
+  }
+]

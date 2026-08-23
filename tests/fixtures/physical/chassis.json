@@ -1,0 +1,12 @@
+{
+  "types": [
+    3
+  ],
+  "class_counts": {
+    "portable": 0,
+    "desktop": 1,
+    "server": 0,
+    "enclosure": 0,
+    "unknown": 0
+  }
+}

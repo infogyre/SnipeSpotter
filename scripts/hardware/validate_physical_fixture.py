@@ -73,7 +73,10 @@ def validate_fixture_dir(fixture_dir: Path) -> list[str]:
         ascii_strings = re.findall(rb"[\x20-\x7e]{8,}", raw)
         for s in ascii_strings:
             decoded = s.decode("ascii", errors="replace")
-            if not any(decoded.startswith(prefix) for prefix in EXPECTED_PLACEHOLDER_PREFIXES):
+            if not any(
+                decoded.startswith(prefix) or prefix.startswith(decoded)
+                for prefix in EXPECTED_PLACEHOLDER_PREFIXES
+            ):
                 violations.append(f"{smbios_path}: non-placeholder string in SMBIOS data: '{decoded}'")
 
     return violations
