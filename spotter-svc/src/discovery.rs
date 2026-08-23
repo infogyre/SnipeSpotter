@@ -89,7 +89,7 @@ fn read_smbios() -> Result<Vec<u8>> {
     use windows::Win32::System::SystemInformation::{
         FIRMWARE_TABLE_PROVIDER, GetSystemFirmwareTable,
     };
-    const RSMB: FIRMWARE_TABLE_PROVIDER = FIRMWARE_TABLE_PROVIDER(u32::from_le_bytes(*b"RSMB"));
+    const RSMB: FIRMWARE_TABLE_PROVIDER = FIRMWARE_TABLE_PROVIDER(u32::from_be_bytes(*b"RSMB"));
     // SAFETY: The first call uses no output buffer to query the required size.
     let size = unsafe { GetSystemFirmwareTable(RSMB, 0, None) };
     if size == 0 {

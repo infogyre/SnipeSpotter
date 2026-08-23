@@ -99,7 +99,8 @@ public static class SpotterFirmware {
   [DllImport("kernel32.dll", SetLastError=true)] public static extern uint GetSystemFirmwareTable(uint provider, uint id, IntPtr buffer, uint size);
 }
 '@
-        $provider = [BitConverter]::ToUInt32([Text.Encoding]::ASCII.GetBytes('RSMB'), 0)
+        $rsmb = [Text.Encoding]::ASCII.GetBytes('RSMB')
+        $provider = [uint32]($rsmb[0] * 0x1000000 + $rsmb[1] * 0x10000 + $rsmb[2] * 0x100 + $rsmb[3])
         $length = [SpotterFirmware]::GetSystemFirmwareTable($provider, 0, [IntPtr]::Zero, 0)
         if ($length -le 0) { throw 'firmware size unavailable' }
         $boundedLength = [Math]::Min([int]$length, 16384)

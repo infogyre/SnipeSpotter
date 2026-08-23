@@ -39,7 +39,12 @@ public static class SpotterFirmware {
 }
 '@
 
-$provider = [BitConverter]::ToUInt32([Text.Encoding]::ASCII.GetBytes('RSMB'), 0)
+# GetSystemFirmwareTable expects the 'RSMB' FourCC as a big-endian DWORD
+# (matching the C multi-character constant 'RSMB' == 0x52534D42).
+# BitConverter.ToUInt32 on x86/x64 produces little-endian (0x424D5352), which
+# returns ERROR_INVALID_PARAMETER or zero. Use manual big-endian packing instead.
+$rsmb = [Text.Encoding]::ASCII.GetBytes('RSMB')
+$provider = [uint32]($rsmb[0] * 0x1000000 + $rsmb[1] * 0x10000 + $rsmb[2] * 0x100 + $rsmb[3])
 $length = [SpotterFirmware]::GetSystemFirmwareTable($provider, 0, [IntPtr]::Zero, 0)
 if ($length -le 0) { throw 'firmware size unavailable or zero' }
 $boundedLength = [Math]::Min([int]$length, $MaxSmbiosBytes)
