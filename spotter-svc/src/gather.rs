@@ -9,7 +9,10 @@ use spotter_core::{
     sync::{ResolvedMonitor, ResolvedTaxonomy, TaxonomyResolution},
 };
 
-use crate::{discovery::HardwareDiscovery, snipeit_client::SnipeItClient};
+use crate::{
+    ports::{HardwareDiscovery, RemoteReads},
+    snipeit_client::SnipeItClient,
+};
 
 /// Fully gathered remote and local inputs required by the pure sync planner.
 pub struct GatheredSync {
@@ -30,24 +33,27 @@ pub struct GatheredSync {
 ///
 /// Returns an error when local discovery or a non-not-found Snipe-IT operation fails.
 pub async fn gather_sync(
-    discovery: &impl HardwareDiscovery,
-    client: &SnipeItClient,
+    discovery: &(impl HardwareDiscovery + ?Sized),
+    remote: &(impl RemoteReads + ?Sized),
 ) -> Result<GatheredSync> {
-    let (system, monitor_info) = discovery.discover()?;
-    let system_asset = optional_asset(client.find_asset_by_serial(&system.serial).await)?;
-    let system_taxonomy = resolve_taxonomy(client, &system.manufacturer, &system.model).await?;
+    let (system, monitor_info) = discovery.discover().await?;
+    let system_asset = optional_asset(remote.find_asset_by_serial(&system.serial).await)?;
+    let system_taxonomy = remote
+        .resolve_taxonomy(&system.manufacturer, &system.model)
+        .await?;
     let mut monitors = Vec::with_capacity(monitor_info.len());
     let mut warnings = Vec::new();
     for monitor in monitor_info {
-        let asset = optional_asset(client.find_asset_by_serial(&monitor.serial).await)?;
+        let asset = optional_asset(remote.find_asset_by_serial(&monitor.serial).await)?;
         if asset.is_none() {
             warnings.push(format!(
                 "monitor {} has no matching Snipe-IT asset",
                 monitor.serial
             ));
         }
-        let taxonomy =
-            resolve_taxonomy(client, &monitor.manufacturer_code, &monitor.product_code).await?;
+        let taxonomy = remote
+            .resolve_taxonomy(&monitor.manufacturer_code, &monitor.product_code)
+            .await?;
         monitors.push(ResolvedMonitor {
             asset_id: asset.map(|value| value.id).filter(|id| *id != 0),
             monitor,
@@ -69,43 +75,70 @@ pub async fn gather_sync(
     })
 }
 
-fn optional_asset(result: Result<Asset, SnipeItError>) -> Result<Option<Asset>> {
+fn optional_asset(result: Result<Option<Asset>>) -> Result<Option<Asset>> {
     match result {
-        Ok(asset) if asset.id != 0 => Ok(Some(asset)),
-        Ok(_) | Err(SnipeItError::NotFound) => Ok(None),
+        Ok(Some(asset)) if asset.id != 0 => Ok(Some(asset)),
+        Ok(None | Some(_)) => Ok(None),
+        Err(error) if error.downcast_ref::<SnipeItError>() == Some(&SnipeItError::NotFound) => {
+            Ok(None)
+        }
         Err(error) => Err(error).context("failed to resolve Snipe-IT asset"),
     }
 }
 
-async fn resolve_taxonomy(
-    client: &SnipeItClient,
-    manufacturer_name: &str,
-    model_name: &str,
-) -> Result<ResolvedTaxonomy> {
-    let normalized_manufacturer = normalize(manufacturer_name);
-    let normalized_model = normalize(model_name);
-    let manufacturers = client.find_manufacturers(manufacturer_name).await?;
-    let manufacturer = resolve_named(
-        manufacturers
-            .iter()
-            .map(|value| (value.id, value.name.as_str())),
-        &normalized_manufacturer,
-    );
-    let models = client.find_models(model_name).await?;
-    let matching_models = matching_models(&models, &normalized_model, resolved_id(&manufacturer));
-    let model = resolution_from_ids(matching_models.iter().map(|value| value.id));
-    let category = resolution_from_ids(
-        matching_models
-            .iter()
-            .filter_map(|value| value.category.as_ref().map(|category| category.id)),
-    );
-    Ok(ResolvedTaxonomy {
-        manufacturer,
-        category,
-        model,
-        normalized_manufacturer,
-        normalized_model,
-    })
+impl RemoteReads for SnipeItClient {
+    fn find_asset_by_serial<'a>(
+        &'a self,
+        serial: &'a str,
+    ) -> crate::ports::PortFuture<'a, Option<Asset>> {
+        Box::pin(async move {
+            self.find_asset_by_serial(serial)
+                .await
+                .map(Some)
+                .or_else(|error| {
+                    if error == SnipeItError::NotFound {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(anyhow::Error::from)
+        })
+    }
+
+    fn resolve_taxonomy<'a>(
+        &'a self,
+        manufacturer_name: &'a str,
+        model_name: &'a str,
+    ) -> crate::ports::PortFuture<'a, ResolvedTaxonomy> {
+        Box::pin(async move {
+            let normalized_manufacturer = normalize(manufacturer_name);
+            let normalized_model = normalize(model_name);
+            let manufacturers = self.find_manufacturers(manufacturer_name).await?;
+            let manufacturer = resolve_named(
+                manufacturers
+                    .iter()
+                    .map(|value| (value.id, value.name.as_str())),
+                &normalized_manufacturer,
+            );
+            let models = self.find_models(model_name).await?;
+            let matching_models =
+                matching_models(&models, &normalized_model, resolved_id(&manufacturer));
+            let model = resolution_from_ids(matching_models.iter().map(|value| value.id));
+            let category = resolution_from_ids(
+                matching_models
+                    .iter()
+                    .filter_map(|value| value.category.as_ref().map(|category| category.id)),
+            );
+            Ok(ResolvedTaxonomy {
+                manufacturer,
+                category,
+                model,
+                normalized_manufacturer,
+                normalized_model,
+            })
+        })
+    }
 }
 
 fn matching_models<'a>(
@@ -253,9 +286,9 @@ mod tests {
     #[test]
     fn not_found_asset_is_optional_but_other_errors_propagate() {
         assert!(matches!(
-            optional_asset(Err(SnipeItError::NotFound)),
+            optional_asset(Err(SnipeItError::NotFound.into())),
             Ok(None)
         ));
-        assert!(optional_asset(Err(SnipeItError::AuthFailure)).is_err());
+        assert!(optional_asset(Err(SnipeItError::AuthFailure.into())).is_err());
     }
 }

@@ -12,6 +12,9 @@ workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+test-support = []
+
 [[bin]]
 name = "spotter-svc"
 path = "src/main.rs"

@@ -10,6 +10,7 @@ pub mod gather;
 pub mod ipc_server;
 pub mod logging;
 pub mod operation_journal;
+pub mod ports;
 #[cfg(windows)]
 pub mod service;
 pub mod snipeit_client;

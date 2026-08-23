@@ -33,6 +33,13 @@ impl HardwareDiscovery for WindowsHardwareDiscovery {
     }
 }
 
+#[cfg(windows)]
+impl crate::ports::HardwareDiscovery for WindowsHardwareDiscovery {
+    fn discover(&self) -> crate::ports::PortFuture<'_, (SystemInfo, Vec<MonitorInfo>)> {
+        Box::pin(async move { HardwareDiscovery::discover(self) })
+    }
+}
+
 #[cfg(any(windows, test))]
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]

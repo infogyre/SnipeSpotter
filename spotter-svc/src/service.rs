@@ -2,7 +2,11 @@
 
 //! Windows Service Control Manager lifecycle and runtime orchestration.
 
-use std::{ffi::OsString, sync::mpsc, time::Duration};
+use std::{
+    ffi::OsString,
+    sync::{Arc, Mutex, mpsc},
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result};
 use spotter_core::{
@@ -14,6 +18,11 @@ use spotter_core::{
         validate_config_field,
     },
     state::ServiceState as PersistedServiceState,
+};
+
+use crate::ports::{
+    Clock, HardwareDiscovery, PortFuture, RemoteMutations, RemoteReads, SecretProtector,
+    SettingsStore, StateStore,
 };
 use windows_service::{
     define_windows_service,
@@ -30,6 +39,14 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 define_windows_service!(ffi_service_main, service_main);
 
 struct CommandOwner {
+    secret: Box<dyn SecretProtector>,
+    settings_store: Box<dyn SettingsStore>,
+    state_store: Box<dyn StateStore>,
+    discovery: Box<dyn HardwareDiscovery>,
+    remote: Box<dyn RemoteReads>,
+    remote_mutations: Box<dyn RemoteMutations>,
+    clock: Box<dyn Clock>,
+    settings_snapshot: Option<Arc<Mutex<spotter_core::Settings>>>,
     settings_path: std::path::PathBuf,
     state_path: std::path::PathBuf,
     journal_path: std::path::PathBuf,
@@ -40,6 +57,47 @@ struct CommandOwner {
 }
 
 impl CommandOwner {
+    #[cfg(any(test, feature = "test-support"))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the test seam explicitly injects each external boundary"
+    )]
+    pub(crate) fn new_test(
+        secret: impl SecretProtector + 'static,
+        settings_store: impl SettingsStore + 'static,
+        state_store: impl StateStore + 'static,
+        discovery: impl HardwareDiscovery + 'static,
+        remote: impl RemoteReads + 'static,
+        remote_mutations: impl RemoteMutations + 'static,
+        clock: impl Clock + 'static,
+        settings_snapshot: Option<Arc<Mutex<spotter_core::Settings>>>,
+        settings_path: std::path::PathBuf,
+        state_path: std::path::PathBuf,
+        journal_path: std::path::PathBuf,
+        state_key: Vec<u8>,
+        polling_sender: tokio::sync::watch::Sender<u64>,
+        persisted_state: PersistedServiceState,
+        controller: crate::ServiceController,
+    ) -> Self {
+        Self {
+            secret: Box::new(secret),
+            settings_store: Box::new(settings_store),
+            state_store: Box::new(state_store),
+            discovery: Box::new(discovery),
+            remote: Box::new(remote),
+            remote_mutations: Box::new(remote_mutations),
+            clock: Box::new(clock),
+            settings_snapshot,
+            settings_path,
+            state_path,
+            journal_path,
+            state_key,
+            polling_sender,
+            persisted_state,
+            controller,
+        }
+    }
+
     async fn handle(&mut self, command: ServiceCommand) -> IpcResponse {
         match command {
             ServiceCommand::GetConfig => IpcResponse::Config {
@@ -74,7 +132,7 @@ impl CommandOwner {
             anyhow::bail!("service is not configured")
         }
         self.controller.state = crate::FsmState::Syncing;
-        let now = chrono::Utc::now();
+        let now = self.clock.now();
         let result = self.run_sync(now).await;
         match result {
             Ok(warnings) => {
@@ -96,7 +154,7 @@ impl CommandOwner {
                     Some(spotter_core::state::SyncResult::Failed {
                         error: error.to_string(),
                     });
-                crate::state_io::save_state(
+                self.state_store.save(
                     &self.state_path,
                     &mut self.persisted_state,
                     &self.state_key,
@@ -114,7 +172,7 @@ impl CommandOwner {
         if requested_serial.is_some_and(|serial| serial.trim().is_empty()) {
             anyhow::bail!("monitor serial must not be empty")
         }
-        let decrypted = crate::config_io::decrypt_config(&self.controller.settings)?;
+        let decrypted = decrypt_config(&*self.secret, &self.controller.settings)?;
         let mut operations = Vec::new();
         let mut checked_in = Vec::new();
         for entry in &self.persisted_state.known_monitors {
@@ -153,9 +211,9 @@ impl CommandOwner {
             },
             warnings: Vec::new(),
         };
-        let mut client =
-            crate::snipeit_client::SnipeItClient::new(decrypted.url, decrypted.api_token)?;
-        crate::sync_engine::execute_plan(plan, None, &self.journal_path, &mut client).await?;
+        self.remote_mutations
+            .execute_plan(plan, None, &self.journal_path)
+            .await?;
         for result in &checked_in {
             if let Some(entry) = self
                 .persisted_state
@@ -166,17 +224,17 @@ impl CommandOwner {
                 entry.checked_out = false;
             }
         }
-        crate::state_io::save_state(&self.state_path, &mut self.persisted_state, &self.state_key)?;
-        crate::sync_engine::compact_after_state_commit(&self.journal_path)?;
+        self.state_store
+            .save(&self.state_path, &mut self.persisted_state, &self.state_key)?;
+        self.remote_mutations
+            .compact_after_state_commit(&self.journal_path)
+            .await?;
         Ok(IpcResponse::CheckinResult { checked_in })
     }
 
     async fn run_sync(&mut self, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<String>> {
-        let decrypted = crate::config_io::decrypt_config(&self.controller.settings)?;
-        let mut client =
-            crate::snipeit_client::SnipeItClient::new(decrypted.url, decrypted.api_token)?;
-        let discovery = crate::discovery::WindowsHardwareDiscovery;
-        let gathered = crate::gather::gather_sync(&discovery, &client).await?;
+        let decrypted = decrypt_config(&*self.secret, &self.controller.settings)?;
+        let gathered = crate::gather::gather_sync(&*self.discovery, &*self.remote).await?;
         let previous = spotter_core::monitors::MonitorSyncState {
             entries: self.persisted_state.known_monitors.clone(),
         };
@@ -196,13 +254,10 @@ impl CommandOwner {
         );
         plan.warnings.extend(gathered.warnings);
         let computer_asset_id = gathered.system_asset.as_ref().map(|asset| asset.id);
-        let outcome = crate::sync_engine::execute_plan(
-            plan,
-            computer_asset_id,
-            &self.journal_path,
-            &mut client,
-        )
-        .await?;
+        let outcome = self
+            .remote_mutations
+            .execute_plan(plan, computer_asset_id, &self.journal_path)
+            .await?;
         self.persisted_state.last_sync_time = Some(now.to_rfc3339());
         self.persisted_state.last_sync_result = Some(if outcome.warnings.is_empty() {
             spotter_core::state::SyncResult::Success
@@ -221,17 +276,21 @@ impl CommandOwner {
                     asset_tag: asset.asset_tag,
                 });
         self.persisted_state.known_monitors = outcome.next_monitor_state.entries;
-        crate::state_io::save_state(&self.state_path, &mut self.persisted_state, &self.state_key)?;
-        crate::sync_engine::compact_after_state_commit(&self.journal_path)?;
+        self.state_store
+            .save(&self.state_path, &mut self.persisted_state, &self.state_key)?;
+        self.remote_mutations
+            .compact_after_state_commit(&self.journal_path)
+            .await?;
         Ok(outcome.warnings)
     }
 
     fn set_config(&mut self, field: &str, value: &str) -> Result<IpcResponse> {
         let update = validate_config_field(field, value).map_err(anyhow::Error::msg)?;
         let settings = apply_settings_update(&self.controller.settings, &update);
-        crate::config_io::save_settings(&self.settings_path, &settings)?;
+        self.settings_store.save(&self.settings_path, &settings)?;
         self.polling_sender
             .send_replace(settings.polling.interval_hours);
+        self.update_settings_snapshot(&settings);
         self.controller.settings = settings;
         self.refresh_configuration_state();
         Ok(IpcResponse::Ok {
@@ -243,11 +302,14 @@ impl CommandOwner {
         if plaintext.is_empty() {
             anyhow::bail!("API token must not be empty")
         }
-        let encrypted =
-            spotter_win32::dpapi::encrypt(plaintext).context("failed to encrypt API token")?;
+        let encrypted = self
+            .secret
+            .encrypt(plaintext)
+            .context("failed to encrypt API token")?;
         let mut settings = self.controller.settings.clone();
         settings.snipeit.api_token_encrypted = encrypted;
-        crate::config_io::save_settings(&self.settings_path, &settings)?;
+        self.settings_store.save(&self.settings_path, &settings)?;
+        self.update_settings_snapshot(&settings);
         self.controller.settings = settings;
         self.refresh_configuration_state();
         Ok(IpcResponse::Ok {
@@ -286,6 +348,15 @@ impl CommandOwner {
         }
     }
 
+    fn update_settings_snapshot(&self, settings: &spotter_core::Settings) {
+        let Some(snapshot) = &self.settings_snapshot else {
+            return;
+        };
+        if let Ok(mut current) = snapshot.lock() {
+            *current = settings.clone();
+        }
+    }
+
     fn refresh_configuration_state(&mut self) {
         self.controller.state = if config_status(&self.controller.settings).is_empty() {
             crate::FsmState::Idle
@@ -293,6 +364,22 @@ impl CommandOwner {
             crate::FsmState::Unconfigured
         };
     }
+}
+
+fn decrypt_config(
+    secret: &dyn SecretProtector,
+    settings: &spotter_core::Settings,
+) -> Result<crate::config_io::DecryptedConfig> {
+    let token = secret.decrypt(&settings.snipeit.api_token_encrypted)?;
+    let token = secrecy::SecretString::from(
+        String::from_utf8(token).context("decrypted API token is not UTF-8")?,
+    );
+    Ok(crate::config_io::DecryptedConfig {
+        url: settings.snipeit.url.clone(),
+        api_token: token,
+        checkout_status_id: settings.snipeit.checkout_status_id,
+        checkin_status_id: settings.snipeit.checkin_status_id,
+    })
 }
 
 fn state_after_sync_error(error: &anyhow::Error) -> crate::FsmState {
@@ -316,10 +403,163 @@ fn state_after_sync_error(error: &anyhow::Error) -> crate::FsmState {
     crate::FsmState::Error
 }
 
+#[cfg(windows)]
+struct DpapiSecretProtector;
+
+#[cfg(windows)]
+impl SecretProtector for DpapiSecretProtector {
+    fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        spotter_win32::dpapi::encrypt(plaintext)
+    }
+
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        spotter_win32::dpapi::decrypt(ciphertext)
+    }
+}
+
+struct FileSettingsStore;
+
+impl SettingsStore for FileSettingsStore {
+    fn save(&self, path: &std::path::Path, settings: &spotter_core::Settings) -> Result<()> {
+        crate::config_io::save_settings(path, settings)
+    }
+
+    fn load(&self, path: &std::path::Path) -> Result<spotter_core::Settings> {
+        crate::config_io::load_settings(path)
+    }
+}
+
+struct FileStateStore;
+
+impl StateStore for FileStateStore {
+    fn save(
+        &self,
+        path: &std::path::Path,
+        state: &mut PersistedServiceState,
+        key: &[u8],
+    ) -> Result<()> {
+        crate::state_io::save_state(path, state, key)
+    }
+
+    fn load(&self, path: &std::path::Path, key: &[u8]) -> Result<PersistedServiceState> {
+        crate::state_io::load_state(path, key)
+    }
+
+    fn load_or_create_key(&self, path: &std::path::Path) -> Result<Vec<u8>> {
+        crate::state_io::load_or_create_key(path)
+    }
+}
+
+#[cfg(windows)]
+struct WindowsDiscovery;
+
+#[cfg(windows)]
+impl HardwareDiscovery for WindowsDiscovery {
+    fn discover(
+        &self,
+    ) -> PortFuture<
+        '_,
+        (
+            spotter_core::smbios::SystemInfo,
+            Vec<spotter_core::monitors::MonitorInfo>,
+        ),
+    > {
+        Box::pin(async move {
+            crate::discovery::HardwareDiscovery::discover(
+                &crate::discovery::WindowsHardwareDiscovery,
+            )
+        })
+    }
+}
+
+#[cfg(windows)]
+struct ProductionRemote {
+    settings: Arc<Mutex<spotter_core::Settings>>,
+}
+
+#[cfg(windows)]
+impl ProductionRemote {
+    fn client(&self) -> Result<crate::snipeit_client::SnipeItClient> {
+        let settings = self
+            .settings
+            .lock()
+            .map_err(|_| anyhow::anyhow!("production settings lock poisoned"))?
+            .clone();
+        let decrypted = decrypt_config(&DpapiSecretProtector, &settings)?;
+        crate::snipeit_client::SnipeItClient::new(decrypted.url, decrypted.api_token)
+    }
+}
+
+#[cfg(windows)]
+impl RemoteReads for ProductionRemote {
+    fn find_asset_by_serial<'a>(
+        &'a self,
+        serial: &'a str,
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        Box::pin(async move {
+            let client = self.client()?;
+            crate::ports::RemoteReads::find_asset_by_serial(&client, serial).await
+        })
+    }
+
+    fn resolve_taxonomy<'a>(
+        &'a self,
+        manufacturer: &'a str,
+        model: &'a str,
+    ) -> PortFuture<'a, spotter_core::sync::ResolvedTaxonomy> {
+        Box::pin(async move {
+            let client = self.client()?;
+            crate::ports::RemoteReads::resolve_taxonomy(&client, manufacturer, model).await
+        })
+    }
+}
+
+#[cfg(windows)]
+impl RemoteMutations for ProductionRemote {
+    fn execute_plan<'a>(
+        &'a self,
+        plan: spotter_core::sync::SyncPlan,
+        computer_asset_id: Option<u64>,
+        journal_path: &'a std::path::Path,
+    ) -> PortFuture<'a, crate::ports::SyncOutcome> {
+        Box::pin(async move {
+            let mut client = self.client()?;
+            crate::sync_engine::execute_plan(plan, computer_asset_id, journal_path, &mut client)
+                .await
+        })
+    }
+
+    fn recover_pending<'a>(
+        &'a self,
+        journal_path: &'a std::path::Path,
+    ) -> PortFuture<'a, Vec<String>> {
+        Box::pin(async move {
+            let mut client = self.client()?;
+            crate::sync_engine::recover_pending(journal_path, &mut client).await
+        })
+    }
+
+    fn compact_after_state_commit<'a>(
+        &'a self,
+        journal_path: &'a std::path::Path,
+    ) -> PortFuture<'a, ()> {
+        Box::pin(async move { crate::sync_engine::compact_after_state_commit(journal_path) })
+    }
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+}
+
 #[expect(
     clippy::needless_pass_by_value,
     reason = "Result::unwrap_or_else supplies the owned application error"
 )]
+#[cfg(windows)]
 fn protocol_error(error: anyhow::Error) -> IpcResponse {
     IpcResponse::Error {
         message: error.to_string(),
@@ -347,9 +587,11 @@ fn run_service() -> Result<()> {
         .context("another SnipeSpotter service instance is already running")?;
     let root = data_dir();
     let settings_path = root.join("settings.toml");
-    let settings = crate::config_io::load_settings(&settings_path)?;
-    let state_key = crate::state_io::load_or_create_key(&root.join("state-hmac-key.bin"))?;
-    let persisted_state = crate::state_io::load_state(&root.join("state.toml"), &state_key)?;
+    let settings_store = FileSettingsStore;
+    let state_store = FileStateStore;
+    let settings = settings_store.load(&settings_path)?;
+    let state_key = state_store.load_or_create_key(&root.join("state-hmac-key.bin"))?;
+    let persisted_state = state_store.load(&root.join("state.toml"), &state_key)?;
     let _log_guard = crate::logging::initialize(&root.join("logs"), &settings.logging)?;
     let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
     let status_handle = register_controls(shutdown_sender)?;
@@ -365,11 +607,12 @@ fn run_service() -> Result<()> {
         .build()
         .context("failed to create service runtime")?;
     let configured = config_status(&settings).is_empty();
+    let settings_snapshot = Arc::new(Mutex::new(settings.clone()));
+    let remote = ProductionRemote {
+        settings: Arc::clone(&settings_snapshot),
+    };
     if configured {
-        runtime.block_on(recover_operations(
-            &settings,
-            &root.join("operations.jsonl"),
-        ))?;
+        runtime.block_on(recover_operations(&remote, &root.join("operations.jsonl")))?;
     }
     let (polling_sender, polling_receiver) =
         tokio::sync::watch::channel(settings.polling.interval_hours);
@@ -379,7 +622,17 @@ fn run_service() -> Result<()> {
     } else {
         crate::FsmState::Unconfigured
     };
-    let owner = std::sync::Arc::new(tokio::sync::Mutex::new(CommandOwner {
+    let owner = Arc::new(tokio::sync::Mutex::new(CommandOwner {
+        secret: Box::new(DpapiSecretProtector),
+        settings_store: Box::new(settings_store),
+        state_store: Box::new(state_store),
+        discovery: Box::new(WindowsDiscovery),
+        remote: Box::new(remote),
+        remote_mutations: Box::new(ProductionRemote {
+            settings: Arc::clone(&settings_snapshot),
+        }),
+        clock: Box::new(SystemClock),
+        settings_snapshot: Some(settings_snapshot),
         settings_path,
         state_path: root.join("state.toml"),
         journal_path: root.join("operations.jsonl"),
@@ -437,12 +690,10 @@ async fn run_polling_timer(
 }
 
 async fn recover_operations(
-    settings: &spotter_core::Settings,
+    remote: &dyn RemoteMutations,
     journal_path: &std::path::Path,
 ) -> Result<()> {
-    let decrypted = crate::config_io::decrypt_config(settings)?;
-    let mut client = crate::snipeit_client::SnipeItClient::new(decrypted.url, decrypted.api_token)?;
-    let confirmed = crate::sync_engine::recover_pending(journal_path, &mut client).await?;
+    let confirmed = remote.recover_pending(journal_path).await?;
     if !confirmed.is_empty() {
         tracing::info!(
             count = confirmed.len(),
@@ -533,19 +784,139 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the test exercises the full constructor seam with local fakes"
+    )]
     fn full_status_uses_persisted_asset_and_monitor_state() {
         use chrono::DateTime;
         use spotter_core::{monitors::MonitorSyncEntry, state::AssetSummary};
 
+        struct FakeSecret;
+        impl SecretProtector for FakeSecret {
+            fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+                Ok(plaintext.to_vec())
+            }
+
+            fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+                Ok(ciphertext.to_vec())
+            }
+        }
+
+        struct FakeSettingsStore;
+        impl SettingsStore for FakeSettingsStore {
+            fn save(&self, _: &std::path::Path, _: &spotter_core::Settings) -> Result<()> {
+                Ok(())
+            }
+
+            fn load(&self, _: &std::path::Path) -> Result<spotter_core::Settings> {
+                Ok(spotter_core::Settings::default())
+            }
+        }
+
+        struct FakeStateStore;
+        impl StateStore for FakeStateStore {
+            fn save(
+                &self,
+                _: &std::path::Path,
+                _: &mut PersistedServiceState,
+                _: &[u8],
+            ) -> Result<()> {
+                Ok(())
+            }
+
+            fn load(&self, _: &std::path::Path, _: &[u8]) -> Result<PersistedServiceState> {
+                Ok(PersistedServiceState::default())
+            }
+
+            fn load_or_create_key(&self, _: &std::path::Path) -> Result<Vec<u8>> {
+                Ok(vec![0; 32])
+            }
+        }
+
+        struct FakeDiscovery;
+        impl HardwareDiscovery for FakeDiscovery {
+            fn discover(
+                &self,
+            ) -> PortFuture<
+                '_,
+                (
+                    spotter_core::smbios::SystemInfo,
+                    Vec<spotter_core::monitors::MonitorInfo>,
+                ),
+            > {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+        }
+
+        struct FakeReads;
+        impl RemoteReads for FakeReads {
+            fn find_asset_by_serial<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+
+            fn resolve_taxonomy<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a str,
+            ) -> PortFuture<'a, spotter_core::sync::ResolvedTaxonomy> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+        }
+
+        struct FakeMutations;
+        impl RemoteMutations for FakeMutations {
+            fn execute_plan<'a>(
+                &'a self,
+                _: spotter_core::sync::SyncPlan,
+                _: Option<u64>,
+                _: &'a std::path::Path,
+            ) -> PortFuture<'a, crate::ports::SyncOutcome> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+
+            fn recover_pending<'a>(
+                &'a self,
+                _: &'a std::path::Path,
+            ) -> PortFuture<'a, Vec<String>> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+
+            fn compact_after_state_commit<'a>(
+                &'a self,
+                _: &'a std::path::Path,
+            ) -> PortFuture<'a, ()> {
+                Box::pin(async { anyhow::bail!("unused") })
+            }
+        }
+
+        struct FakeClock;
+        impl Clock for FakeClock {
+            fn now(&self) -> chrono::DateTime<chrono::Utc> {
+                chrono::Utc::now()
+            }
+        }
+
         let seen = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .map_or(DateTime::UNIX_EPOCH, |value| value.to_utc());
-        let owner = CommandOwner {
-            settings_path: std::path::PathBuf::new(),
-            state_path: std::path::PathBuf::new(),
-            journal_path: std::path::PathBuf::new(),
-            state_key: vec![0; 32],
-            polling_sender: tokio::sync::watch::channel(4).0,
-            persisted_state: PersistedServiceState {
+        let owner = CommandOwner::new_test(
+            FakeSecret,
+            FakeSettingsStore,
+            FakeStateStore,
+            FakeDiscovery,
+            FakeReads,
+            FakeMutations,
+            FakeClock,
+            None,
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+            std::path::PathBuf::new(),
+            vec![0; 32],
+            tokio::sync::watch::channel(4).0,
+            PersistedServiceState {
                 last_sync_time: Some(String::from("2026-01-01T00:00:00Z")),
                 matched_asset: Some(AssetSummary {
                     id: 7,
@@ -562,8 +933,8 @@ mod tests {
                 }],
                 ..PersistedServiceState::default()
             },
-            controller: crate::ServiceController::new(spotter_core::Settings::default()),
-        };
+            crate::ServiceController::new(spotter_core::Settings::default()),
+        );
         let response = owner.status(true);
         assert!(matches!(response, IpcResponse::StatusFull { .. }));
         if let IpcResponse::StatusFull {
