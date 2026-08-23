@@ -1,9 +1,7 @@
+// On Windows with hardware-experiment, the session query uses unsafe.
 #![cfg_attr(
-    windows,
-    expect(
-        unsafe_code,
-        reason = "The service-session query uses a single Windows API call."
-    )
+    all(windows, feature = "hardware-experiment"),
+    allow(unsafe_code)
 )]
 // pattern: Imperative Shell
 
