@@ -783,133 +783,233 @@ mod tests {
         );
     }
 
+    // ---- Configurable shared fakes ----
+
+    use std::sync::{Arc, Mutex};
+
+    use spotter_core::{
+        monitors::{MonitorInfo, MonitorSyncEntry},
+        smbios::{ChassisType, SystemInfo},
+        snipeit::{Asset, AssetModel, SnipeItError},
+        sync::{ResolvedTaxonomy, TaxonomyResolution},
+    };
+
+    /// Identity secret protector — ciphertext equals plaintext.
+    struct IdentitySecret;
+    impl SecretProtector for IdentitySecret {
+        fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+            Ok(plaintext.to_vec())
+        }
+        fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+            Ok(ciphertext.to_vec())
+        }
+    }
+
+    /// Settings store that records saves into a shared buffer.
+    struct RecordingSettingsStore {
+        saved: Arc<Mutex<Vec<spotter_core::Settings>>>,
+        fail: Arc<Mutex<bool>>,
+    }
+    impl SettingsStore for RecordingSettingsStore {
+        fn save(&self, _: &std::path::Path, settings: &spotter_core::Settings) -> Result<()> {
+            if *self.fail.lock().unwrap() {
+                anyhow::bail!("simulated settings save failure");
+            }
+            self.saved.lock().unwrap().push(settings.clone());
+            Ok(())
+        }
+        fn load(&self, _: &std::path::Path) -> Result<spotter_core::Settings> {
+            Ok(spotter_core::Settings::default())
+        }
+    }
+
+    /// In-memory state store that always succeeds.
+    struct MemoryStateStore;
+    impl StateStore for MemoryStateStore {
+        fn save(&self, _: &std::path::Path, _: &mut PersistedServiceState, _: &[u8]) -> Result<()> {
+            Ok(())
+        }
+        fn load(&self, _: &std::path::Path, _: &[u8]) -> Result<PersistedServiceState> {
+            Ok(PersistedServiceState::default())
+        }
+        fn load_or_create_key(&self, _: &std::path::Path) -> Result<Vec<u8>> {
+            Ok(vec![0; 32])
+        }
+    }
+
+    /// Configurable discovery that can succeed or fail.
+    struct TestDiscovery {
+        fail: Arc<Mutex<bool>>,
+    }
+    impl HardwareDiscovery for TestDiscovery {
+        fn discover(&self) -> PortFuture<'_, (SystemInfo, Vec<MonitorInfo>)> {
+            let fail = *self.fail.lock().unwrap();
+            Box::pin(async move {
+                if fail {
+                    anyhow::bail!("simulated discovery failure");
+                }
+                Ok((
+                    SystemInfo {
+                        manufacturer: String::from("TestCo"),
+                        model: String::from("TestModel"),
+                        serial: String::from("TESTSYS"),
+                        asset_tag: String::new(),
+                        chassis_type: ChassisType(3),
+                    },
+                    vec![],
+                ))
+            })
+        }
+    }
+
+    /// Configurable remote reads that can return success or typed errors.
+    struct TestReads {
+        taxonomy_error: Arc<Mutex<Option<SnipeItError>>>,
+    }
+    impl RemoteReads for TestReads {
+        fn find_asset_by_serial<'a>(&'a self, _: &'a str) -> PortFuture<'a, Option<Asset>> {
+            Box::pin(async {
+                Ok(Some(Asset {
+                    id: 100,
+                    name: String::from("test-computer"),
+                    serial: Some(String::from("TESTSYS")),
+                    asset_tag: Some(String::from("TAG1")),
+                    model: Some(AssetModel {
+                        id: 4,
+                        ..AssetModel::default()
+                    }),
+                    ..Asset::default()
+                }))
+            })
+        }
+        fn resolve_taxonomy<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> PortFuture<'a, ResolvedTaxonomy> {
+            let err = self.taxonomy_error.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some(error) = err {
+                    return Err(anyhow::Error::new(error));
+                }
+                Ok(ResolvedTaxonomy {
+                    manufacturer: TaxonomyResolution::Resolved { id: 1 },
+                    category: TaxonomyResolution::Resolved { id: 2 },
+                    model: TaxonomyResolution::Resolved { id: 4 },
+                    normalized_manufacturer: String::from("TestCo"),
+                    normalized_model: String::from("TestModel"),
+                })
+            })
+        }
+    }
+
+    /// Remote mutations that always succeed.
+    struct SuccessMutations;
+    impl RemoteMutations for SuccessMutations {
+        fn execute_plan<'a>(
+            &'a self,
+            plan: spotter_core::sync::SyncPlan,
+            _: Option<u64>,
+            _: &'a std::path::Path,
+        ) -> PortFuture<'a, crate::ports::SyncOutcome> {
+            Box::pin(async {
+                Ok(crate::sync_engine::ExecutionOutcome {
+                    next_monitor_state: plan.next_monitor_state,
+                    warnings: plan.warnings,
+                    confirmed_operations: Vec::new(),
+                })
+            })
+        }
+        fn recover_pending<'a>(&'a self, _: &'a std::path::Path) -> PortFuture<'a, Vec<String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn compact_after_state_commit<'a>(&'a self, _: &'a std::path::Path) -> PortFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Fixed clock returning a deterministic timestamp.
+    struct FixedClock;
+    impl Clock for FixedClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .map_or(chrono::DateTime::UNIX_EPOCH, |value| value.to_utc())
+        }
+    }
+
+    /// Build configured settings with all required fields filled.
+    fn configured_settings() -> spotter_core::Settings {
+        let mut s = spotter_core::Settings::default();
+        s.snipeit.url = String::from("https://snipeit.test");
+        s.snipeit.checkout_status_id = 5;
+        s.snipeit.checkin_status_id = 6;
+        s.snipeit.api_token_encrypted = b"test-token".to_vec();
+        s
+    }
+
+    /// Build a `CommandOwner` with configurable fakes and temp paths.
+    fn make_owner(
+        settings: spotter_core::Settings,
+        settings_store: RecordingSettingsStore,
+        discovery: TestDiscovery,
+        reads: TestReads,
+        persisted_state: PersistedServiceState,
+    ) -> (CommandOwner, Arc<RecordingSettingsStore>) {
+        let dir = tempfile::tempdir()
+            .unwrap_or_else(|_| panic!("failed to create temp directory for test owner"));
+        // Leak the tempdir so it persists for the owner's lifetime.
+        // It will be cleaned up when the process exits.
+        let root = dir.path().to_path_buf();
+        std::mem::forget(dir);
+
+        let store = Arc::new(settings_store);
+        let owner = CommandOwner::new_test(
+            IdentitySecret,
+            RecordingSettingsStore {
+                saved: Arc::clone(&store.saved),
+                fail: Arc::clone(&store.fail),
+            },
+            MemoryStateStore,
+            discovery,
+            reads,
+            SuccessMutations,
+            FixedClock,
+            None,
+            root.join("settings.toml"),
+            root.join("state.toml"),
+            root.join("operations.jsonl"),
+            vec![0; 32],
+            tokio::sync::watch::channel(4).0,
+            persisted_state,
+            crate::ServiceController::new(settings),
+        );
+        (owner, store)
+    }
+
+    // ---- Existing baseline test (preserved) ----
+
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "the test exercises the full constructor seam with local fakes"
-    )]
     fn full_status_uses_persisted_asset_and_monitor_state() {
         use chrono::DateTime;
-        use spotter_core::{monitors::MonitorSyncEntry, state::AssetSummary};
-
-        struct FakeSecret;
-        impl SecretProtector for FakeSecret {
-            fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
-                Ok(plaintext.to_vec())
-            }
-
-            fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-                Ok(ciphertext.to_vec())
-            }
-        }
-
-        struct FakeSettingsStore;
-        impl SettingsStore for FakeSettingsStore {
-            fn save(&self, _: &std::path::Path, _: &spotter_core::Settings) -> Result<()> {
-                Ok(())
-            }
-
-            fn load(&self, _: &std::path::Path) -> Result<spotter_core::Settings> {
-                Ok(spotter_core::Settings::default())
-            }
-        }
-
-        struct FakeStateStore;
-        impl StateStore for FakeStateStore {
-            fn save(
-                &self,
-                _: &std::path::Path,
-                _: &mut PersistedServiceState,
-                _: &[u8],
-            ) -> Result<()> {
-                Ok(())
-            }
-
-            fn load(&self, _: &std::path::Path, _: &[u8]) -> Result<PersistedServiceState> {
-                Ok(PersistedServiceState::default())
-            }
-
-            fn load_or_create_key(&self, _: &std::path::Path) -> Result<Vec<u8>> {
-                Ok(vec![0; 32])
-            }
-        }
-
-        struct FakeDiscovery;
-        impl HardwareDiscovery for FakeDiscovery {
-            fn discover(
-                &self,
-            ) -> PortFuture<
-                '_,
-                (
-                    spotter_core::smbios::SystemInfo,
-                    Vec<spotter_core::monitors::MonitorInfo>,
-                ),
-            > {
-                Box::pin(async { anyhow::bail!("unused") })
-            }
-        }
-
-        struct FakeReads;
-        impl RemoteReads for FakeReads {
-            fn find_asset_by_serial<'a>(
-                &'a self,
-                _: &'a str,
-            ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
-                Box::pin(async { anyhow::bail!("unused") })
-            }
-
-            fn resolve_taxonomy<'a>(
-                &'a self,
-                _: &'a str,
-                _: &'a str,
-            ) -> PortFuture<'a, spotter_core::sync::ResolvedTaxonomy> {
-                Box::pin(async { anyhow::bail!("unused") })
-            }
-        }
-
-        struct FakeMutations;
-        impl RemoteMutations for FakeMutations {
-            fn execute_plan<'a>(
-                &'a self,
-                _: spotter_core::sync::SyncPlan,
-                _: Option<u64>,
-                _: &'a std::path::Path,
-            ) -> PortFuture<'a, crate::ports::SyncOutcome> {
-                Box::pin(async { anyhow::bail!("unused") })
-            }
-
-            fn recover_pending<'a>(
-                &'a self,
-                _: &'a std::path::Path,
-            ) -> PortFuture<'a, Vec<String>> {
-                Box::pin(async { anyhow::bail!("unused") })
-            }
-
-            fn compact_after_state_commit<'a>(
-                &'a self,
-                _: &'a std::path::Path,
-            ) -> PortFuture<'a, ()> {
-                Box::pin(async { anyhow::bail!("unused") })
-            }
-        }
-
-        struct FakeClock;
-        impl Clock for FakeClock {
-            fn now(&self) -> chrono::DateTime<chrono::Utc> {
-                chrono::Utc::now()
-            }
-        }
+        use spotter_core::state::AssetSummary;
 
         let seen = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
             .map_or(DateTime::UNIX_EPOCH, |value| value.to_utc());
         let owner = CommandOwner::new_test(
-            FakeSecret,
-            FakeSettingsStore,
-            FakeStateStore,
-            FakeDiscovery,
-            FakeReads,
-            FakeMutations,
-            FakeClock,
+            IdentitySecret,
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            MemoryStateStore,
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            SuccessMutations,
+            FixedClock,
             None,
             std::path::PathBuf::new(),
             std::path::PathBuf::new(),
@@ -947,5 +1047,330 @@ mod tests {
             assert_eq!(monitors.len(), 1);
             assert_eq!(monitors[0].asset_id, Some(8));
         }
+    }
+
+    // ---- Configuration command tests ----
+
+    #[tokio::test]
+    async fn set_config_persists_and_reloads_before_response() {
+        let (mut owner, store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        let response = owner
+            .handle(ServiceCommand::SetConfig {
+                field: String::from("polling.interval_hours"),
+                value: String::from("12"),
+            })
+            .await;
+        assert!(matches!(response, IpcResponse::Ok { .. }));
+        let saved = store.saved.lock().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].polling.interval_hours, 12);
+    }
+
+    #[tokio::test]
+    async fn set_config_save_failure_preserves_active_settings() {
+        let (mut owner, _store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(true)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        let original_interval = owner.controller.settings.polling.interval_hours;
+        let response = owner
+            .handle(ServiceCommand::SetConfig {
+                field: String::from("polling.interval_hours"),
+                value: String::from("12"),
+            })
+            .await;
+        assert!(matches!(response, IpcResponse::Error { .. }));
+        assert_eq!(
+            owner.controller.settings.polling.interval_hours,
+            original_interval
+        );
+    }
+
+    #[tokio::test]
+    async fn set_token_encrypts_and_persists_ciphertext_only() {
+        let (mut owner, store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        let token = b"my-secret-api-token";
+        let response = owner
+            .handle(ServiceCommand::SetToken {
+                value: String::from_utf8_lossy(token).into_owned(),
+            })
+            .await;
+        assert!(matches!(response, IpcResponse::Ok { .. }));
+        let saved = store.saved.lock().unwrap();
+        assert_eq!(saved.len(), 1);
+        // IdentitySecret: ciphertext == plaintext bytes
+        assert_eq!(saved[0].snipeit.api_token_encrypted, token.to_vec());
+        // The token string must not appear as-is in a serialized form
+        let toml_text = toml::to_string(&saved[0]).unwrap_or_default();
+        assert!(
+            !toml_text.contains("my-secret-api-token"),
+            "plaintext token must not appear in serialized settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_token_rejects_empty_token() {
+        let (mut owner, store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        let response = owner
+            .handle(ServiceCommand::SetToken {
+                value: String::new(),
+            })
+            .await;
+        assert!(matches!(response, IpcResponse::Error { .. }));
+        let saved = store.saved.lock().unwrap();
+        assert!(saved.is_empty(), "no save should occur for empty token");
+    }
+
+    #[tokio::test]
+    async fn get_config_is_redacted_after_token_update() {
+        let (mut owner, _store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        owner
+            .handle(ServiceCommand::SetToken {
+                value: String::from("new-secret-token"),
+            })
+            .await;
+        let response = owner.handle(ServiceCommand::GetConfig).await;
+        if let IpcResponse::Config { settings, .. } = response {
+            assert!(
+                settings.snipeit.api_token_encrypted.is_empty(),
+                "GetConfig must redact the encrypted token"
+            );
+        } else {
+            panic!("GetConfig must return IpcResponse::Config");
+        }
+    }
+
+    // ---- Sync orchestration tests ----
+
+    #[tokio::test]
+    async fn trigger_sync_success_returns_ok() {
+        let (mut owner, _store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        let response = owner.handle(ServiceCommand::TriggerSync).await;
+        assert!(matches!(response, IpcResponse::Ok { .. }));
+    }
+
+    #[tokio::test]
+    async fn trigger_sync_auth_failure_results_in_unconfigured() {
+        let (mut owner, _store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(Some(SnipeItError::AuthFailure))),
+            },
+            PersistedServiceState::default(),
+        );
+        let _ = owner.handle(ServiceCommand::TriggerSync).await;
+        assert_eq!(owner.controller.state, crate::FsmState::Unconfigured);
+    }
+
+    #[tokio::test]
+    async fn trigger_sync_transient_failure_results_in_error() {
+        let (mut owner, _store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(true)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        let _ = owner.handle(ServiceCommand::TriggerSync).await;
+        assert_eq!(owner.controller.state, crate::FsmState::Error);
+    }
+
+    #[tokio::test]
+    async fn trigger_sync_when_unconfigured_returns_error() {
+        let (mut owner, _store) = make_owner(
+            spotter_core::Settings::default(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        let response = owner.handle(ServiceCommand::TriggerSync).await;
+        assert!(matches!(response, IpcResponse::Error { .. }));
+    }
+
+    // ---- Forced check-in tests ----
+
+    #[tokio::test]
+    async fn checkin_all_selects_only_absent_checked_out_with_asset_ids() {
+        let seen = FixedClock.now();
+        let state = PersistedServiceState {
+            known_monitors: vec![
+                // Eligible: absent, checked out, has asset ID
+                MonitorSyncEntry {
+                    serial: String::from("ELIG"),
+                    snipeit_asset_id: Some(200),
+                    last_seen: seen,
+                    absent_since: Some(seen),
+                    checked_out: true,
+                },
+                // Not eligible: not absent
+                MonitorSyncEntry {
+                    serial: String::from("PRESENT"),
+                    snipeit_asset_id: Some(201),
+                    last_seen: seen,
+                    absent_since: None,
+                    checked_out: true,
+                },
+                // Not eligible: not checked out
+                MonitorSyncEntry {
+                    serial: String::from("RETURNED"),
+                    snipeit_asset_id: Some(202),
+                    last_seen: seen,
+                    absent_since: Some(seen),
+                    checked_out: false,
+                },
+                // Not eligible: no asset ID
+                MonitorSyncEntry {
+                    serial: String::from("NOMAP"),
+                    snipeit_asset_id: None,
+                    last_seen: seen,
+                    absent_since: Some(seen),
+                    checked_out: true,
+                },
+            ],
+            ..PersistedServiceState::default()
+        };
+        let (mut owner, _store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            state,
+        );
+        let response = owner.handle(ServiceCommand::CheckinAll).await;
+        if let IpcResponse::CheckinResult { checked_in } = response {
+            assert_eq!(checked_in.len(), 1);
+            assert_eq!(checked_in[0].serial, "ELIG");
+            assert_eq!(checked_in[0].asset_id, 200);
+        } else {
+            panic!("CheckinAll must return IpcResponse::CheckinResult");
+        }
+    }
+
+    #[tokio::test]
+    async fn checkin_serial_rejects_unknown_monitor() {
+        let (mut owner, _store) = make_owner(
+            configured_settings(),
+            RecordingSettingsStore {
+                saved: Arc::new(Mutex::new(Vec::new())),
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestDiscovery {
+                fail: Arc::new(Mutex::new(false)),
+            },
+            TestReads {
+                taxonomy_error: Arc::new(Mutex::new(None)),
+            },
+            PersistedServiceState::default(),
+        );
+        let response = owner
+            .handle(ServiceCommand::CheckinSerial {
+                serial: String::from("UNKNOWN"),
+            })
+            .await;
+        assert!(matches!(response, IpcResponse::Error { .. }));
     }
 }
