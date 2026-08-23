@@ -1,8 +1,5 @@
 // On Windows with hardware-experiment, the session query uses unsafe.
-#![cfg_attr(
-    all(windows, feature = "hardware-experiment"),
-    allow(unsafe_code)
-)]
+#![cfg_attr(all(windows, feature = "hardware-experiment"), allow(unsafe_code))]
 // pattern: Imperative Shell
 
 //! Temporary Windows service host for the privacy-safe hardware experiment.
@@ -89,12 +86,12 @@ mod windows_service_host {
             })
             .map_err(|error| format!("failed to register hardware service controls: {error}"))?;
         set_status(
-            &status_handle,
+            status_handle,
             ServiceState::StartPending,
             1,
             Duration::from_secs(30),
         )?;
-        set_status(&status_handle, ServiceState::Running, 0, Duration::ZERO)?;
+        set_status(status_handle, ServiceState::Running, 0, Duration::ZERO)?;
 
         let mut collector = spawn_collector(&config)?;
         let service_result = loop {
@@ -122,7 +119,7 @@ mod windows_service_host {
                 }
             }
         };
-        set_status(&status_handle, ServiceState::Stopped, 0, Duration::ZERO)?;
+        set_status(status_handle, ServiceState::Stopped, 0, Duration::ZERO)?;
         service_result
     }
 
@@ -232,13 +229,13 @@ mod windows_service_host {
     fn current_session_id() -> Result<u32, String> {
         let mut session_id = 0_u32;
         // SAFETY: The process ID is returned by Windows, and `session_id` is valid writable storage.
-        unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session_id) }
+        unsafe { ProcessIdToSessionId(GetCurrentProcessId(), std::ptr::addr_of_mut!(session_id)) }
             .map_err(|error| format!("failed to query service session ID: {error}"))?;
         Ok(session_id)
     }
 
     fn set_status(
-        handle: &windows_service::service_control_handler::ServiceStatusHandle,
+        handle: windows_service::service_control_handler::ServiceStatusHandle,
         state: ServiceState,
         checkpoint: u32,
         wait_hint: Duration,
