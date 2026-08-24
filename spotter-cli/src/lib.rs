@@ -158,10 +158,13 @@ pub fn dispatch(
         })?),
         Command::Sync => Some(transport.send(&ServiceCommand::TriggerSync)?),
         Command::Checkin(args) => {
+            if !args.all && args.serial.is_none() {
+                bail!("specify --all or a monitor serial");
+            }
             if !args.yes
                 && !confirmation.confirm("Check in the selected monitor asset(s)? [y/N] ")?
             {
-                bail!("check-in cancelled")
+                bail!("check-in cancelled");
             }
             if args.all {
                 Some(transport.send(&ServiceCommand::CheckinAll)?)
