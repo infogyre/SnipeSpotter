@@ -55,13 +55,14 @@ Parses `PRODUCT_NAME` and `COMPANY_NAME` from `spotter-core/src/identity.rs` at 
 Implements the Gather -- Process -- Persist cycle:
 
 - **FSM** (`fsm.rs`): Enum + match loop. All states visible in one function. The FSM is the single owner of active config, Snipe-IT client, sync execution, and in-memory state. Commands are serialized: one sync/check-in at a time, duplicate triggers coalesce, config updates commit atomically.
+- **Production owner test boundary** (`service.rs`): `CommandOwner::handle` remains the production orchestration subject. Its external boundaries are intentionally narrow: secret protection, settings/state/journal persistence, clock/path inputs, hardware discovery, remote reads, and remote mutations. Test-support construction substitutes only those ports and uses unique temporary roots/endpoints; production construction continues to use DPAPI, ProgramData, Windows discovery, and the authenticated Snipe-IT client.
 - **Hardware discovery** (`discovery.rs`): `discover_hardware()` calls `GetSystemFirmwareTable` for SMBIOS and WMI `WmiMonitorID` for monitors. Abstracted behind a `HardwareDiscovery` trait with real and mock implementations.
 - **Snipe-IT client** (`snipeit_client.rs`): `reqwest`-based HTTP client with bearer token auth, rate limit handling (`X-RateLimit-Remaining`, `Retry-After`), pagination, and `Option<String>` base URL override for wiremock testing.
 - **Sync engine** (`sync_engine.rs`): Orchestrates gather (discover hardware, find assets by serial, resolve taxonomy, load prior state) -- process (`plan_sync()`) -- persist (journal each operation, reconcile before execution, mark confirmed, persist state delta).
 - **IPC server** (`ipc_server.rs`): Named-pipe server with JSON-over-newline protocol. Transport handlers validate framing and enqueue `FsmCommand` values to the FSM. Each request carries a one-shot response sender for committed results.
 - **Config I/O** (`config_io.rs`): Crash-safe Windows replacement via `ReplaceFileW` / `MoveFileExW`. DPAPI decryption wraps the token in `SecretString`.
 - **State I/O** (`state_io.rs`): HMAC-signed state with crash-safe replacement. HMAC key generated with `getrandom` on first run.
-- **Operation journal** (`operation_journal.rs`): Append-only, fsynced journal of prepared/confirmed operations with deterministic IDs. Recovery loads signed state plus pending records, reconciles, retries only operations still not in desired state, then compacts atomically.
+- **Operation journal** (`operation_journal.rs`): Append-only, fsynced journal of `Prepared` → `RemoteOutcomeObserved` → `StateCommitted` records with deterministic IDs. Recovery loads signed state plus pending evidence, reconciles only operations without an observed outcome, applies validated candidate-state evidence, and compacts only after the signed state commit.
 - **Logging** (`logging.rs`): `tracing-subscriber` with `tracing-appender` rolling file appender. Daily rotation, configurable level and retention.
 - **Service registration** (`service.rs`): `windows-service` crate for SCM integration. Service name: `SnipeSpotter`, account: `LocalSystem`, start type: automatic.
 
@@ -118,10 +119,11 @@ sequenceDiagram
 
 Operation recovery:
 
-- Before each external mutation, the engine durably appends a journal entry keyed by a deterministic `operation_id` (operation kind + source asset + target/status + sync generation).
+- Before each external mutation, the engine durably appends a `Prepared` record keyed by a deterministic `operation_id` (operation kind + source asset + target/status + sync generation) and binds the serialized operation payload to that ID.
 - Before execution, the engine reconciles the current server assignment/status. If the desired state is already applied, it treats that as success.
-- After each confirmed response, the engine durably marks the operation complete and persists the monitor-state delta.
-- On restart, recovery loads signed state plus pending journal records, queries Snipe-IT, records confirmed outcomes, retries only operations still not in desired state, then compacts atomically.
+- After each confirmed or reconciled response, the engine durably appends `RemoteOutcomeObserved` with a validated complete candidate signed-state snapshot. The candidate includes the exact matched-asset and monitor state reached by that operation, including authoritative PATCH metadata.
+- The owner persists the candidate signed state before appending `StateCommitted`; only then may it compact the journal. A failed state save or journal commit leaves the prior active state or recoverable evidence intact.
+- On restart, recovery processes pending records in durable `Prepared` order, reconciles both prepared and observed operations against Snipe-IT, applies validated candidate snapshots or operation-specific legacy deltas to the loaded signed state, persists the result, appends `StateCommitted`, and compacts atomically.
 
 ## Security boundaries
 
@@ -131,6 +133,14 @@ Operation recovery:
 - **Signed state**: HMAC-SHA256 over canonical JSON that excludes the HMAC field. Constant-time verification via `subtle`. Tampered state is rejected; the operator preserves files for diagnosis rather than deleting them.
 - **IPC line limit**: 64 KiB maximum per request or response line to prevent DoS.
 - **Elevation**: CLI manifest requires `requireAdministrator`. Runtime `is_elevated()` check as belt-and-suspenders backup.
+
+## Hosted hardware experiment boundary
+
+The optional hosted hardware experiment is deliberately separate from the product runtime and existing raw fixture recon scripts. It lives under `scripts/hardware/` and is invoked only by `.github/workflows/hardware-experiment.yml`; the workflow records the protected `awaiting_operator_hardware_approval` checkpoint after the observation matrix and before any promotion.
+
+Its imperative-shell collector (`collect_hardware.ps1`) gathers only bounded summaries: requested runner image and alias, exact runner/build metadata, process bitness, caller class/context, the numeric Windows process session ID captured in each context, classified API results and durations, SMBIOS lengths/type histograms, WMI counts/array lengths/placeholder classes, chassis class counts, and HMAC fragments. The workflow creates one protected temporary HMAC key per image/repetition and shares it between direct-admin and LocalSystem collection; it is never uploaded and is removed during failure-safe cleanup. Raw firmware, EDID, WMI strings, serials, asset tags, environment dumps, tokens, and exception text are never emitted.
+
+`privacy_policy.py` is the functional-core validator. It applies a closed schema, maximum sizes/counts, token/key/payload rejection, and the invariant that the HMAC key and raw values are absent from the report. `validate_report.py` emits only generic pass/fail text and runs before artifact upload. Reports are diagnostic-only, retained for at most seven days, and cannot promote releases, mutate Snipe-IT, or claim physical hardware coverage. See [the experiment policy](hardware-experiment-policy.md) and [report template](hardware-report-template.md).
 
 ## Monitor check-in policy
 

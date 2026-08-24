@@ -33,7 +33,7 @@ Double-click the MSI in Explorer and follow the wizard. Administrator elevation 
 5. Creates `%ProgramData%\infogyre\SnipeSpotter\` with a blank `settings.toml` template.
 6. Applies ACLs to the ProgramData tree granting inheritable full control only to `SYSTEM` and the built-in `Administrators` group.
 
-The service is registered but not started during installation. It will start on the next boot, or you can start it manually after configuration.
+The service is registered but not started during installation. When started, it remains `Running` while unconfigured and serves the administrator-only named pipe so the CLI can complete configuration; an unconfigured state is not a service-health failure. It will start on the next boot, or you can start it manually after installation.
 
 ### Major upgrade
 
@@ -192,6 +192,8 @@ Forces check-in of monitors regardless of check-in policy. `--all` checks in all
 
 ### service install / uninstall
 
+Direct CLI SCM registration is intentionally separate from MSI registration. `service install` creates the sibling service with AutoStart, own-process type, the production service executable, the `LocalSystem` account, and the documented description. If the service is already installed, the command returns an actionable operational error without mutating it. `service uninstall` stops a running service, waits for `Stopped`, requests deletion, and waits for SCM disappearance; uninstalling a missing service returns an actionable operational error. A pending stop or delete timeout is a failure, not an accepted early result.
+
 ```powershell
 spotter-cli service install
 spotter-cli service uninstall
@@ -255,6 +257,23 @@ DPAPI ciphertext is bound to the machine. After an OS reinstall:
 1. Reinstall the SnipeSpotter MSI.
 2. Re-enter all configuration: URL, status IDs, and token.
 3. The service will rebuild monitor state on the next sync.
+
+## Hosted hardware experiment
+
+This Phase 0 diagnostic scaffold is separate from SnipeSpotter installation, synchronization, and MSI lifecycle validation. Its contract and validator can be checked on non-Windows systems, but collection, LocalSystem execution, protected approval, and artifact upload run only on GitHub-hosted Windows runners. It does not need a Snipe-IT URL, API token, administrator credential, or physical device.
+
+An authorized operator may dispatch `.github/workflows/hardware-experiment.yml` with the exact `operator_acknowledgement=APPROVE` input. The workflow then runs the bounded matrix and pauses at the protected environment job named `awaiting_operator_hardware_approval` before any observation can be promoted; that protected environment is a post-observation evidence checkpoint, not pre-run authorization:
+
+1. Set `operator_acknowledgement` to the exact value `APPROVE` when dispatching.
+2. Use the default `images=windows-2022,windows-latest`; add `windows-2025` only when that optional hosted label is explicitly approved.
+3. Keep `repetitions=3`; the preparation job rejects other values and reports optional images that were not selected.
+4. Review both direct-admin and LocalSystem reports for each of the three repetitions per selected image.
+5. Download reports only for the approved diagnostic question; artifacts expire after seven days.
+6. Do not promote runner-specific gates, persistent fixtures, or a physical matrix from the observations without a separate explicit operator approval after reviewing the checkpoint report.
+
+The collector records the requested image label and alias, exact bounded runner/build metadata, process bitness, caller class, the numeric Windows process session ID captured in each context, classified API outcomes/durations, bounded SMBIOS lengths/type histograms, WMI counts/array lengths/placeholder classes, chassis class counts, and short HMAC fragments. It never records raw serials, asset tags, monitor strings, firmware/EDID, environment values, tokens, or exception text. One protected per-image/repetition HMAC key is shared by the direct and LocalSystem contexts, never uploaded, and removed by failure-safe cleanup. The validator runs before upload and emits only generic pass/fail output.
+
+Treat a report as hosted-runner diagnostics only. It is not a hardware inventory record, physical hardware result, release approval, promotion signal, deployment, or Snipe-IT mutation. Do not use the existing raw recon scripts for this workflow; they serve a different fixture-generation purpose.
 
 ## Uninstallation
 

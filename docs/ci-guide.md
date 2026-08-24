@@ -11,16 +11,14 @@ SnipeSpotter uses a reusable-workflow pattern with path gating to keep CI fast.
 | `ci.yml` | Push to `main`, PRs | Path-gated caller that dispatches to `checks.yml` |
 | `checks.yml` | `workflow_call` | Reusable workflow with all required gates |
 | `release.yml` | Tag push `vX.Y.Z`, `workflow_dispatch` | Build, package, validate, and publish releases |
+| `elevated-windows.yml` | Reusable `workflow_call` | Elevated MSI/service lifecycle and cleanup lane |
+| `hardware-experiment.yml` | Protected `workflow_dispatch` | Privacy-safe hosted hardware observations; stops at operator approval |
 | `bump.yml` | `workflow_dispatch` | Bump workspace version and open a PR |
 | `mutants.yml` | Weekly schedule | Mutation testing with `cargo-mutants` |
 
 ### Path gating
 
-`ci.yml` uses `dorny/paths-filter` to detect changes in:
-- `code` -- Rust source files
-- `windows` -- code + installer + workflows
-
-Only relevant paths trigger the reusable checks workflow. A `force_all` input bypasses gating for manual runs.
+`ci.yml` uses `dorny/paths-filter` to detect changes in the `run_checks` and `run_elevated` path sets. Only relevant paths trigger each reusable workflow. When elevated paths are not relevant, `elevated-skip` emits an explicit successful result and `ci-success` consumes it; relevant paths require the reusable elevated workflow result. A `force_all` input bypasses gating for manual runs.
 
 ### Jobs
 
@@ -43,7 +41,7 @@ Linux only builds and tests `spotter-core` (the cross-platform crate). Windows-o
 |---|---|---|
 | Workspace tests | `cargo test --workspace --all-targets` | Tests |
 | Workspace clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Lint |
-| PowerShell script lint | `Invoke-ScriptAnalyzer` on all `.ps1` files | Script quality |
+| PowerShell script lint | `Invoke-ScriptAnalyzer` on all `.ps1` and `.psm1` files | Script quality |
 
 #### Package contract (`ubuntu-latest`)
 
@@ -139,7 +137,7 @@ The lifecycle test is `scripts/test-msi-lifecycle.ps1`. On an elevated Windows r
    - All expected files exist: `bin\spotter-svc.exe`, `bin\spotter-cli.exe`, `bin\spotter_svc.pdb`, `bin\spotter_cli.pdb`, `sbom\*.cdx.json`, `settings.toml`
 2. **ACLs**: Verifies `ProgramData\infogyre\SnipeSpotter\` grants full control to `SYSTEM` and `Administrators`.
 3. **PATH**: Verifies the `bin\` directory was added to the machine PATH.
-4. **Service start/stop**: Starts the service, waits 3 seconds, checks state (Running or Stopped -- the unconfigured service may stop on its own), stops if running.
+4. **Service health**: Starts the service, requires it to remain `Running` for the configured stability window, verifies the running process owner is `NT AUTHORITY\\SYSTEM`, verifies the fixed named pipe is present, invokes the installed CLI for JSON status, and requires an `Unconfigured` response before stopping it.
 5. **Uninstall**: Silently uninstalls and verifies:
    - Service is no longer registered
    - `Program Files\infogyre\SnipeSpotter\` is removed
@@ -154,6 +152,14 @@ Pass `-PreviousMsiPath` to exercise major-upgrade configuration preservation:
 ```
 
 This installs the previous MSI, adds a marker to `settings.toml`, installs the new MSI over it, and verifies the marker survives the upgrade.
+
+### Elevated coverage and cleanup
+
+The reusable `elevated-windows.yml` lane is invoked for relevant PR paths and by the release workflow after the MSI is built. It uses unique run identities, bounded condition-based waits, sustained service/pipe checks where available, and failure-safe cleanup. A cleanup failure is a failed lifecycle result; it is never silently accepted. The PR caller emits an explicit successful skip when no elevated path is relevant so the aggregate `ci-success` check remains deterministic.
+
+### Hosted hardware experiment
+
+`hardware-experiment.yml` is protected and manually dispatched. Its `images` input drives the generated matrix; `windows-2022` and `windows-latest` are always required, while the optional `windows-2025` label is scheduled only when explicitly requested. The fixed `repetitions=3` input creates three repetitions per selected image. Each image/repetition cell runs both direct-admin and LocalSystem collection with one protected per-cell HMAC key, validates both reports before upload, records the requested image label/alias and exact runner metadata plus the numeric session ID from each process context, and removes keys and temporary reports during failure-safe cleanup. Unsupported optional images are reported in the preparation job's machine-readable `skipped_images` output. The workflow stops at `awaiting_operator_hardware_approval`; hosted observations are evidence only and do not implement release promotion or physical-hardware qualification.
 
 ### Runner policy
 
@@ -170,3 +176,28 @@ Three PowerShell scripts capture hardware data for test fixture generation:
 | `scripts/recon-chassis.ps1` | `Win32_SystemEnclosure.ChassisTypes` | `chassis-fixture.json` (chassis type, portability flag, enclosure metadata) |
 
 Run these on target hardware to generate realistic test fixtures for the SMBIOS parser and monitor discovery code. The scripts accept a `-OutputPath` parameter to control where the JSON fixture is written.
+
+## Hosted hardware experiment
+
+The hosted experiment is intentionally separate from the raw fixture scripts above. Run `.github/workflows/hardware-experiment.yml` only through `workflow_dispatch`; it is not called by `ci.yml`, `checks.yml`, or `release.yml`.
+
+### Approval and dispatch
+
+1. Create a protected GitHub environment named `hardware-experiment-approval` and require an operator reviewer. Do not put secrets in this environment; the experiment does not need credentials.
+2. Dispatch the workflow with `operator_acknowledgement=APPROVE`, the default `images=windows-2022,windows-latest` (or include the explicitly approved optional `windows-2025` label), and `repetitions=3`.
+3. The job named `awaiting_operator_hardware_approval` runs after the Windows matrix and pauses at the protected environment before any observation can be promoted. Its gate rejects acknowledgements other than the exact word `APPROVE`; it is a post-observation evidence checkpoint, not a pre-allocation authorization gate.
+4. `windows-2022` and `windows-latest` are required. The preparation job reports optional `windows-2025` as skipped when it is not requested; an unknown image label is rejected rather than replacing either required image.
+
+The generated matrix runs three repetitions per selected image. Each image/repetition cell collects both direct-admin and LocalSystem reports with one shared protected HMAC key, derives the session ID inside each process context, validates both locally, and uploads only the redacted JSON reports with seven-day retention. The matrix has no package, release, publish, promotion, deployment, Snipe-IT, or physical-hardware step. A failing validator prevents upload; cleanup removes the key, service host files, and reports and fails if cleanup cannot complete.
+
+### Privacy gates
+
+The collector is `scripts/hardware/collect_hardware.ps1`; do not substitute the existing `scripts/recon-*.ps1` scripts because those intentionally write raw fixture data. The upload-side command is:
+
+```powershell
+python scripts/hardware/validate_report.py --input artifacts/hardware-report.json
+```
+
+The validator enforces the closed schema in `scripts/hardware/report-schema.json` and the stricter pure policy in `scripts/hardware/privacy_policy.py`. It rejects raw identifiers, tokens, firmware/EDID payloads, environment dumps, exception text, unbounded collections/strings, and reports over 32 KiB. The collector uses an ephemeral random HMAC key only to generate short fragments; the key is never uploaded. Validation output is generic and does not echo report contents.
+
+This experiment provides observations about GitHub-hosted runner images only. It is not evidence about physical hardware and must not be used as a release promotion or lifecycle sign-off.
