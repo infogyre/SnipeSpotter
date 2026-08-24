@@ -4,9 +4,8 @@
 
 use std::{ffi::OsString, sync::mpsc, time::Duration};
 
-use crate::discovery::HardwareDiscovery;
 use crate::owner_ports::{
-    Clock, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
+    Clock, HardwareDiscovery, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
 };
 use anyhow::{Context as _, Result};
 use spotter_core::{
@@ -163,6 +162,10 @@ impl CommandOwner {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "forced check-in preflight and orchestration"
+    )]
     async fn force_checkin(&mut self, requested_serial: Option<&str>) -> Result<IpcResponse> {
         if !config_status(&self.controller.settings).is_empty() {
             anyhow::bail!("service is not configured")

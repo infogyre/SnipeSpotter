@@ -27,7 +27,8 @@ pub mod test_support {
     use tokio::sync::Mutex;
 
     pub use crate::owner_ports::{
-        Clock, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
+        Clock, HardwareDiscovery, RemoteFactory, RemotePort, SecretProtector, SettingsStore,
+        StateStore,
     };
 
     /// Complete external dependency bundle used by [`spawn_owner`].
@@ -37,7 +38,7 @@ pub mod test_support {
         pub state_store: Box<dyn StateStore>,
         pub remote: Box<dyn RemotePort>,
         pub remote_factory: Box<dyn RemoteFactory>,
-        pub discovery: Box<dyn crate::discovery::HardwareDiscovery>,
+        pub discovery: Box<dyn HardwareDiscovery>,
         pub clock: Box<dyn Clock>,
     }
 

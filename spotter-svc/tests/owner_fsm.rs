@@ -10,14 +10,35 @@ use spotter_core::{
     ipc::{IpcResponse, ServiceCommand},
     smbios::{ChassisType, SystemInfo},
     state::ServiceState,
+    sync::{ResolvedTaxonomy, TaxonomyResolution},
 };
 use spotter_svc::{
-    discovery::HardwareDiscovery,
+    ports::{HardwareDiscovery, PortFuture, RemoteReads},
     test_support::{
         Clock, OwnerPorts, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
         enqueue_owner_request, spawn_owner, spawn_owner_with_recovery,
     },
 };
+
+fn resolved_taxonomy() -> ResolvedTaxonomy {
+    ResolvedTaxonomy {
+        manufacturer: TaxonomyResolution::Resolved { id: 1 },
+        category: TaxonomyResolution::Resolved { id: 2 },
+        model: TaxonomyResolution::Resolved { id: 3 },
+        normalized_manufacturer: String::from("maker"),
+        normalized_model: String::from("model"),
+    }
+}
+
+fn missing_taxonomy() -> ResolvedTaxonomy {
+    ResolvedTaxonomy {
+        manufacturer: TaxonomyResolution::Missing,
+        category: TaxonomyResolution::Missing,
+        model: TaxonomyResolution::Missing,
+        normalized_manufacturer: String::new(),
+        normalized_model: String::new(),
+    }
+}
 
 struct FakeProtector;
 
@@ -175,65 +196,26 @@ struct RejectingRemote {
     calls: Arc<Mutex<BoundaryCalls>>,
 }
 
-impl spotter_svc::gather::RemoteReads for RejectingRemote {
+impl RemoteReads for RejectingRemote {
     fn find_asset_by_serial<'a>(
         &'a self,
         _serial: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        spotter_core::snipeit::Asset,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
         if let Ok(mut calls) = self.calls.lock() {
             calls.remote_reads += 1;
         }
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
+        Box::pin(async { anyhow::bail!("remote read was unexpectedly requested") })
     }
 
-    fn find_manufacturers<'a>(
+    fn resolve_taxonomy<'a>(
         &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::Manufacturer>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
         if let Ok(mut calls) = self.calls.lock() {
             calls.remote_reads += 1;
         }
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
-    }
-
-    fn find_models<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::AssetModel>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        if let Ok(mut calls) = self.calls.lock() {
-            calls.remote_reads += 1;
-        }
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
+        Box::pin(async { anyhow::bail!("remote read was unexpectedly requested") })
     }
 }
 
@@ -340,17 +322,19 @@ impl RemoteFactory for FixedFactory {
 struct FixedDiscovery;
 
 impl HardwareDiscovery for FixedDiscovery {
-    fn discover(&self) -> Result<(SystemInfo, Vec<spotter_core::monitors::MonitorInfo>)> {
-        Ok((
-            SystemInfo {
-                manufacturer: String::from("Maker"),
-                model: String::from("Model"),
-                serial: String::from("SYS-1"),
-                asset_tag: String::from("TAG-1"),
-                chassis_type: ChassisType(3),
-            },
-            Vec::new(),
-        ))
+    fn discover(&self) -> PortFuture<'_, (SystemInfo, Vec<spotter_core::monitors::MonitorInfo>)> {
+        Box::pin(async {
+            Ok((
+                SystemInfo {
+                    manufacturer: String::from("Maker"),
+                    model: String::from("Model"),
+                    serial: String::from("SYS-1"),
+                    asset_tag: String::from("TAG-1"),
+                    chassis_type: ChassisType(3),
+                },
+                Vec::new(),
+            ))
+        })
     }
 }
 
@@ -359,59 +343,22 @@ struct TypedFailureRemote {
     error: spotter_core::snipeit::SnipeItError,
 }
 
-impl spotter_svc::gather::RemoteReads for TypedFailureRemote {
+impl RemoteReads for TypedFailureRemote {
     fn find_asset_by_serial<'a>(
         &'a self,
         _serial: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        spotter_core::snipeit::Asset,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
         let error = self.error.clone();
-        Box::pin(async move { Err(error) })
+        Box::pin(async move { Err(anyhow::Error::from(error)) })
     }
 
-    fn find_manufacturers<'a>(
+    fn resolve_taxonomy<'a>(
         &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::Manufacturer>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
         let error = self.error.clone();
-        Box::pin(async move { Err(error) })
-    }
-
-    fn find_models<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::AssetModel>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        let error = self.error.clone();
-        Box::pin(async move { Err(error) })
+        Box::pin(async move { Err(anyhow::Error::from(error)) })
     }
 }
 
@@ -444,8 +391,8 @@ impl spotter_svc::sync_engine::RemoteMutations for TypedFailureRemote {
 struct FailingDiscovery;
 
 impl HardwareDiscovery for FailingDiscovery {
-    fn discover(&self) -> Result<(SystemInfo, Vec<spotter_core::monitors::MonitorInfo>)> {
-        anyhow::bail!("hardware discovery failed")
+    fn discover(&self) -> PortFuture<'_, (SystemInfo, Vec<spotter_core::monitors::MonitorInfo>)> {
+        Box::pin(async { anyhow::bail!("hardware discovery failed") })
     }
 }
 
@@ -1030,6 +977,10 @@ fn monitor_entry(
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "this integration test verifies the complete CheckinAll state transition"
+)]
 async fn checkin_all_selects_only_absent_checked_out_nonzero_assets() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
@@ -1090,12 +1041,15 @@ async fn checkin_all_selects_only_absent_checked_out_nonzero_assets() -> Result<
         vec![(11, 2), (22, 2)]
     );
 
-    let saved_state = state_saves
-        .lock()
-        .map_err(|_| anyhow::anyhow!("state save lock poisoned"))?
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("state candidate was not saved"))?;
+    let saved_state = {
+        let state_saves = state_saves
+            .lock()
+            .map_err(|_| anyhow::anyhow!("state save lock poisoned"))?;
+        state_saves
+            .first()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("state candidate was not saved"))?
+    };
     assert_eq!(
         saved_state.known_monitors,
         vec![
@@ -1243,6 +1197,10 @@ async fn checkin_reports_state_save_failure_and_retains_remote_evidence() -> Res
 }
 
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "this integration test verifies restart recovery and idempotence"
+)]
 async fn restart_recovers_observed_checkin_without_repeating_mutation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
@@ -1324,23 +1282,25 @@ async fn restart_recovers_observed_checkin_without_repeating_mutation() -> Resul
     };
     assert_eq!(monitors.len(), 1);
     assert!(!monitors[0].checked_out);
-    let recovered_states = recovered_saves
-        .lock()
-        .map_err(|_| anyhow::anyhow!("recovery state save lock poisoned"))?;
-    assert_eq!(recovered_states.len(), 1);
-    assert_eq!(recovered_states[0].known_monitors.len(), 1);
-    assert!(!recovered_states[0].known_monitors[0].checked_out);
-    assert_eq!(
-        recovered_states[0].known_monitors[0].snipeit_asset_id,
-        Some(11)
-    );
-    drop(recovered_states);
-    let recovery_observations = recovery_calls
-        .lock()
-        .map_err(|_| anyhow::anyhow!("recovery calls lock poisoned"))?;
-    assert_eq!(recovery_observations.mutations, 0);
-    assert_eq!(recovery_observations.reconciliation_reads, 1);
-    drop(recovery_observations);
+    {
+        let recovered_states = recovered_saves
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recovery state save lock poisoned"))?;
+        assert_eq!(recovered_states.len(), 1);
+        assert_eq!(recovered_states[0].known_monitors.len(), 1);
+        assert!(!recovered_states[0].known_monitors[0].checked_out);
+        assert_eq!(
+            recovered_states[0].known_monitors[0].snipeit_asset_id,
+            Some(11)
+        );
+    }
+    {
+        let recovery_observations = recovery_calls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("recovery calls lock poisoned"))?;
+        assert_eq!(recovery_observations.mutations, 0);
+        assert_eq!(recovery_observations.reconciliation_reads, 1);
+    }
     assert!(spotter_svc::operation_journal::load(&journal_path)?.is_empty());
 
     let second_status = second_fsm.request(ServiceCommand::GetStatusFull).await?;
@@ -1535,56 +1495,20 @@ async fn checkin_serial_success_commits_state_before_response() -> Result<()> {
 
 struct SuccessfulRemote;
 
-impl spotter_svc::gather::RemoteReads for SuccessfulRemote {
+impl RemoteReads for SuccessfulRemote {
     fn find_asset_by_serial<'a>(
         &'a self,
         _serial: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        spotter_core::snipeit::Asset,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::NotFound) })
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        Box::pin(async { Ok(None) })
     }
 
-    fn find_manufacturers<'a>(
+    fn resolve_taxonomy<'a>(
         &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::Manufacturer>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn find_models<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::AssetModel>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
+        Box::pin(async { Ok(resolved_taxonomy()) })
     }
 }
 
@@ -1624,56 +1548,20 @@ struct ReconciliationRemote {
     calls: Arc<Mutex<RecoveryCalls>>,
 }
 
-impl spotter_svc::gather::RemoteReads for ReconciliationRemote {
+impl RemoteReads for ReconciliationRemote {
     fn find_asset_by_serial<'a>(
         &'a self,
         _serial: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        spotter_core::snipeit::Asset,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::NotFound) })
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        Box::pin(async { Ok(None) })
     }
 
-    fn find_manufacturers<'a>(
+    fn resolve_taxonomy<'a>(
         &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::Manufacturer>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn find_models<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::AssetModel>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
+        Box::pin(async { Ok(missing_taxonomy()) })
     }
 }
 
@@ -1714,56 +1602,20 @@ struct RecordingCheckinRemote {
     checkins: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
-impl spotter_svc::gather::RemoteReads for RecordingCheckinRemote {
+impl RemoteReads for RecordingCheckinRemote {
     fn find_asset_by_serial<'a>(
         &'a self,
         _serial: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        spotter_core::snipeit::Asset,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::NotFound) })
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        Box::pin(async { Ok(None) })
     }
 
-    fn find_manufacturers<'a>(
+    fn resolve_taxonomy<'a>(
         &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::Manufacturer>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn find_models<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::AssetModel>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Ok(Vec::new()) })
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
+        Box::pin(async { Ok(resolved_taxonomy()) })
     }
 }
 
@@ -1802,56 +1654,20 @@ impl spotter_svc::sync_engine::RemoteMutations for RecordingCheckinRemote {
     }
 }
 
-impl spotter_svc::gather::RemoteReads for RemotePortUnavailable {
+impl RemoteReads for RemotePortUnavailable {
     fn find_asset_by_serial<'a>(
         &'a self,
         _serial: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        spotter_core::snipeit::Asset,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        Box::pin(async { anyhow::bail!("remote unavailable") })
     }
 
-    fn find_manufacturers<'a>(
+    fn resolve_taxonomy<'a>(
         &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::Manufacturer>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
-    }
-
-    fn find_models<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::AssetModel>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
+        Box::pin(async { anyhow::bail!("remote unavailable") })
     }
 }
 
@@ -1901,21 +1717,11 @@ impl RecordingRemote {
     }
 }
 
-impl spotter_svc::gather::RemoteReads for RecordingRemote {
+impl RemoteReads for RecordingRemote {
     fn find_asset_by_serial<'a>(
         &'a self,
         _serial: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        spotter_core::snipeit::Asset,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
         self.record_read();
         let release = self.gate.as_ref().and_then(|gate| {
             let sender = gate.started.lock().expect("sync gate started lock").take();
@@ -1928,44 +1734,17 @@ impl spotter_svc::gather::RemoteReads for RecordingRemote {
             if let Some(release) = release {
                 let _ = release.await;
             }
-            Err(spotter_core::snipeit::SnipeItError::NotFound)
+            Ok(None)
         })
     }
 
-    fn find_manufacturers<'a>(
+    fn resolve_taxonomy<'a>(
         &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::Manufacturer>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
         self.record_read();
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    fn find_models<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::AssetModel>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        self.record_read();
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async { Ok(resolved_taxonomy()) })
     }
 }
 
@@ -2015,6 +1794,10 @@ impl RemoteFactory for RecordingFactory {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "this integration test verifies queued configuration and the next sync"
+)]
 async fn config_update_queued_during_sync_is_used_by_next_operation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
@@ -2088,11 +1871,13 @@ async fn config_update_queued_during_sync_is_used_by_next_operation() -> Result<
         config_response.await?,
         IpcResponse::Ok { ref message } if message == "updated snipeit.url"
     ));
-    let settings_saves = settings_saves
-        .lock()
-        .map_err(|_| anyhow::anyhow!("settings save lock poisoned"))?;
-    assert_eq!(settings_saves.len(), 1);
-    assert_eq!(settings_saves[0].snipeit.url, "https://new.example");
+    {
+        let settings_saves = settings_saves
+            .lock()
+            .map_err(|_| anyhow::anyhow!("settings save lock poisoned"))?;
+        assert_eq!(settings_saves.len(), 1);
+        assert_eq!(settings_saves[0].snipeit.url, "https://new.example");
+    }
     assert_eq!(
         built_urls
             .lock()

@@ -7,7 +7,8 @@ use chrono::{DateTime, Utc};
 use secrecy::SecretString;
 use spotter_core::{Settings, state::ServiceState};
 
-use crate::{discovery::HardwareDiscovery, ports::RemoteReads, sync_engine::RemoteMutations};
+pub use crate::ports::{HardwareDiscovery, RemoteReads};
+use crate::sync_engine::RemoteMutations;
 
 /// Encrypts and decrypts the API token at the platform boundary.
 pub trait SecretProtector: Send + Sync {
@@ -101,6 +102,10 @@ impl<T> RemotePort for T where T: RemoteReads + RemoteMutations {}
 /// Constructs an authenticated remote port from committed settings.
 pub trait RemoteFactory: Send + Sync {
     /// Build a remote client for a complete settings candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when settings decryption or client construction fails.
     fn build(&self, settings: &Settings) -> Result<Box<dyn RemotePort>>;
 }
 
@@ -122,63 +127,38 @@ impl RemoteReads for UnavailableRemote {
     fn find_asset_by_serial<'a>(
         &'a self,
         _serial: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        spotter_core::snipeit::Asset,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
+    ) -> crate::ports::PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        Box::pin(async { Ok(None) })
     }
 
-    fn find_manufacturers<'a>(
+    fn resolve_taxonomy<'a>(
         &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::Manufacturer>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
-    }
-
-    fn find_models<'a>(
-        &'a self,
-        _name: &'a str,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        Vec<spotter_core::snipeit::AssetModel>,
-                        spotter_core::snipeit::SnipeItError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async { Err(spotter_core::snipeit::SnipeItError::AuthFailure) })
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> crate::ports::PortFuture<'a, spotter_core::sync::ResolvedTaxonomy> {
+        Box::pin(async {
+            Ok(spotter_core::sync::ResolvedTaxonomy {
+                manufacturer: spotter_core::sync::TaxonomyResolution::Missing,
+                category: spotter_core::sync::TaxonomyResolution::Missing,
+                model: spotter_core::sync::TaxonomyResolution::Missing,
+                normalized_manufacturer: String::new(),
+                normalized_model: String::new(),
+            })
+        })
     }
 }
 
 impl HardwareDiscovery for UnavailableRemote {
     fn discover(
         &self,
-    ) -> Result<(
-        spotter_core::smbios::SystemInfo,
-        Vec<spotter_core::monitors::MonitorInfo>,
-    )> {
-        anyhow::bail!("hardware discovery is unavailable")
+    ) -> crate::ports::PortFuture<
+        '_,
+        (
+            spotter_core::smbios::SystemInfo,
+            Vec<spotter_core::monitors::MonitorInfo>,
+        ),
+    > {
+        Box::pin(async { anyhow::bail!("hardware discovery is unavailable") })
     }
 }
 
