@@ -3,11 +3,23 @@ name: checks
 on:
   workflow_call:
     inputs:
+      run_checks:
+        description: Run checks for paths relevant to the repository.
+        required: false
+        type: boolean
+        default: true
       force_all:
         description: Run every check even when paths are unchanged.
         required: false
         type: boolean
         default: false
+    outputs:
+      checks_ran:
+        description: Whether the reusable checks ran instead of being explicitly skipped.
+        value: ${{ jobs.ci-success.outputs.checks_ran }}
+      checks_result:
+        description: The aggregate checks result, including an explicit skipped result.
+        value: ${{ jobs.ci-success.outputs.checks_result }}
 
 permissions:
   contents: read
@@ -15,6 +27,7 @@ permissions:
 jobs:
   linux-core:
     name: Linux core checks
+    if: inputs.run_checks || inputs.force_all
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -42,6 +55,7 @@ jobs:
 
   windows-workspace:
     name: Windows workspace checks
+    if: inputs.run_checks || inputs.force_all
     runs-on: windows-latest
     steps:
       - name: Check out source
@@ -52,6 +66,8 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component clippy
       - name: Workspace tests
         run: cargo test --workspace --all-targets
+      - name: Production owner integration tests
+        run: cargo test -p spotter-svc --all-targets --features test-support --locked
       - name: Workspace clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Compile hardware experiment service host
@@ -62,8 +78,10 @@ jobs:
           if (-not (Get-Module -ListAvailable -Name PSScriptAnalyzer)) {
             Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
           }
-          $files = Get-ChildItem -Recurse -Filter '*.ps1' -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch '\\target\\' -and $_.FullName -notmatch '\\\.git\\' }
+          $files = @(
+            Get-ChildItem -Recurse -Include '*.ps1', '*.psm1' -File -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '\\target\\' -and $_.FullName -notmatch '\\\.git\\' }
+          )
           if (-not $files) { Write-Host 'No PowerShell files to lint'; exit 0 }
           $violations = @()
           foreach ($f in $files) {
@@ -83,6 +101,7 @@ jobs:
 
   package-contract:
     name: Package contract
+    if: inputs.run_checks || inputs.force_all
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -97,19 +116,102 @@ jobs:
           for package in spotter-core spotter-win32 spotter-build spotter-svc spotter-cli spotter-hardware-service; do
             cargo metadata --no-deps --format-version 1 | grep -q '"name":"'"$package"'"'
           done
+      - name: Verify MSI lifecycle script contract
+        run: python3 scripts/test-msi-lifecycle-contract.py
+      - name: Verify PowerShell test-support contract
+        run: python3 scripts/test-support-contract.py
+      - name: Verify workflow contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          workflows = [
+              Path('.github/workflows/checks.yml'),
+              Path('.github/workflows/release.yml'),
+              Path('.github/workflows/elevated-windows.yml'),
+          ]
+          for path in workflows:
+              text = path.read_text(encoding='utf-8')
+              for line_number, line in enumerate(text.splitlines(), 1):
+                  action_key = 'uses' + ':'
+                  if action_key not in line or 'uses: ./' in line:
+                      continue
+                  if not re.search(action_key + r'\s+[^\s@]+@[0-9a-f]{40}(?:\s|$)', line):
+                      raise SystemExit(f'{path}:{line_number}: action reference is not full-SHA pinned')
+
+          checks = Path('.github/workflows/checks.yml').read_text(encoding='utf-8')
+          assert 'workflow_call:' in checks
+          assert 'run_checks:' in checks
+          assert 'checks_ran:' in checks and 'checks_result:' in checks
+          assert 'ci-success:' in checks and 'if: always()' in checks
+
+          elevated = Path('.github/workflows/elevated-windows.yml').read_text(encoding='utf-8')
+          for required_input in ('source_artifact:', 'force:', 'run_identity:', 'log_artifact_name:'):
+              assert required_input in elevated, f'elevated workflow missing {required_input}'
+          assert 'lifecycle_result:' in elevated
+
+          caller = Path('.github/workflows/ci.yml').read_text(encoding='utf-8')
+          for required_path in ('Cargo.toml', 'Cargo.lock', 'deny.toml', '.github/workflows/**', 'spotter-*/**', 'scripts/**'):
+              assert required_path in caller, f'ci.yml path filter missing {required_path}'
+          assert 'if: always()' in caller and 'CHECKS_RESULT:' in caller
+          assert 'run_elevated:' in caller
+          assert '  elevated:' in caller
+          assert 'needs: [changes, checks, elevated, elevated_skip]' in caller
+          assert 'RUN_ELEVATED:' in caller and 'ELEVATED_RESULT:' in caller
+          assert 'ELEVATED_OUTPUT:' in caller and 'ELEVATED_SKIP_OUTPUT:' in caller
+
+          release = Path('.github/workflows/release.yml').read_text(encoding='utf-8')
+          assert 'name: packaged-release' in release
+          assert re.search(r'\n  lifecycle:\n.*?needs: \[verify, package\]\n.*?uses: ./\.github/workflows/elevated-windows\.yml', release, re.S)
+          assert 'needs: [verify, package, lifecycle]' in release
+          assert '      - name: Validate MSI lifecycle\n' not in release
+          print('workflow contract: OK')
+          PY
 
   ci-success:
     name: CI success
     if: always()
     needs: [linux-core, windows-workspace, package-contract]
+    outputs:
+      checks_ran: ${{ steps.result.outputs.checks_ran }}
+      checks_result: ${{ steps.result.outputs.checks_result }}
     runs-on: ubuntu-latest
     steps:
       - name: Require all checks to pass
+        id: require
         env:
+          RUN_CHECKS: ${{ inputs.run_checks || inputs.force_all }}
           LINUX_RESULT: ${{ needs.linux-core.result }}
           WINDOWS_RESULT: ${{ needs.windows-workspace.result }}
           CONTRACT_RESULT: ${{ needs.package-contract.result }}
         run: |
+          set -euo pipefail
+          if [ "${RUN_CHECKS}" != true ]; then
+            echo 'Checks skipped by reusable-workflow input; aggregate remains successful.'
+            exit 0
+          fi
           test "${LINUX_RESULT}" = success
           test "${WINDOWS_RESULT}" = success
           test "${CONTRACT_RESULT}" = success
+      - name: Publish aggregate result
+        id: result
+        if: always()
+        env:
+          RUN_CHECKS: ${{ inputs.run_checks || inputs.force_all }}
+          REQUIRE_OUTCOME: ${{ steps.require.outcome }}
+        run: |
+          set -euo pipefail
+          if [ "${RUN_CHECKS}" != true ]; then
+            result=skipped
+            ran=false
+          elif [ "${REQUIRE_OUTCOME}" = success ]; then
+            result=success
+            ran=true
+          else
+            result=failure
+            ran=true
+          fi
+          printf 'checks_ran=%s\nchecks_result=%s\n' "${ran}" "${result}" >> "${GITHUB_OUTPUT}"

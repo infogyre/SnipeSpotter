@@ -5,6 +5,10 @@ on:
     tags: ['v[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -51,6 +55,8 @@ jobs:
         run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
       - name: Test workspace
         run: cargo test --workspace --all-targets --locked
+      - name: Production owner integration tests
+        run: cargo test -p spotter-svc --all-targets --features test-support --locked
       - name: Build release binaries
         run: cargo build -p spotter-svc -p spotter-cli --release --locked --target x86_64-pc-windows-msvc
       - name: Stage exact binary inventory
@@ -127,18 +133,6 @@ jobs:
           New-Item -ItemType Directory -Force packaged | Out-Null
           Copy-Item $msi.FullName "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64.msi"
           Compress-Archive -Path release-stage/* -DestinationPath "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64-symbols.zip"
-      - name: Validate MSI lifecycle
-        shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
-        run: ./scripts/test-msi-lifecycle.ps1 -MsiPath "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64.msi"
-      - name: Upload MSI lifecycle logs
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: msi-lifecycle-logs
-          path: ${{ runner.temp }}/snipespotter-msi-logs/*
-          if-no-files-found: warn
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -146,9 +140,21 @@ jobs:
           path: packaged/*
           if-no-files-found: error
 
+  lifecycle:
+    name: Validate MSI lifecycle on elevated Windows
+    needs: [verify, package]
+    uses: ./.github/workflows/elevated-windows.yml
+    with:
+      artifact_name: packaged-release
+      msi_name: SnipeSpotter-${{ needs.verify.outputs.version }}-x64.msi
+      source_artifact: false
+      force: true
+      run_identity: release-${{ github.run_id }}-${{ github.run_attempt }}
+      log_artifact_name: msi-lifecycle-logs
+
   aggregate:
     name: Aggregate and validate release inventory
-    needs: [verify, package]
+    needs: [verify, package, lifecycle]
     runs-on: ubuntu-latest
     steps:
       - name: Download packaged artifacts
@@ -179,9 +185,9 @@ jobs:
     needs: [verify, aggregate]
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
+      id-token: write # Required by GitHub artifact provenance attestation.
       contents: read
-      attestations: write
+      attestations: write # Required to publish the provenance attestation.
     steps:
       - name: Download release inventory
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -189,7 +195,7 @@ jobs:
           name: release-inventory
           path: dist
       - name: Attest artifacts
-        uses: actions/attest-build-provenance@96b4a1ef7235a096b17240c259729fdd70c83d45 # v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: dist/*
 
@@ -199,7 +205,7 @@ jobs:
     needs: [verify, aggregate, attest]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # Required to publish the verified GitHub release.
     steps:
       - name: Download release inventory
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

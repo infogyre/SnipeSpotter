@@ -1,0 +1,156 @@
+name: elevated Windows lifecycle
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        description: Artifact containing the MSI to validate.
+        required: false
+        type: string
+        default: packaged-release
+      source_artifact:
+        description: Build and package a source MSI when true instead of downloading one.
+        required: false
+        type: boolean
+        default: false
+      force:
+        description: Run the lifecycle lane even when the caller is not path-relevant.
+        required: false
+        type: boolean
+        default: false
+      run_identity:
+        description: Unique identity used for logs and cleanup diagnostics.
+        required: true
+        type: string
+      msi_name:
+        description: Exact MSI filename within the downloaded artifact.
+        required: false
+        type: string
+        default: ''
+      log_artifact_name:
+        description: Artifact name for lifecycle diagnostics.
+        required: true
+        type: string
+    outputs:
+      lifecycle_result:
+        description: Result of the MSI lifecycle validation.
+        value: ${{ jobs.lifecycle.outputs.lifecycle_result }}
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Install, verify, and uninstall MSI
+    runs-on: windows-latest
+    outputs:
+      lifecycle_result: ${{ steps.result.outputs.lifecycle_result }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Download packaged MSI
+        if: ${{ !inputs.source_artifact }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: packaged
+      - name: Build source MSI
+        if: ${{ inputs.source_artifact }}
+        shell: pwsh
+        env:
+          RUN_IDENTITY: ${{ inputs.run_identity }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build -p spotter-svc -p spotter-cli --release --locked --target x86_64-pc-windows-msvc
+          $stage = Join-Path $env:RUNNER_TEMP "snipespotter-$env:RUN_IDENTITY-stage"
+          New-Item -ItemType Directory -Force -Path $stage, (Join-Path $stage 'sbom') | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/spotter-svc.exe $stage
+          Copy-Item target/x86_64-pc-windows-msvc/release/spotter-cli.exe $stage
+          Copy-Item target/x86_64-pc-windows-msvc/release/spotter_svc.pdb $stage
+          Copy-Item target/x86_64-pc-windows-msvc/release/spotter_cli.pdb $stage
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --manifest-path spotter-svc/Cargo.toml --format json
+          cargo cyclonedx --manifest-path spotter-cli/Cargo.toml --format json
+          Move-Item spotter-svc/spotter-svc.cdx.json (Join-Path $stage 'sbom/spotter-svc.cdx.json')
+          Move-Item spotter-cli/spotter-cli.cdx.json (Join-Path $stage 'sbom/spotter-cli.cdx.json')
+          $expectedStageFiles = @(
+            'spotter-svc.exe',
+            'spotter-cli.exe',
+            'spotter_svc.pdb',
+            'spotter_cli.pdb',
+            'sbom/spotter-svc.cdx.json',
+            'sbom/spotter-cli.cdx.json'
+          ) | Sort-Object
+          $actualStageFiles = @(
+            Get-ChildItem -LiteralPath $stage -Recurse -File |
+              ForEach-Object { $_.FullName.Substring($stage.Length + 1).Replace('\', '/') }
+          ) | Sort-Object
+          if (Compare-Object $actualStageFiles $expectedStageFiles) {
+            throw 'source-artifact stage inventory differs from the closed expected set'
+          }
+          dotnet tool install --global wix --version 6.0.0
+          Remove-Item -LiteralPath installer/bin, installer/obj -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force packaged | Out-Null
+          $msi = Join-Path (Resolve-Path -LiteralPath packaged).Path "SnipeSpotter-$env:RUN_IDENTITY-x64.msi"
+          $stageDir = (Resolve-Path -LiteralPath $stage).Path
+          dotnet build installer/Product.wixproj -c Release -p:Platform=x64 -p:ProductVersion=0.1.0 "-p:StageDir=$stageDir"
+          $builtMsis = @(Get-ChildItem installer/bin -Recurse -Filter '*.msi' -File)
+          if ($builtMsis.Count -ne 1) { throw 'WiX must produce exactly one MSI' }
+          Copy-Item -LiteralPath $builtMsis[0].FullName -Destination $msi
+          $packagedMsis = @(Get-ChildItem -LiteralPath packaged -Filter '*.msi' -File)
+          if ($packagedMsis.Count -ne 1 -or $packagedMsis[0].FullName -ne $msi) {
+            throw 'source-artifact package inventory must contain exactly the MSI consumed by validation'
+          }
+      - name: Validate MSI lifecycle
+        id: validate
+        shell: pwsh
+        env:
+          MSI_NAME: ${{ inputs.msi_name }}
+          RUN_IDENTITY: ${{ inputs.run_identity }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $resolvedName = $env:MSI_NAME
+          if ([string]::IsNullOrWhiteSpace($resolvedName)) {
+            $resolvedName = (Get-ChildItem -LiteralPath packaged -Filter '*.msi' -File | Select-Object -First 1).Name
+          }
+          $msiPath = Join-Path (Get-Location) (Join-Path 'packaged' $resolvedName)
+          if (-not (Test-Path -LiteralPath $msiPath -PathType Leaf)) {
+            throw "packaged MSI was not found: $msiPath"
+          }
+          ./scripts/test-msi-lifecycle.ps1 -MsiPath $msiPath
+      - name: Capture bounded lifecycle diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $diagnosticRoot = Join-Path $env:RUNNER_TEMP 'snipespotter-msi-logs'
+          New-Item -ItemType Directory -Force -Path $diagnosticRoot | Out-Null
+          $service = Get-Service -Name 'SnipeSpotter' -ErrorAction SilentlyContinue
+          if ($null -eq $service) {
+            'service=absent' | Set-Content -LiteralPath (Join-Path $diagnosticRoot 'service.txt')
+          } else {
+            "service=$($service.Status)" | Set-Content -LiteralPath (Join-Path $diagnosticRoot 'service.txt')
+          }
+          Get-WinEvent -LogName Application -MaxEvents 50 -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProviderName -match 'MsiInstaller|SnipeSpotter' } |
+            Select-Object -First 20 TimeCreated, ProviderName, Id, LevelDisplayName |
+            ConvertTo-Json -Depth 2 |
+            Set-Content -LiteralPath (Join-Path $diagnosticRoot 'application-events.json')
+      - name: Publish lifecycle result
+        id: result
+        if: always()
+        env:
+          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "lifecycle_result=$env:VALIDATE_OUTCOME" | Set-Content -LiteralPath $env:GITHUB_OUTPUT
+      - name: Upload MSI lifecycle logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ inputs.log_artifact_name }}
+          path: ${{ runner.temp }}/snipespotter-msi-logs/*
+          if-no-files-found: warn
