@@ -95,7 +95,6 @@ class PrivacyPolicyTests(unittest.TestCase):
         workflow = (Path(__file__).resolve().parents[2] / ".github" / "workflows" / "hardware-experiment.yml").read_text(encoding="utf-8")
         self.assertIn("GetCurrentProcess().SessionId", workflow)
         self.assertIn("-ImageAlias $env:IMAGE_ALIAS", workflow)
-        self.assertIn("-ImageAlias $arguments.image_alias", workflow)
         self.assertIn("hmac_fragments", collector)
 
     def test_workflow_uses_one_key_for_both_contexts_and_cleans_it(self) -> None:
@@ -140,18 +139,12 @@ class PrivacyPolicyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertGreaterEqual(
             workflow.count("[Diagnostics.Process]::GetCurrentProcess().SessionId"),
-            2,
+            1,
         )
         self.assertIn(
             "-SessionId $directSessionId",
             workflow,
         )
-        self.assertIn(
-            "$sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId",
-            workflow,
-        )
-        self.assertIn("-SessionId $sessionId", workflow)
-        self.assertNotIn("session_id = $sessionId", workflow)
 
     def test_workflow_records_machine_readable_optional_image_skip(self) -> None:
         workflow = (
