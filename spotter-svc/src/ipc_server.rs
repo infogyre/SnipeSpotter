@@ -80,9 +80,26 @@ where
 /// # Errors
 /// Returns an error when pipe creation or a client session fails.
 #[cfg(windows)]
+/// Run the production named-pipe accept loop on the fixed product endpoint.
+///
+/// # Errors
+/// Returns an error when pipe creation or a client session fails.
 pub async fn run_named_pipe(fsm: FsmHandle) -> Result<()> {
+    run_named_pipe_at(fsm, spotter_core::PIPE_NAME).await
+}
+
+#[cfg(windows)]
+/// Run the secured named-pipe accept loop on an explicit endpoint.
+///
+/// The endpoint is intended for isolated integration tests. Production callers should use
+/// [`run_named_pipe`], which preserves the fixed product pipe identity.
+///
+/// # Errors
+/// Returns an error when pipe creation or a client session fails.
+pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> Result<()> {
+    let pipe_name = pipe_name.into();
     loop {
-        let server = create_secured_server()?;
+        let server = create_secured_server(&pipe_name)?;
         server.connect().await?;
         if let Err(error) = serve_one(server, &fsm).await {
             tracing::warn!(%error, "IPC client session failed");
@@ -91,8 +108,9 @@ pub async fn run_named_pipe(fsm: FsmHandle) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn create_secured_server() -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-    use spotter_core::PIPE_NAME;
+fn create_secured_server(
+    pipe_name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use spotter_win32::pipe::create_admin_pipe_security_attributes;
     use tokio::net::windows::named_pipe::ServerOptions;
 
@@ -104,7 +122,7 @@ fn create_secured_server() -> Result<tokio::net::windows::named_pipe::NamedPipeS
     unsafe {
         ServerOptions::new()
             .first_pipe_instance(false)
-            .create_with_security_attributes_raw(PIPE_NAME, security.as_ptr().cast_mut().cast())
+            .create_with_security_attributes_raw(pipe_name, security.as_ptr().cast_mut().cast())
             .context("failed to create secured named pipe")
     }
 }

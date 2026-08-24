@@ -38,7 +38,7 @@ pub struct AssetSummary {
 }
 
 /// Persisted service state and its authentication tag.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServiceState {
     /// The timestamp of the most recent synchronization attempt.

@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use secrecy::SecretString;
 use spotter_core::{Settings, state::ServiceState};
 
-use crate::{discovery::HardwareDiscovery, gather::RemoteReads, sync_engine::RemoteMutations};
+use crate::{discovery::HardwareDiscovery, ports::RemoteReads, sync_engine::RemoteMutations};
 
 /// Encrypts and decrypts the API token at the platform boundary.
 pub trait SecretProtector: Send + Sync {

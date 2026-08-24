@@ -10,9 +10,9 @@ pub mod gather;
 pub mod ipc_server;
 pub mod logging;
 pub mod operation_journal;
-pub mod ports;
 #[cfg(windows)]
 pub mod owner_ports;
+pub mod ports;
 #[cfg(windows)]
 pub mod service;
 
