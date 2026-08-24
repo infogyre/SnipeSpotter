@@ -32,3 +32,5 @@ windows-service = { workspace = true }
 spotter-build = { path = "../spotter-build" }
 
 [dev-dependencies]
+spotter-svc = { path = "../spotter-svc" }
+tokio = { workspace = true }

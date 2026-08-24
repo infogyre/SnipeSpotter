@@ -1402,7 +1402,9 @@ dependencies = [
  "serde_json",
  "spotter-build",
  "spotter-core",
+ "spotter-svc",
  "spotter-win32",
+ "tokio",
  "windows",
  "windows-service",
 ]

@@ -213,6 +213,8 @@ fn render(response: &IpcResponse, json: bool) -> Result<String> {
 pub struct NamedPipeTransport {
     #[cfg(windows)]
     timeout: Duration,
+    #[cfg(windows)]
+    endpoint: String,
 }
 
 impl NamedPipeTransport {
@@ -223,6 +225,18 @@ impl NamedPipeTransport {
         Self {
             #[cfg(windows)]
             timeout,
+            #[cfg(windows)]
+            endpoint: String::from(spotter_core::PIPE_NAME),
+        }
+    }
+
+    /// Construct a transport for an explicit Windows named-pipe endpoint.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn with_endpoint(timeout: Duration, endpoint: impl Into<String>) -> Self {
+        Self {
+            timeout,
+            endpoint: endpoint.into(),
         }
     }
 }
@@ -237,9 +251,10 @@ impl Default for NamedPipeTransport {
 impl IpcTransport for NamedPipeTransport {
     fn send(&mut self, command: &ServiceCommand) -> Result<IpcResponse> {
         let command = command.clone();
+        let endpoint = self.endpoint.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
-            let _ = sender.send(exchange_named_pipe(&command));
+            let _ = sender.send(exchange_named_pipe(&command, &endpoint));
         });
         receiver
             .recv_timeout(self.timeout)
@@ -255,13 +270,13 @@ impl IpcTransport for NamedPipeTransport {
 }
 
 #[cfg(windows)]
-fn exchange_named_pipe(command: &ServiceCommand) -> Result<IpcResponse> {
+fn exchange_named_pipe(command: &ServiceCommand, endpoint: &str) -> Result<IpcResponse> {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 
     let pipe = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(spotter_core::PIPE_NAME)
+        .open(endpoint)
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
     let mut request = serde_json::to_vec(command).context("failed to encode service request")?;
     request.push(b'\n');

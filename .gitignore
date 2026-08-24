@@ -20,3 +20,10 @@
 .idea/
 .DS_Store
 Thumbs.db
+
+# Python generated caches
+__pycache__/
+*.py[cod]
+
+# Generated hosted hardware experiment reports
+/hardware-reports/
