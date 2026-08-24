@@ -27,9 +27,20 @@ async fn secured_server_and_production_client_roundtrip_on_unique_pipe() -> Resu
         endpoint.clone(),
     ));
 
+    // Retry connecting until the server has created the pipe instance.
     let response = tokio::task::spawn_blocking(move || {
-        let mut transport = NamedPipeTransport::with_endpoint(Duration::from_secs(5), endpoint);
-        transport.send(&ServiceCommand::GetStatus)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let mut transport =
+                NamedPipeTransport::with_endpoint(Duration::from_secs(5), endpoint.clone());
+            match transport.send(&ServiceCommand::GetStatus) {
+                Ok(response) => return Ok(response),
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     })
     .await??;
 
