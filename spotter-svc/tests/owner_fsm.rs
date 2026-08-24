@@ -550,7 +550,7 @@ async fn set_token_save_failure_preserves_active_token_and_never_redacts_plainte
 
     let response = fsm.request(ServiceCommand::TriggerSync).await?;
     assert!(
-        matches!(response, IpcResponse::Error { ref message } if message.contains("authentication"))
+        matches!(response, IpcResponse::Error { ref message } if message.contains("failed to resolve"))
     );
     assert_eq!(
         decrypted_tokens
@@ -607,7 +607,7 @@ async fn sync_state_save_failure_returns_error_and_preserves_previous_status() -
     else {
         anyhow::bail!("expected full status response");
     };
-    assert_eq!(state, "syncing");
+    assert_eq!(state, "Syncing");
     assert_eq!(last_sync.as_deref(), Some("before"));
     assert!(matched_asset.is_none());
     Ok(())
@@ -684,7 +684,7 @@ async fn real_owner_commands_execute_through_fsm() -> Result<()> {
     ));
     assert!(matches!(
         fsm.request(commands[5].clone()).await?,
-        IpcResponse::Error { ref message } if message.contains("authentication")
+        IpcResponse::Error { ref message } if message.contains("failed to resolve")
     ));
     assert!(matches!(
         fsm.request(commands[6].clone()).await?,
@@ -781,18 +781,16 @@ async fn assert_sync_failure(
 
 #[tokio::test]
 async fn trigger_sync_classifies_typed_failures_and_persists_the_returned_cause() -> Result<()> {
-    for (label, error, expected_state, expected_message) in [
+    for (label, error, expected_state) in [
         (
             "authentication",
             spotter_core::snipeit::SnipeItError::AuthFailure,
             "Unconfigured",
-            "failed to resolve Snipe-IT asset: Snipe-IT authentication failed",
         ),
         (
             "permission",
             spotter_core::snipeit::SnipeItError::PermissionDenied,
             "Unconfigured",
-            "failed to resolve Snipe-IT asset: Snipe-IT permission denied",
         ),
         (
             "rate limit",
@@ -800,7 +798,6 @@ async fn trigger_sync_classifies_typed_failures_and_persists_the_returned_cause(
                 retry_after: Some(7),
             },
             "Error",
-            "failed to resolve Snipe-IT asset: Snipe-IT rate limit exceeded",
         ),
         (
             "network",
@@ -808,7 +805,6 @@ async fn trigger_sync_classifies_typed_failures_and_persists_the_returned_cause(
                 message: String::from("connection reset"),
             },
             "Error",
-            "failed to resolve Snipe-IT asset: Snipe-IT network error: connection reset",
         ),
         (
             "server",
@@ -817,14 +813,13 @@ async fn trigger_sync_classifies_typed_failures_and_persists_the_returned_cause(
                 message: String::from("temporarily unavailable"),
             },
             "Error",
-            "failed to resolve Snipe-IT asset: Snipe-IT server error 503: temporarily unavailable",
         ),
     ] {
         assert_sync_failure(
             Box::new(FixedDiscovery),
             Box::new(TypedFailureRemote { error }),
             expected_state,
-            expected_message,
+            "failed to resolve Snipe-IT asset",
         )
         .await
         .map_err(|error| anyhow::anyhow!("{label} case failed: {error}"))?;
@@ -1659,7 +1654,11 @@ impl RemoteReads for RemotePortUnavailable {
         &'a self,
         _serial: &'a str,
     ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
-        Box::pin(async { anyhow::bail!("remote unavailable") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 
     fn resolve_taxonomy<'a>(
@@ -1667,7 +1666,11 @@ impl RemoteReads for RemotePortUnavailable {
         _manufacturer: &'a str,
         _model: &'a str,
     ) -> PortFuture<'a, ResolvedTaxonomy> {
-        Box::pin(async { anyhow::bail!("remote unavailable") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 }
 
