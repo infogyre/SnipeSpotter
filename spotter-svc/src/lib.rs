@@ -12,7 +12,120 @@ pub mod logging;
 pub mod operation_journal;
 pub mod ports;
 #[cfg(windows)]
+pub mod owner_ports;
+#[cfg(windows)]
 pub mod service;
+
+#[cfg(all(windows, feature = "test-support"))]
+/// Test-only construction of the production command owner.
+#[doc(hidden)]
+pub mod test_support {
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+    use spotter_core::{Settings, state::ServiceState};
+    use tokio::sync::Mutex;
+
+    pub use crate::owner_ports::{
+        Clock, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
+    };
+
+    /// Complete external dependency bundle used by [`spawn_owner`].
+    pub struct OwnerPorts {
+        pub secret_protector: Box<dyn SecretProtector>,
+        pub settings_store: Box<dyn SettingsStore>,
+        pub state_store: Box<dyn StateStore>,
+        pub remote: Box<dyn RemotePort>,
+        pub remote_factory: Box<dyn RemoteFactory>,
+        pub discovery: Box<dyn crate::discovery::HardwareDiscovery>,
+        pub clock: Box<dyn Clock>,
+    }
+
+    /// Construct the real owner and route commands through the production FSM.
+    ///
+    /// The test constructor accepts all filesystem locations explicitly so integration tests never
+    /// touch the fixed `ProgramData` root or the installed SCM identity.
+    ///
+    /// # Errors
+    /// Returns an error when the FSM channel capacity is zero.
+    pub fn spawn_owner(
+        capacity: usize,
+        journal_path: impl Into<PathBuf>,
+        settings: Settings,
+        persisted_state: ServiceState,
+        ports: OwnerPorts,
+    ) -> Result<crate::fsm::FsmHandle> {
+        spawn_owner_inner(
+            capacity,
+            journal_path.into(),
+            settings,
+            persisted_state,
+            ports,
+        )
+    }
+
+    /// Recover pending owner work before exposing the owner through the production FSM.
+    ///
+    /// This is the same startup ordering used by the Windows service, with test-injected ports
+    /// replacing platform and network adapters.
+    ///
+    /// # Errors
+    /// Returns an error when recovery or the FSM channel setup fails.
+    pub async fn spawn_owner_with_recovery(
+        capacity: usize,
+        journal_path: impl Into<PathBuf>,
+        settings: Settings,
+        mut persisted_state: ServiceState,
+        mut ports: OwnerPorts,
+    ) -> Result<crate::fsm::FsmHandle> {
+        let journal_path = journal_path.into();
+        crate::service::recover_owner_state(
+            &journal_path,
+            ports.state_store.as_ref(),
+            &mut *ports.remote,
+            &mut persisted_state,
+        )
+        .await?;
+        spawn_owner_inner(capacity, journal_path, settings, persisted_state, ports)
+    }
+
+    fn spawn_owner_inner(
+        capacity: usize,
+        journal_path: PathBuf,
+        settings: Settings,
+        persisted_state: ServiceState,
+        ports: OwnerPorts,
+    ) -> Result<crate::fsm::FsmHandle> {
+        let (polling_sender, _polling_receiver) =
+            tokio::sync::watch::channel(settings.polling.interval_hours);
+        let owner = std::sync::Arc::new(Mutex::new(crate::service::CommandOwner::from_test_ports(
+            journal_path,
+            settings,
+            persisted_state,
+            polling_sender,
+            ports,
+        )));
+        crate::fsm::spawn(capacity, move |command| {
+            let owner = std::sync::Arc::clone(&owner);
+            async move { owner.lock().await.handle(command).await }
+        })
+    }
+
+    /// Enqueue a production owner command while retaining control of its response consumer.
+    ///
+    /// This test-support-only wrapper exercises the same FSM sender and owner handler as
+    /// [`crate::fsm::FsmHandle::request`], but lets integration tests drop the receiver after the
+    /// command has been accepted.
+    ///
+    /// # Errors
+    /// Returns an error when the service loop has stopped.
+    pub async fn enqueue_owner_request(
+        fsm: &crate::fsm::FsmHandle,
+        command: spotter_core::ipc::ServiceCommand,
+    ) -> Result<tokio::sync::oneshot::Receiver<spotter_core::ipc::IpcResponse>> {
+        fsm.enqueue(command).await
+    }
+}
 pub mod snipeit_client;
 pub mod state_io;
 pub mod sync_engine;
@@ -21,6 +134,8 @@ use spotter_core::{
     config::{Settings, config_status},
     ipc::{IpcResponse, ServiceCommand},
 };
+#[cfg(any(windows, test))]
+use spotter_core::{ipc::MonitorStatus, state::ServiceState as PersistedServiceState};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsmState {
@@ -72,6 +187,44 @@ pub struct ServiceController {
     pub state: FsmState,
     pub settings: Settings,
     sync_pending: bool,
+}
+
+/// Project persisted owner data into the public status response without performing I/O.
+#[cfg(any(windows, test))]
+#[must_use]
+pub(crate) fn service_status_projection(
+    state: FsmState,
+    settings: &Settings,
+    persisted_state: &PersistedServiceState,
+    full: bool,
+) -> IpcResponse {
+    let state = format!("{state:?}");
+    if !full {
+        return IpcResponse::Status {
+            state,
+            last_sync: persisted_state.last_sync_time.clone(),
+            next_sync: None,
+            snipeit_url: settings.snipeit.url.clone(),
+        };
+    }
+    let monitors = persisted_state
+        .known_monitors
+        .iter()
+        .map(|monitor| MonitorStatus {
+            serial: monitor.serial.clone(),
+            asset_id: monitor.snipeit_asset_id,
+            checked_out: monitor.checked_out,
+            absent_since: monitor.absent_since.map(|value| value.to_rfc3339()),
+        })
+        .collect();
+    IpcResponse::StatusFull {
+        state,
+        last_sync: persisted_state.last_sync_time.clone(),
+        next_sync: None,
+        snipeit_url: settings.snipeit.url.clone(),
+        matched_asset: persisted_state.matched_asset.clone(),
+        monitors,
+    }
 }
 
 impl ServiceController {
@@ -190,6 +343,51 @@ mod tests {
         assert!(controller.take_sync_request());
         assert!(!controller.take_sync_request());
     }
+    #[test]
+    fn service_status_projection_preserves_persisted_full_status() {
+        use chrono::{DateTime, TimeZone as _, Utc};
+        use spotter_core::{monitors::MonitorSyncEntry, state::AssetSummary};
+
+        let seen = Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 0)
+            .single()
+            .unwrap_or(DateTime::UNIX_EPOCH);
+        let mut settings = Settings::default();
+        settings.snipeit.url = String::from("https://example.test");
+        let persisted = PersistedServiceState {
+            last_sync_time: Some(String::from("2026-01-01T00:00:00Z")),
+            matched_asset: Some(AssetSummary {
+                id: 7,
+                name: String::from("computer"),
+                serial: Some(String::from("SYS")),
+                asset_tag: None,
+            }),
+            known_monitors: vec![MonitorSyncEntry {
+                serial: String::from("MON"),
+                snipeit_asset_id: Some(8),
+                last_seen: seen,
+                absent_since: None,
+                checked_out: true,
+            }],
+            ..PersistedServiceState::default()
+        };
+        let response = service_status_projection(FsmState::Idle, &settings, &persisted, true);
+        assert!(matches!(response, IpcResponse::StatusFull { .. }));
+        if let IpcResponse::StatusFull {
+            state,
+            matched_asset,
+            monitors,
+            ..
+        } = response
+        {
+            assert_eq!(state, "Idle");
+            assert_eq!(matched_asset.map(|asset| asset.id), Some(7));
+            assert_eq!(monitors.len(), 1);
+            assert_eq!(monitors[0].asset_id, Some(8));
+            assert!(monitors[0].checked_out);
+        }
+    }
+
     #[test]
     fn journal_recovery_is_deterministic() {
         let records = vec![

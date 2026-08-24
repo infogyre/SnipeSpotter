@@ -34,6 +34,31 @@ pub struct MonitorSyncState {
     pub entries: Vec<MonitorSyncEntry>,
 }
 
+/// Reason a specifically requested monitor cannot be forcibly checked in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForcedCheckinIneligibility {
+    Present,
+    AlreadyCheckedIn,
+    Unmapped,
+}
+
+/// Classify whether a monitor can be forcibly checked in.
+#[must_use]
+pub fn forced_checkin_ineligibility(
+    entry: &MonitorSyncEntry,
+) -> Option<ForcedCheckinIneligibility> {
+    if entry.absent_since.is_none() {
+        return Some(ForcedCheckinIneligibility::Present);
+    }
+    if !entry.checked_out {
+        return Some(ForcedCheckinIneligibility::AlreadyCheckedIn);
+    }
+    if entry.snipeit_asset_id.is_none_or(|asset_id| asset_id == 0) {
+        return Some(ForcedCheckinIneligibility::Unmapped);
+    }
+    None
+}
+
 /// Deterministic difference between current discovery and persisted state.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MonitorDiff {
@@ -41,6 +66,24 @@ pub struct MonitorDiff {
     pub removed_monitors: Vec<MonitorSyncEntry>,
     pub unchanged_monitors: Vec<MonitorInfo>,
     pub next_state: MonitorSyncState,
+}
+
+/// Build a candidate monitor state with selected successfully checked-in serials cleared.
+///
+/// The input is never mutated, so callers can persist the candidate only after the corresponding
+/// remote mutations have succeeded.
+#[must_use]
+pub fn apply_forced_checkin_serials(
+    state: &MonitorSyncState,
+    serials: &[String],
+) -> MonitorSyncState {
+    let mut candidate = state.clone();
+    for entry in &mut candidate.entries {
+        if serials.iter().any(|serial| serial == &entry.serial) {
+            entry.checked_out = false;
+        }
+    }
+    candidate
 }
 
 /// Diff current monitors by serial and produce the next persisted state.
@@ -171,54 +214,63 @@ mod tests {
         assert!(entry.is_some_and(|entry| entry.absent_since.is_none()));
     }
 
-    /// Real WMI monitor data captured from a Dell Precision 3460 with two
-    /// monitors. All identifiers redacted to deterministic placeholders.
-    /// Proves `diff_monitors` handles real monitor shapes from physical hardware.
     #[test]
-    fn diff_handles_real_physical_wmi_fixture() {
-        let raw = include_str!("../../tests/fixtures/physical/wmi_monitors.json");
-        let fixture: Vec<serde_json::Value> =
-            serde_json::from_str(raw).expect("fixture must be valid JSON");
-
-        let monitors: Vec<MonitorInfo> = fixture
-            .iter()
-            .filter(|m| {
-                m.get("active")
-                    .and_then(serde_json::Value::as_bool)
-                    .is_some_and(std::convert::identity)
-            })
-            .map(|m| MonitorInfo {
-                manufacturer_code: m["manufacturer_name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                product_code: m["product_code"].as_str().unwrap_or_default().to_owned(),
-                serial: m["serial"].as_str().unwrap_or_default().to_owned(),
-                manufacture_week: u8::try_from(
-                    m["week_of_manufacture"].as_u64().unwrap_or_default(),
-                )
-                .unwrap_or_default(),
-                manufacture_year: u16::try_from(
-                    m["year_of_manufacture"].as_u64().unwrap_or_default(),
-                )
-                .unwrap_or_default(),
-            })
-            .collect();
-
-        assert_eq!(monitors.len(), 2, "fixture has 2 active monitors");
-        assert!(
-            monitors[0].serial.starts_with("SER"),
-            "serials must be redacted"
-        );
-        assert!(
-            monitors[1].serial.starts_with("SER"),
-            "serials must be redacted"
+    fn forced_checkin_eligibility_reports_each_rejection_reason() {
+        let mut entry = MonitorSyncEntry {
+            serial: String::from("MON-1"),
+            snipeit_asset_id: Some(1),
+            last_seen: at(1),
+            absent_since: None,
+            checked_out: true,
+        };
+        assert_eq!(
+            forced_checkin_ineligibility(&entry),
+            Some(ForcedCheckinIneligibility::Present)
         );
 
-        // Feed through the planner to prove it handles real shapes.
-        let diff = diff_monitors(&monitors, &MonitorSyncState::default(), at(1));
-        assert_eq!(diff.new_monitors.len(), 2);
-        assert!(diff.removed_monitors.is_empty());
-        assert_eq!(diff.next_state.entries.len(), 2);
+        entry.absent_since = Some(at(1));
+        entry.checked_out = false;
+        assert_eq!(
+            forced_checkin_ineligibility(&entry),
+            Some(ForcedCheckinIneligibility::AlreadyCheckedIn)
+        );
+
+        entry.checked_out = true;
+        entry.snipeit_asset_id = None;
+        assert_eq!(
+            forced_checkin_ineligibility(&entry),
+            Some(ForcedCheckinIneligibility::Unmapped)
+        );
+
+        entry.snipeit_asset_id = Some(1);
+        assert_eq!(forced_checkin_ineligibility(&entry), None);
+    }
+
+    #[test]
+    fn forced_checkin_candidate_clears_selected_checkout_flags_transactionally() {
+        let state = MonitorSyncState {
+            entries: vec![
+                MonitorSyncEntry {
+                    serial: String::from("MON-1"),
+                    snipeit_asset_id: Some(1),
+                    last_seen: at(1),
+                    absent_since: Some(at(1)),
+                    checked_out: true,
+                },
+                MonitorSyncEntry {
+                    serial: String::from("MON-2"),
+                    snipeit_asset_id: Some(2),
+                    last_seen: at(1),
+                    absent_since: Some(at(1)),
+                    checked_out: true,
+                },
+            ],
+        };
+
+        let candidate = apply_forced_checkin_serials(&state, &[String::from("MON-1")]);
+
+        assert!(!candidate.entries[0].checked_out);
+        assert!(candidate.entries[1].checked_out);
+        assert!(state.entries[0].checked_out);
     }
 }

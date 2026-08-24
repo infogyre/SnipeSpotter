@@ -31,6 +31,23 @@ impl FsmHandle {
     /// # Errors
     /// Returns an error when the service loop has stopped or the response is cancelled.
     pub async fn request(&self, command: ServiceCommand) -> Result<IpcResponse> {
+        self.enqueue(command)
+            .await?
+            .await
+            .map_err(|_| anyhow::anyhow!("service command response was cancelled"))
+    }
+
+    /// Enqueue one command and return its response receiver before waiting for completion.
+    ///
+    /// This is crate-visible so the test-support owner harness can exercise a disconnected
+    /// response consumer while retaining the production enqueue and ordering path.
+    ///
+    /// # Errors
+    /// Returns an error when the service loop has stopped.
+    pub(crate) async fn enqueue(
+        &self,
+        command: ServiceCommand,
+    ) -> Result<oneshot::Receiver<IpcResponse>> {
         let is_sync = command == ServiceCommand::TriggerSync;
         if is_sync
             && self
@@ -38,9 +55,11 @@ impl FsmHandle {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
-            return Ok(IpcResponse::Ok {
+            let (response, receiver) = oneshot::channel();
+            let _ = response.send(IpcResponse::Ok {
                 message: String::from("sync already queued"),
             });
+            return Ok(receiver);
         }
         let (response, receiver) = oneshot::channel();
         if self
@@ -54,9 +73,7 @@ impl FsmHandle {
             }
             return Err(anyhow::anyhow!("service command loop is unavailable"));
         }
-        receiver
-            .await
-            .map_err(|_| anyhow::anyhow!("service command response was cancelled"))
+        Ok(receiver)
     }
 }
 
