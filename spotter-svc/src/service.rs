@@ -718,6 +718,9 @@ mod tests {
     fn factory_failure_preserves_active_settings() {
         let mut settings = spotter_core::Settings::default();
         settings.snipeit.url = String::from("https://old.example");
+        settings.snipeit.api_token_encrypted = vec![0x42];
+        settings.snipeit.checkout_status_id = 5;
+        settings.snipeit.checkin_status_id = 6;
         let original = settings.clone();
         let mut owner = CommandOwner {
             journal_path: std::path::PathBuf::new(),
