@@ -45,7 +45,7 @@ def test_lifecycle_checks_named_pipe_and_unconfigured_cli_status() -> None:
 
 def test_lifecycle_uses_shared_support_modules() -> None:
     assert "Assert-ServiceRunsAsSystem -Name $serviceName" in SCRIPT
-    assert "Write-BoundedDiagnostics" in SCRIPT
+    assert "Write-BoundedDiagnostic" in SCRIPT
     assert "Invoke-FailureSafeCleanup" in SCRIPT
     assert "function Assert-RunningServiceOwner" not in SCRIPT
     assert "function Write-LifecycleDiagnostics" not in SCRIPT

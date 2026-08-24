@@ -23,7 +23,7 @@ function Assert-AclPrincipal {
     param(
         [Parameter(Mandatory = $true)][object[]]$Rules,
         [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Identity,
-        [Parameter(Mandatory = $true)][ValidateSet('Allow', 'Deny')][string]$AccessType = 'Allow',
+        [Parameter(Mandatory = $true)][ValidateSet('Allow', 'Deny')][string]$AccessType,
         [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$RightsFragment,
         [Parameter(Mandatory = $false)][bool]$MustBeInherited = $false
     )

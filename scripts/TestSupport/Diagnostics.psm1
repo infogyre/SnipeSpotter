@@ -14,7 +14,7 @@ function Get-BoundedText {
     return ($text.Substring(0, $MaxCharacters).Trim() + '...')
 }
 
-function Write-BoundedDiagnostics {
+function Write-BoundedDiagnostic {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path,
@@ -41,4 +41,4 @@ function Write-BoundedDiagnostics {
     [IO.File]::WriteAllText($Path, $json, [Text.UTF8Encoding]::new($false))
 }
 
-Export-ModuleMember -Function Get-BoundedText, Write-BoundedDiagnostics
+Export-ModuleMember -Function Get-BoundedText, Write-BoundedDiagnostic

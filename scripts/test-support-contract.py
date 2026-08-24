@@ -63,7 +63,7 @@ def test_diagnostics_are_allowlisted_and_size_bounded() -> None:
     assert "function Get-BoundedText" in module
     assert "MaxCharacters" in module
     assert "ValidateRange(1, 65536)" in module
-    assert "function Write-BoundedDiagnostics" in module
+    assert "function Write-BoundedDiagnostic" in module
     assert "MaxBytes" in module
     assert "ConvertTo-Json" in module
     assert "Get-ChildItem Env:" not in module

@@ -149,7 +149,7 @@ try {
     }
 } catch {
     $primaryError = $_
-    Write-BoundedDiagnostics -Path (Join-Path $LogDirectory 'failure-state.json') -Values @{
+    Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'failure-state.json') -Values @{
         phase = 'failure'
         service_status = ([string](Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status)
         install_root_exists = [bool](Test-Path -LiteralPath $installRoot)
@@ -168,7 +168,7 @@ try {
         Invoke-FailureSafeCleanup -Actions $cleanupActions
     } catch {
         $cleanupError = $_
-        Write-BoundedDiagnostics -Path (Join-Path $LogDirectory 'cleanup-failure-state.json') -Values @{
+        Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'cleanup-failure-state.json') -Values @{
             phase = 'cleanup-failure'
             service_status = ([string](Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status)
             install_root_exists = [bool](Test-Path -LiteralPath $installRoot)
@@ -190,7 +190,7 @@ try {
     }
 } catch {
     if ($null -eq $primaryError) { $primaryError = $_ }
-    Write-BoundedDiagnostics -Path (Join-Path $LogDirectory 'post-uninstall-failure-state.json') -Values @{
+    Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'post-uninstall-failure-state.json') -Values @{
         phase = 'post-uninstall-failure'
         service_status = ([string](Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status)
         install_root_exists = [bool](Test-Path -LiteralPath $installRoot)
