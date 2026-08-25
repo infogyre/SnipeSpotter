@@ -114,7 +114,7 @@ def test_service_log_capture_is_bounded_best_effort_and_privacy_safe() -> None:
     assert "$ServiceLogTruncationMarker" in helper
     assert "try {" in helper
     assert "catch {" in helper
-    assert "$_ .Name" not in helper
+    assert "$_.Name" not in helper
     assert "$logName = $log.Name" in helper
     assert "Write-Warning" in helper
     assert "return" in helper
