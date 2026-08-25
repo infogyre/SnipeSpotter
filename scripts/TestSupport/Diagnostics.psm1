@@ -10,6 +10,7 @@ function Get-BoundedText {
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
     $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    if ($null -eq $text) { return '' }
     if ($text.Length -le $MaxCharacters) { return $text.Trim() }
     return ($text.Substring(0, $MaxCharacters).Trim() + '...')
 }

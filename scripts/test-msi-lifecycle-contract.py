@@ -10,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).parent
 SCRIPT = (ROOT / "test-msi-lifecycle.ps1").read_text(encoding="utf-8")
 WAIT = (ROOT / "TestSupport" / "Wait.psm1").read_text(encoding="utf-8")
+DIAGNOSTICS = (ROOT / "TestSupport" / "Diagnostics.psm1").read_text(encoding="utf-8")
 SERVICE = (ROOT.parent / "spotter-svc" / "src" / "service.rs").read_text(encoding="utf-8")
 
 
@@ -90,6 +91,32 @@ def test_lifecycle_cli_failure_diagnostics_are_bounded() -> None:
     assert "Get-BoundedText" in SCRIPT
     assert "MaxCharacters" in SCRIPT
     assert "Get-Content -Raw -LiteralPath $stderrPath" not in SCRIPT
+
+
+def test_bounded_text_accepts_empty_files() -> None:
+    assert "if ($null -eq $text) { return '' }" in DIAGNOSTICS
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for the empty diagnostic file probe"
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        empty_file = Path(temporary_directory) / "empty.txt"
+        empty_file.write_bytes(b"")
+        module = ROOT / "TestSupport" / "Diagnostics.psm1"
+        probe = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module '{module.as_posix()}' -Force
+$result = Get-BoundedText -Path '{empty_file.as_posix()}' -MaxCharacters 512
+if ($result -ne '') {{ throw "empty diagnostic file returned unexpected text: $result" }}
+Write-Output 'empty diagnostic file accepted'
+"""
+        result = subprocess.run(
+            [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert "empty diagnostic file accepted" in result.stdout
 
 
 def test_failure_diagnostics_preserve_the_original_error_when_service_is_missing() -> None:
@@ -241,6 +268,7 @@ def main() -> None:
     test_lifecycle_verifies_running_service_process_owner()
     test_lifecycle_attempts_post_uninstall_cleanup_after_uninstall_failure()
     test_lifecycle_cli_failure_diagnostics_are_bounded()
+    test_bounded_text_accepts_empty_files()
     test_failure_diagnostics_preserve_the_original_error_when_service_is_missing()
     test_failure_diagnostics_cover_every_cleanup_boundary()
     test_service_logs_are_captured_before_failure_cleanup()
