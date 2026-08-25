@@ -1,5 +1,6 @@
 """Static contract checks for the elevated MSI lifecycle harness."""
 
+import os
 from pathlib import Path
 import re
 import shutil
@@ -94,26 +95,30 @@ def test_lifecycle_cli_failure_diagnostics_are_bounded() -> None:
 
 
 def test_bounded_text_accepts_empty_files() -> None:
-    assert "if ($null -eq $text) { return '' }" in DIAGNOSTICS
     pwsh = shutil.which("pwsh")
     assert pwsh, "pwsh is required for the empty diagnostic file probe"
-    with tempfile.TemporaryDirectory() as temporary_directory:
+    with tempfile.TemporaryDirectory(prefix="fixture's-") as temporary_directory:
         empty_file = Path(temporary_directory) / "empty.txt"
         empty_file.write_bytes(b"")
         module = ROOT / "TestSupport" / "Diagnostics.psm1"
-        probe = f"""
+        probe = """
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-Import-Module '{module.as_posix()}' -Force
-$result = Get-BoundedText -Path '{empty_file.as_posix()}' -MaxCharacters 512
-if ($result -ne '') {{ throw "empty diagnostic file returned unexpected text: $result" }}
+Import-Module $env:SPOTTER_DIAGNOSTICS_MODULE -Force
+$result = Get-BoundedText -Path $env:SPOTTER_EMPTY_DIAGNOSTIC_FILE -MaxCharacters 512
+if ($result -ne '') { throw "empty diagnostic file returned unexpected text: $result" }
 Write-Output 'empty diagnostic file accepted'
 """
+        environment = os.environ | {
+            "SPOTTER_DIAGNOSTICS_MODULE": str(module),
+            "SPOTTER_EMPTY_DIAGNOSTIC_FILE": str(empty_file),
+        }
         result = subprocess.run(
             [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe],
             check=False,
             capture_output=True,
             text=True,
+            env=environment,
         )
         assert result.returncode == 0, result.stderr or result.stdout
         assert "empty diagnostic file accepted" in result.stdout
@@ -179,7 +184,7 @@ def test_service_log_capture_preserves_primary_error_on_setup_failure() -> None:
 def test_service_log_capture_behavior_with_temporary_files() -> None:
     pwsh = shutil.which("pwsh")
     assert pwsh, "pwsh is required for the service log capture behavior probe"
-    with tempfile.TemporaryDirectory() as temporary_directory:
+    with tempfile.TemporaryDirectory(prefix="fixture's-") as temporary_directory:
         root = Path(temporary_directory)
         data_root = root / "data"
         log_root = data_root / "logs"
@@ -195,30 +200,38 @@ def test_service_log_capture_behavior_with_temporary_files() -> None:
         probe = """
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
-""" + SCRIPT[SCRIPT.index("$MaxServiceLogBytes ="):SCRIPT.index("function Get-ServiceStatusForDiagnostic")] + _function_text(SCRIPT, "Save-ServiceLogDiagnostic", "Get-MachinePathEntry") + f"""
-Save-ServiceLogDiagnostic -DataRoot '{data_root.as_posix()}' -Destination '{destination.as_posix()}'
+""" + SCRIPT[SCRIPT.index("$MaxServiceLogBytes ="):SCRIPT.index("function Get-ServiceStatusForDiagnostic")] + _function_text(SCRIPT, "Save-ServiceLogDiagnostic", "Get-MachinePathEntry") + """
+Save-ServiceLogDiagnostic -DataRoot $env:SPOTTER_DATA_ROOT -Destination $env:SPOTTER_DESTINATION
 $primary = 'sentinel primary error'
-try {{
-    Save-ServiceLogDiagnostic -DataRoot '{data_root.as_posix()}' -Destination '{blocked_destination.as_posix()}'
-}} catch {{
+try {
+    Save-ServiceLogDiagnostic -DataRoot $env:SPOTTER_DATA_ROOT -Destination $env:SPOTTER_BLOCKED_DESTINATION
+} catch {
     throw "capture replaced primary error: $($_.Exception.Message)"
-}}
-if (-not (Test-Path -LiteralPath '{(destination / 'spotter-svc.log.2026-06-01').as_posix()}' -PathType Leaf)) {{ throw 'daily service log was not captured' }}
-if (Test-Path -LiteralPath '{(destination / 'other.log').as_posix()}') {{ throw 'unrelated log was captured' }}
-$capturedFiles = @(Get-ChildItem -LiteralPath '{destination.as_posix()}' -File)
-if ($capturedFiles.Count -gt 4) {{ throw "file count bound exceeded: $($capturedFiles.Count)" }}
+}
+if (-not (Test-Path -LiteralPath $env:SPOTTER_CAPTURED_DAILY_LOG -PathType Leaf)) { throw 'daily service log was not captured' }
+if (Test-Path -LiteralPath $env:SPOTTER_UNRELATED_LOG) { throw 'unrelated log was captured' }
+$capturedFiles = @(Get-ChildItem -LiteralPath $env:SPOTTER_DESTINATION -File)
+if ($capturedFiles.Count -gt 4) { throw "file count bound exceeded: $($capturedFiles.Count)" }
 $totalCapturedBytes = ($capturedFiles | Measure-Object -Property Length -Sum).Sum
-if ($totalCapturedBytes -gt 65536) {{ throw "aggregate byte bound exceeded: $totalCapturedBytes" }}
-$captured = [IO.File]::ReadAllBytes('{(destination / 'spotter-svc.log.2026-06-01').as_posix()}')
-if ($captured.Length -gt 32768) {{ throw "per-file bound exceeded: $($captured.Length)" }}
-if ($captured.Length -eq 32768 -and -not ([Text.Encoding]::UTF8.GetString($captured)).EndsWith('...[truncated]')) {{ throw 'bounded file lacks truncation marker' }}
+if ($totalCapturedBytes -gt 65536) { throw "aggregate byte bound exceeded: $totalCapturedBytes" }
+$captured = [IO.File]::ReadAllBytes($env:SPOTTER_CAPTURED_DAILY_LOG)
+if ($captured.Length -gt 32768) { throw "per-file bound exceeded: $($captured.Length)" }
+if ($captured.Length -eq 32768 -and -not ([Text.Encoding]::UTF8.GetString($captured)).EndsWith('...[truncated]')) { throw 'bounded file lacks truncation marker' }
 Write-Output $primary
 """
+        environment = os.environ | {
+            "SPOTTER_DATA_ROOT": str(data_root),
+            "SPOTTER_DESTINATION": str(destination),
+            "SPOTTER_BLOCKED_DESTINATION": str(blocked_destination),
+            "SPOTTER_CAPTURED_DAILY_LOG": str(destination / "spotter-svc.log.2026-06-01"),
+            "SPOTTER_UNRELATED_LOG": str(destination / "other.log"),
+        }
         result = subprocess.run(
             [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe],
             check=False,
             capture_output=True,
             text=True,
+            env=environment,
         )
         assert result.returncode == 0, result.stderr or result.stdout
         assert "sentinel primary error" in result.stdout
