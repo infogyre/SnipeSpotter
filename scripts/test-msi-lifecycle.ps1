@@ -28,6 +28,36 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
+function Get-ServiceStatusForDiagnostic {
+    param([Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Name)
+    $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+    if ($null -eq $service) { return 'absent' }
+    return $service.Status.ToString()
+}
+
+function Save-ServiceLogDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$DataRoot,
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Destination
+    )
+
+    $logDirectory = Join-Path $DataRoot 'logs'
+    if (-not (Test-Path -LiteralPath $logDirectory -PathType Container)) { return }
+    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+    Get-ChildItem -LiteralPath $logDirectory -Filter '*.log' -File -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            try {
+                $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction Stop
+                if ($content.Length -gt 32768) {
+                    $content = $content.Substring(0, 32768) + '...[truncated]'
+                }
+                Set-Content -LiteralPath (Join-Path $Destination $_.Name) -Value $content
+            } catch {
+                Write-Warning "could not capture service log $($_.Name): $($_.Exception.Message)"
+            }
+        }
+}
+
 function Get-MachinePathEntry {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     if ([string]::IsNullOrWhiteSpace($machinePath)) { return @() }
@@ -150,9 +180,10 @@ try {
     }
 } catch {
     $primaryError = $_
+    Save-ServiceLogDiagnostic -DataRoot $dataRoot -Destination $LogDirectory
     Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'failure-state.json') -Values @{
         phase = 'failure'
-        service_status = ([string](Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status)
+        service_status = Get-ServiceStatusForDiagnostic -Name $serviceName
         install_root_exists = [bool](Test-Path -LiteralPath $installRoot)
         data_root_exists = [bool](Test-Path -LiteralPath $dataRoot)
         machine_path_contains_bin = [bool]((Get-MachinePathEntry) -contains $binRoot)
@@ -171,7 +202,7 @@ try {
         $cleanupError = $_
         Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'cleanup-failure-state.json') -Values @{
             phase = 'cleanup-failure'
-            service_status = ([string](Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status)
+            service_status = Get-ServiceStatusForDiagnostic -Name $serviceName
             install_root_exists = [bool](Test-Path -LiteralPath $installRoot)
             data_root_exists = [bool](Test-Path -LiteralPath $dataRoot)
             machine_path_contains_bin = [bool]((Get-MachinePathEntry) -contains $binRoot)
@@ -193,7 +224,7 @@ try {
     if ($null -eq $primaryError) { $primaryError = $_ }
     Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'post-uninstall-failure-state.json') -Values @{
         phase = 'post-uninstall-failure'
-        service_status = ([string](Get-Service -Name $serviceName -ErrorAction SilentlyContinue).Status)
+        service_status = Get-ServiceStatusForDiagnostic -Name $serviceName
         install_root_exists = [bool](Test-Path -LiteralPath $installRoot)
         data_root_exists = [bool](Test-Path -LiteralPath $dataRoot)
         machine_path_contains_bin = [bool]((Get-MachinePathEntry) -contains $binRoot)

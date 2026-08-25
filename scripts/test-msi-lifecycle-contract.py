@@ -69,6 +69,23 @@ def test_lifecycle_cli_failure_diagnostics_are_bounded() -> None:
     assert "Get-Content -Raw -LiteralPath $stderrPath" not in SCRIPT
 
 
+def test_failure_diagnostics_preserve_the_original_error_when_service_is_missing() -> None:
+    assert "function Get-ServiceStatusForDiagnostic" in SCRIPT
+    assert "Get-ServiceStatusForDiagnostic -Name $serviceName" in SCRIPT
+    assert ".Status).Status" not in SCRIPT
+
+
+def test_failure_diagnostics_cover_every_cleanup_boundary() -> None:
+    assert SCRIPT.count("Get-ServiceStatusForDiagnostic -Name $serviceName") == 3
+
+
+def test_service_logs_are_captured_before_failure_cleanup() -> None:
+    assert "function Save-ServiceLogDiagnostic" in SCRIPT
+    failure_capture = SCRIPT.index("Save-ServiceLogDiagnostic -DataRoot $dataRoot")
+    cleanup_start = SCRIPT.index("} finally {")
+    assert failure_capture < cleanup_start
+
+
 def test_elevated_source_artifact_producer_matches_packaged_consumer() -> None:
     workflow = (ROOT.parent / ".github" / "workflows" / "elevated-windows.yml").read_text(encoding="utf-8")
     build = workflow[workflow.index("- name: Build source MSI") : workflow.index("- name: Validate MSI lifecycle")]
@@ -111,6 +128,9 @@ def main() -> None:
     test_lifecycle_verifies_running_service_process_owner()
     test_lifecycle_attempts_post_uninstall_cleanup_after_uninstall_failure()
     test_lifecycle_cli_failure_diagnostics_are_bounded()
+    test_failure_diagnostics_preserve_the_original_error_when_service_is_missing()
+    test_failure_diagnostics_cover_every_cleanup_boundary()
+    test_service_logs_are_captured_before_failure_cleanup()
     test_elevated_source_artifact_producer_matches_packaged_consumer()
     test_ci_uses_reusable_elevated_result_or_successful_skip()
     test_elevated_source_artifact_contains_complete_msi_stage()
