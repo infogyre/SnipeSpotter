@@ -117,6 +117,8 @@ def test_service_log_capture_is_bounded_best_effort_and_privacy_safe() -> None:
     assert "-Filter 'spotter-svc.log*'" in helper
     assert "-File" in helper
     assert "[IO.File]::OpenRead" in helper
+    assert "$log.Length" in helper
+    assert "$source.Length" not in helper
     assert ".Read(" in helper
     assert "Set-Content" not in helper
     assert "Get-Content" not in helper
