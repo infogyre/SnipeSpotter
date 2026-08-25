@@ -124,7 +124,7 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
+          $ErrorActionPreference = 'Continue'
           $diagnosticRoot = Join-Path $env:RUNNER_TEMP 'snipespotter-msi-logs'
           New-Item -ItemType Directory -Force -Path $diagnosticRoot | Out-Null
           $service = Get-Service -Name 'SnipeSpotter' -ErrorAction SilentlyContinue
@@ -138,6 +138,22 @@ jobs:
             Select-Object -First 20 TimeCreated, ProviderName, Id, LevelDisplayName |
             ConvertTo-Json -Depth 2 |
             Set-Content -LiteralPath (Join-Path $diagnosticRoot 'application-events.json')
+          # Capture the service's own tracing log files for root-cause analysis.
+          $logDir = Join-Path $env:ProgramData 'infogyre\SnipeSpotter\logs'
+          if (Test-Path -LiteralPath $logDir) {
+            Get-ChildItem -LiteralPath $logDir -Filter '*.log' -File -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue
+                if ($content) {
+                  $dest = Join-Path $diagnosticRoot $_.Name
+                  # Cap at 32 KB to avoid uploading unbounded logs.
+                  if ($content.Length -gt 32768) {
+                    $content = $content.Substring(0, 32768) + '...[truncated]'
+                  }
+                  Set-Content -LiteralPath $dest -Value $content
+                }
+              }
+          }
       - name: Publish lifecycle result
         id: result
         if: always()
