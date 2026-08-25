@@ -453,28 +453,49 @@ fn service_main(_arguments: Vec<OsString>) {
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "service startup with diagnostic tracing for elevated lane debugging"
+)]
 fn run_service() -> Result<()> {
+    tracing::info!("SnipeSpotter service starting");
     let _instance = spotter_win32::mutex::try_acquire_global_mutex()
         .context("another SnipeSpotter service instance is already running")?;
+    tracing::info!("acquired global mutex");
     let root = data_dir();
+    tracing::info!(root = %root.display(), "using data directory");
     let settings_path = root.join("settings.toml");
-    let settings = crate::config_io::load_settings(&settings_path)?;
-    let state_key = crate::state_io::load_or_create_key(&root.join("state-hmac-key.bin"))?;
-    let persisted_state = crate::state_io::load_state(&root.join("state.toml"), &state_key)?;
-    let _log_guard = crate::logging::initialize(&root.join("logs"), &settings.logging)?;
+    let settings = crate::config_io::load_settings(&settings_path).inspect_err(
+        |e| tracing::error!(%e, path = %settings_path.display(), "failed to load settings"),
+    )?;
+    tracing::info!(url = %settings.snipeit.url, "settings loaded");
+    let state_key = crate::state_io::load_or_create_key(&root.join("state-hmac-key.bin"))
+        .inspect_err(|e| tracing::error!(%e, "failed to load state key"))?;
+    tracing::info!("state key loaded");
+    let persisted_state = crate::state_io::load_state(&root.join("state.toml"), &state_key)
+        .inspect_err(|e| tracing::error!(%e, "failed to load state"))?;
+    tracing::info!("persisted state loaded");
+    let _log_guard = crate::logging::initialize(&root.join("logs"), &settings.logging)
+        .inspect_err(|e| tracing::error!(%e, "failed to initialize logging"))?;
+    tracing::info!("logging initialized");
     let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
-    let status_handle = register_controls(shutdown_sender)?;
+    let status_handle = register_controls(shutdown_sender)
+        .inspect_err(|e| tracing::error!(%e, "failed to register controls"))?;
+    tracing::info!("controls registered");
     set_status(
         &status_handle,
         ServiceState::StartPending,
         1,
         Duration::from_secs(10),
-    )?;
+    )
+    .inspect_err(|e| tracing::error!(%e, "failed to set StartPending"))?;
+    tracing::info!("StartPending reported");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create service runtime")?;
+    tracing::info!("runtime created");
     let configured = config_status(&settings).is_empty();
     let state_path = root.join("state.toml");
     let journal_path = root.join("operations.jsonl");
@@ -526,9 +547,13 @@ fn run_service() -> Result<()> {
     let fsm = crate::fsm::spawn(32, move |command| {
         let owner = std::sync::Arc::clone(&owner);
         async move { owner.lock().await.handle(command).await }
-    })?;
+    })
+    .inspect_err(|e| tracing::error!(%e, "failed to spawn FSM"))?;
+    tracing::info!("FSM spawned");
 
-    set_status(&status_handle, ServiceState::Running, 0, Duration::ZERO)?;
+    set_status(&status_handle, ServiceState::Running, 0, Duration::ZERO)
+        .inspect_err(|e| tracing::error!(%e, "failed to set Running"))?;
+    tracing::info!("Running reported; entering main loop");
     runtime.block_on(async move {
         let timer_fsm = fsm.clone();
         let timer = tokio::spawn(run_polling_timer(timer_fsm, polling_receiver));
