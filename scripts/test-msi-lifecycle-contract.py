@@ -36,6 +36,12 @@ def test_lifecycle_requires_sustained_running_service() -> None:
     assert "Wait-ForCondition" not in SCRIPT
 
 
+def test_lifecycle_imports_wait_helpers_after_scm_module() -> None:
+    scm_import = SCRIPT.index("Import-Module (Join-Path $testSupportRoot 'Scm.psm1')")
+    wait_import = SCRIPT.index("Import-Module (Join-Path $testSupportRoot 'Wait.psm1')")
+    assert wait_import > scm_import
+
+
 def test_stability_wait_resets_after_a_non_running_sample() -> None:
     body = _function_body(WAIT, "Wait-ConditionStable")
     assert "Stopwatch]::GetTimestamp()" in body
@@ -217,6 +223,7 @@ def test_elevated_source_artifact_contains_complete_msi_stage() -> None:
 
 def main() -> None:
     test_lifecycle_requires_sustained_running_service()
+    test_lifecycle_imports_wait_helpers_after_scm_module()
     test_lifecycle_checks_named_pipe_and_unconfigured_cli_status()
     test_lifecycle_uses_shared_support_modules()
     test_lifecycle_verifies_running_service_process_owner()

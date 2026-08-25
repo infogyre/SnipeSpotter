@@ -18,8 +18,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $testSupportRoot = Join-Path $PSScriptRoot 'TestSupport'
-Import-Module (Join-Path $testSupportRoot 'Wait.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Scm.psm1') -Force
+Import-Module (Join-Path $testSupportRoot 'Wait.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Diagnostics.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Cleanup.psm1') -Force
 
