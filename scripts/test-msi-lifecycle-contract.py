@@ -2,6 +2,9 @@
 
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import tempfile
 
 
 ROOT = Path(__file__).parent
@@ -17,6 +20,12 @@ def _function_body(source: str, name: str) -> str:
     )
     assert match, f"missing PowerShell function: {name}"
     return match.group("body")
+
+
+def _function_text(source: str, name: str, next_name: str) -> str:
+    start = source.index(f"function {name}")
+    end = source.index(f"function {next_name}", start)
+    return source[start:end]
 
 
 def test_lifecycle_requires_sustained_running_service() -> None:
@@ -82,8 +91,93 @@ def test_failure_diagnostics_cover_every_cleanup_boundary() -> None:
 def test_service_logs_are_captured_before_failure_cleanup() -> None:
     assert "function Save-ServiceLogDiagnostic" in SCRIPT
     failure_capture = SCRIPT.index("Save-ServiceLogDiagnostic -DataRoot $dataRoot")
-    cleanup_start = SCRIPT.index("} finally {")
+    cleanup_start = SCRIPT.index("} finally {", failure_capture)
     assert failure_capture < cleanup_start
+
+
+def test_service_log_capture_is_bounded_best_effort_and_privacy_safe() -> None:
+    helper = _function_text(SCRIPT, "Save-ServiceLogDiagnostic", "Get-MachinePathEntry")
+    assert "$MaxServiceLogBytes = 32768" in SCRIPT
+    assert "$MaxServiceLogFiles = 4" in SCRIPT
+    assert "$MaxServiceLogTotalBytes = 65536" in SCRIPT
+    assert "-Filter 'spotter-svc.log*'" in helper
+    assert "-File" in helper
+    assert "[IO.File]::OpenRead" in helper
+    assert ".Read(" in helper
+    assert "Set-Content" not in helper
+    assert "Get-Content" not in helper
+    assert "Get-ChildItem" in helper
+    assert "Select-Object -First $MaxServiceLogFiles" in helper
+    assert "if ($totalBytes -ge $MaxServiceLogTotalBytes)" in helper
+    assert "if ($bytesToRead -le 0)" in helper
+    assert "...[truncated]" in SCRIPT
+    assert "$ServiceLogTruncationMarker" in helper
+    assert "try {" in helper
+    assert "catch {" in helper
+    assert "$_ .Name" not in helper
+    assert "$logName = $log.Name" in helper
+    assert "Write-Warning" in helper
+    assert "return" in helper
+
+
+def test_service_log_capture_preserves_primary_error_on_setup_failure() -> None:
+    helper = _function_text(SCRIPT, "Save-ServiceLogDiagnostic", "Get-MachinePathEntry")
+    invocation = "Save-ServiceLogDiagnostic -DataRoot $dataRoot -Destination $LogDirectory"
+    assert invocation in SCRIPT
+    assert "try {\n        Save-ServiceLogDiagnostic" in SCRIPT
+    assert "Write-Warning \"service log capture failed:" in SCRIPT
+    assert helper.count("try {") >= 2
+    assert helper.count("catch {") >= 2
+    assert "$primaryError = $_" in SCRIPT
+    assert SCRIPT.index("$primaryError = $_") < SCRIPT.index(invocation)
+
+
+def test_service_log_capture_behavior_with_temporary_files() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for the service log capture behavior probe"
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        root = Path(temporary_directory)
+        data_root = root / "data"
+        log_root = data_root / "logs"
+        destination = root / "destination"
+        log_root.mkdir(parents=True)
+        (log_root / "spotter-svc.log.2026-06-01").write_bytes(b"A" * 40_000)
+        (log_root / "spotter-svc.log").write_bytes(b"B" * 20_000)
+        for day in range(2, 7):
+            (log_root / f"spotter-svc.log.2026-06-{day:02d}").write_bytes(b"D" * 20_000)
+        (log_root / "other.log").write_bytes(b"C" * 10)
+        blocked_destination = root / "blocked-destination"
+        blocked_destination.write_bytes(b"destination is not a directory")
+        probe = """
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+""" + SCRIPT[SCRIPT.index("$MaxServiceLogBytes ="):SCRIPT.index("function Get-ServiceStatusForDiagnostic")] + _function_text(SCRIPT, "Save-ServiceLogDiagnostic", "Get-MachinePathEntry") + f"""
+Save-ServiceLogDiagnostic -DataRoot '{data_root.as_posix()}' -Destination '{destination.as_posix()}'
+$primary = 'sentinel primary error'
+try {{
+    Save-ServiceLogDiagnostic -DataRoot '{data_root.as_posix()}' -Destination '{blocked_destination.as_posix()}'
+}} catch {{
+    throw "capture replaced primary error: $($_.Exception.Message)"
+}}
+if (-not (Test-Path -LiteralPath '{(destination / 'spotter-svc.log.2026-06-01').as_posix()}' -PathType Leaf)) {{ throw 'daily service log was not captured' }}
+if (Test-Path -LiteralPath '{(destination / 'other.log').as_posix()}') {{ throw 'unrelated log was captured' }}
+$capturedFiles = @(Get-ChildItem -LiteralPath '{destination.as_posix()}' -File)
+if ($capturedFiles.Count -gt 4) {{ throw "file count bound exceeded: $($capturedFiles.Count)" }}
+$totalCapturedBytes = ($capturedFiles | Measure-Object -Property Length -Sum).Sum
+if ($totalCapturedBytes -gt 65536) {{ throw "aggregate byte bound exceeded: $totalCapturedBytes" }}
+$captured = [IO.File]::ReadAllBytes('{(destination / 'spotter-svc.log.2026-06-01').as_posix()}')
+if ($captured.Length -gt 32768) {{ throw "per-file bound exceeded: $($captured.Length)" }}
+if ($captured.Length -eq 32768 -and -not ([Text.Encoding]::UTF8.GetString($captured)).EndsWith('...[truncated]')) {{ throw 'bounded file lacks truncation marker' }}
+Write-Output $primary
+"""
+        result = subprocess.run(
+            [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert "sentinel primary error" in result.stdout
 
 
 def test_elevated_source_artifact_producer_matches_packaged_consumer() -> None:
@@ -131,6 +225,9 @@ def main() -> None:
     test_failure_diagnostics_preserve_the_original_error_when_service_is_missing()
     test_failure_diagnostics_cover_every_cleanup_boundary()
     test_service_logs_are_captured_before_failure_cleanup()
+    test_service_log_capture_is_bounded_best_effort_and_privacy_safe()
+    test_service_log_capture_preserves_primary_error_on_setup_failure()
+    test_service_log_capture_behavior_with_temporary_files()
     test_elevated_source_artifact_producer_matches_packaged_consumer()
     test_ci_uses_reusable_elevated_result_or_successful_skip()
     test_elevated_source_artifact_contains_complete_msi_stage()

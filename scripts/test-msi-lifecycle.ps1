@@ -28,6 +28,11 @@ function Assert-True {
     if (-not $Condition) { throw $Message }
 }
 
+$MaxServiceLogBytes = 32768
+$MaxServiceLogFiles = 4
+$MaxServiceLogTotalBytes = 65536
+$ServiceLogTruncationMarker = '...[truncated]'
+
 function Get-ServiceStatusForDiagnostic {
     param([Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Name)
     $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
@@ -41,21 +46,59 @@ function Save-ServiceLogDiagnostic {
         [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Destination
     )
 
-    $logDirectory = Join-Path $DataRoot 'logs'
-    if (-not (Test-Path -LiteralPath $logDirectory -PathType Container)) { return }
-    New-Item -ItemType Directory -Force -Path $Destination | Out-Null
-    Get-ChildItem -LiteralPath $logDirectory -Filter '*.log' -File -ErrorAction SilentlyContinue |
-        ForEach-Object {
-            try {
-                $content = Get-Content -LiteralPath $_.FullName -Raw -ErrorAction Stop
-                if ($content.Length -gt 32768) {
-                    $content = $content.Substring(0, 32768) + '...[truncated]'
+    try {
+        $logDirectory = Join-Path $DataRoot 'logs'
+        if (-not (Test-Path -LiteralPath $logDirectory -PathType Container)) { return }
+        New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+        $totalBytes = 0
+        Get-ChildItem -LiteralPath $logDirectory -Filter 'spotter-svc.log*' -File -ErrorAction Stop |
+            Sort-Object Name |
+            Select-Object -First $MaxServiceLogFiles |
+            ForEach-Object {
+                $log = $_
+                $logName = $log.Name
+                try {
+                    if ($totalBytes -ge $MaxServiceLogTotalBytes) { return }
+                    $remainingBytes = $MaxServiceLogTotalBytes - $totalBytes
+                    $bytesToRead = [Math]::Min($MaxServiceLogBytes, $remainingBytes)
+                    $source = [IO.File]::OpenRead($log.FullName)
+                    try {
+                        $wasTruncated = $source.Length -gt $bytesToRead
+                        if ($wasTruncated) {
+                            $markerBytes = [Text.Encoding]::UTF8.GetBytes($ServiceLogTruncationMarker)
+                            $bytesToRead = [Math]::Max(0, $bytesToRead - $markerBytes.Length)
+                        } else {
+                            $markerBytes = [byte[]]@()
+                        }
+                        if ($bytesToRead -le 0) { return }
+                        $buffer = New-Object byte[] $bytesToRead
+                        $bytesRead = $source.Read($buffer, 0, $buffer.Length)
+                        $contentBytes = if ($wasTruncated) {
+                            $output = New-Object byte[] ($bytesRead + $markerBytes.Length)
+                            [Array]::Copy($buffer, 0, $output, 0, $bytesRead)
+                            [Array]::Copy($markerBytes, 0, $output, $bytesRead, $markerBytes.Length)
+                            $output
+                        } else {
+                            if ($bytesRead -eq $buffer.Length) {
+                                $buffer
+                            } else {
+                                $trimmed = New-Object byte[] $bytesRead
+                                [Array]::Copy($buffer, 0, $trimmed, 0, $bytesRead)
+                                $trimmed
+                            }
+                        }
+                        [IO.File]::WriteAllBytes((Join-Path $Destination $logName), $contentBytes)
+                        $totalBytes += $contentBytes.Length
+                    } finally {
+                        $source.Dispose()
+                    }
+                } catch {
+                    Write-Warning "could not capture service log ${logName}: $($_.Exception.Message)"
                 }
-                Set-Content -LiteralPath (Join-Path $Destination $_.Name) -Value $content
-            } catch {
-                Write-Warning "could not capture service log $($_.Name): $($_.Exception.Message)"
             }
-        }
+    } catch {
+        Write-Warning "service log capture failed: $($_.Exception.Message)"
+    }
 }
 
 function Get-MachinePathEntry {
@@ -180,7 +223,11 @@ try {
     }
 } catch {
     $primaryError = $_
-    Save-ServiceLogDiagnostic -DataRoot $dataRoot -Destination $LogDirectory
+    try {
+        Save-ServiceLogDiagnostic -DataRoot $dataRoot -Destination $LogDirectory
+    } catch {
+        Write-Warning "service log capture failed: $($_.Exception.Message)"
+    }
     Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'failure-state.json') -Values @{
         phase = 'failure'
         service_status = Get-ServiceStatusForDiagnostic -Name $serviceName
