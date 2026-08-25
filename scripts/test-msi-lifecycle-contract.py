@@ -10,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).parent
 SCRIPT = (ROOT / "test-msi-lifecycle.ps1").read_text(encoding="utf-8")
 WAIT = (ROOT / "TestSupport" / "Wait.psm1").read_text(encoding="utf-8")
+SERVICE = (ROOT.parent / "spotter-svc" / "src" / "service.rs").read_text(encoding="utf-8")
 
 
 def _function_body(source: str, name: str) -> str:
@@ -40,6 +41,13 @@ def test_lifecycle_imports_wait_helpers_after_scm_module() -> None:
     scm_import = SCRIPT.index("Import-Module (Join-Path $testSupportRoot 'Scm.psm1')")
     wait_import = SCRIPT.index("Import-Module (Join-Path $testSupportRoot 'Wait.psm1')")
     assert wait_import > scm_import
+
+
+def test_service_enters_runtime_before_fsm_spawn() -> None:
+    runtime_creation = SERVICE.index("let runtime = tokio::runtime::Builder")
+    runtime_enter = SERVICE.index("let _runtime_guard = runtime.enter()")
+    fsm_spawn = SERVICE.index("let fsm = crate::fsm::spawn")
+    assert runtime_creation < runtime_enter < fsm_spawn
 
 
 def test_stability_wait_resets_after_a_non_running_sample() -> None:
@@ -224,6 +232,7 @@ def test_elevated_source_artifact_contains_complete_msi_stage() -> None:
 def main() -> None:
     test_lifecycle_requires_sustained_running_service()
     test_lifecycle_imports_wait_helpers_after_scm_module()
+    test_service_enters_runtime_before_fsm_spawn()
     test_lifecycle_checks_named_pipe_and_unconfigured_cli_status()
     test_lifecycle_uses_shared_support_modules()
     test_lifecycle_verifies_running_service_process_owner()

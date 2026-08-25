@@ -496,6 +496,8 @@ fn run_service() -> Result<()> {
         .build()
         .context("failed to create service runtime")?;
     tracing::info!("runtime created");
+    let _runtime_guard = runtime.enter();
+    tracing::info!("runtime entered");
     let configured = config_status(&settings).is_empty();
     let state_path = root.join("state.toml");
     let journal_path = root.join("operations.jsonl");
