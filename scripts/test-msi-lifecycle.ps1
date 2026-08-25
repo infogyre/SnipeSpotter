@@ -63,7 +63,8 @@ function Save-ServiceLogDiagnostic {
                     $bytesToRead = [Math]::Min($MaxServiceLogBytes, $remainingBytes)
                     $source = [IO.File]::OpenRead($log.FullName)
                     try {
-                        $wasTruncated = $log.Length -gt $bytesToRead
+                        $logSize = [int64](Get-Item -LiteralPath $log.FullName -Force -ErrorAction Stop).Length
+                        $wasTruncated = $logSize -gt $bytesToRead
                         if ($wasTruncated) {
                             $markerBytes = [Text.Encoding]::UTF8.GetBytes($ServiceLogTruncationMarker)
                             $bytesToRead = [Math]::Max(0, $bytesToRead - $markerBytes.Length)
