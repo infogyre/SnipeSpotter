@@ -163,7 +163,7 @@ function Assert-InstalledCliContract {
         [Parameter(Mandatory = $true)][psobject]$Result,
         [Parameter(Mandatory = $true)][int]$ExpectedExitCode,
         [Parameter(Mandatory = $true)][string]$ExpectedStdout,
-        [Parameter(Mandatory = $true)][string]$ExpectedStderr
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$ExpectedStderr
     )
 
     Assert-True ($Result.ExitCode -eq $ExpectedExitCode) "installed CLI $($Result.Description) returned an unexpected exit code"

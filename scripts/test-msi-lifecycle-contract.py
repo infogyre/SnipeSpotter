@@ -1,12 +1,11 @@
 """Static contract checks for the elevated MSI lifecycle harness."""
 
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
-
+from pathlib import Path
 
 ROOT = Path(__file__).parent
 SCRIPT = (ROOT / "test-msi-lifecycle.ps1").read_text(encoding="utf-8")
@@ -598,6 +597,76 @@ def test_direct_scm_standard_user_name_fits_security_helper_contract() -> None:
     assert len(match.group(1)) + 5 <= 20
 
 
+def test_installed_cli_contract_accepts_empty_stderr_without_relaxing_other_parameters() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for the installed CLI stream contract probe"
+    assert_true_body = _function_body(SCRIPT, "Assert-True")
+    cli_contract_body = _function_body(SCRIPT, "Assert-InstalledCliContract")
+    probe = """
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+function Assert-True {
+""" + assert_true_body + """
+}
+function Assert-InstalledCliContract {
+""" + cli_contract_body + """
+}
+$result = [pscustomobject]@{
+    ExitCode = 0
+    Stdout = 'expected stdout'
+    Stderr = ''
+    Description = 'stream contract probe'
+}
+Assert-InstalledCliContract -Result $result -ExpectedExitCode 0 -ExpectedStdout 'expected stdout' -ExpectedStderr ''
+
+$assertionFailures = 0
+try {
+    Assert-InstalledCliContract -Result $result -ExpectedExitCode 1 -ExpectedStdout 'expected stdout' -ExpectedStderr ''
+} catch {
+    $assertionFailures++
+}
+try {
+    Assert-InstalledCliContract -Result $result -ExpectedExitCode 0 -ExpectedStdout 'wrong stdout' -ExpectedStderr ''
+} catch {
+    $assertionFailures++
+}
+try {
+    Assert-InstalledCliContract -Result $result -ExpectedExitCode 0 -ExpectedStdout 'expected stdout' -ExpectedStderr 'unexpected stderr'
+} catch {
+    $assertionFailures++
+}
+if ($assertionFailures -ne 3) { throw "stream assertions accepted $assertionFailures invalid result(s)" }
+
+$bindingFailures = 0
+try {
+    Assert-InstalledCliContract -ExpectedExitCode 0 -ExpectedStdout 'expected stdout' -ExpectedStderr ''
+} catch {
+    $bindingFailures++
+}
+try {
+    Assert-InstalledCliContract -Result $result -ExpectedExitCode 0 -ExpectedStdout 'expected stdout'
+} catch {
+    $bindingFailures++
+}
+try {
+    Assert-InstalledCliContract -Result $result -ExpectedExitCode 0 -ExpectedStdout '' -ExpectedStderr ''
+} catch {
+    $bindingFailures++
+}
+if ($bindingFailures -ne 3) { throw "required stream parameters rejected $bindingFailures invalid call(s)" }
+Write-Output 'installed CLI stream contract accepted'
+"""
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ,
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "installed CLI stream contract accepted" in result.stdout
+
+
 def test_msi_acl_replacement_uses_installed_atomic_config_writer_and_exact_cli_contract() -> None:
     assert "Add-Content -LiteralPath $settingsPath -Value \"`n$replacementMarker\"" not in SCRIPT
     update = "Invoke-InstalledCli -Arguments @('config', 'set', 'polling.interval_hours', $replacementInterval)"
@@ -650,6 +719,7 @@ def main() -> None:
     test_direct_scm_process_timeout_covers_two_registrar_waits()
     test_direct_scm_probes_standard_user_after_runtime_artifacts_and_cleans_up()
     test_direct_scm_standard_user_name_fits_security_helper_contract()
+    test_installed_cli_contract_accepts_empty_stderr_without_relaxing_other_parameters()
     test_msi_acl_replacement_uses_installed_atomic_config_writer_and_exact_cli_contract()
     print("lifecycle contract: OK")
 

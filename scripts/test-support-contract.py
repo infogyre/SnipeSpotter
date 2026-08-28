@@ -1,12 +1,11 @@
 """Static contract checks for Windows lifecycle test-support modules."""
 
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import xml.etree.ElementTree as ET
-
+from pathlib import Path
 
 ROOT = Path(__file__).parent / "TestSupport"
 LIFECYCLE = ROOT.parent / "test-msi-lifecycle.ps1"
