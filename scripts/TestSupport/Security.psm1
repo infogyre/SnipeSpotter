@@ -109,6 +109,73 @@ function Assert-ChildIsStandardUser {
     return $Result
 }
 
+function Get-CredentialLaunchDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('configuration', 'native_start')][string]$LaunchStage,
+        [Parameter(Mandatory = $true)][ValidateSet('configuration', 'native')][string]$FailureKind,
+        [Parameter(Mandatory = $true)][ValidateSet('file_name', 'use_shell_execute', 'redirect_standard_output', 'redirect_standard_error', 'username', 'domain', 'password', 'argument_list', 'process_start_info', 'process_start', 'unknown')][string]$FailedField,
+        [Parameter(Mandatory = $true)][Diagnostics.ProcessStartInfo]$StartInfo,
+        [Parameter(Mandatory = $true)][ValidateRange(0, 4096)][int]$ArgumentCount,
+        [Parameter(Mandatory = $true)][object]$ErrorRecord
+    )
+
+    $nativeErrorCode = 0
+    $hresult = 0
+    $exception = if ($ErrorRecord -is [Management.Automation.ErrorRecord]) {
+        $ErrorRecord.Exception
+    } else {
+        $ErrorRecord
+    }
+    if ($null -ne $exception) {
+        $hresult = [int]$exception.HResult
+        while ($null -ne $exception) {
+            if ($exception -is [ComponentModel.Win32Exception]) {
+                $nativeErrorCode = [int]$exception.NativeErrorCode
+                break
+            }
+            $exception = $exception.InnerException
+        }
+    }
+
+    $redirects = if ($StartInfo.RedirectStandardOutput -and $StartInfo.RedirectStandardError) {
+        'stdout_stderr'
+    } elseif ($StartInfo.RedirectStandardOutput) {
+        'stdout'
+    } elseif ($StartInfo.RedirectStandardError) {
+        'stderr'
+    } else {
+        'none'
+    }
+    $executableClass = if ([IO.Path]::GetExtension($StartInfo.FileName) -ieq '.exe') {
+        'windows_executable'
+    } elseif ([IO.Path]::GetExtension($StartInfo.FileName) -ieq '.ps1') {
+        'powershell_script'
+    } else {
+        'other'
+    }
+    $diagnostic = [ordered]@{
+        launch_stage = $LaunchStage
+        failure_kind = $FailureKind
+        failed_field = $FailedField
+        has_username = -not [string]::IsNullOrEmpty($StartInfo.UserName)
+        has_domain = -not [string]::IsNullOrEmpty($StartInfo.Domain)
+        has_secure_password = $null -ne $StartInfo.Password
+        use_shell_execute = [bool]$StartInfo.UseShellExecute
+        redirects = $redirects
+        has_working_directory = -not [string]::IsNullOrEmpty($StartInfo.WorkingDirectory)
+        load_user_profile = [bool]$StartInfo.LoadUserProfile
+        argument_count = $ArgumentCount
+        executable_class = $executableClass
+        native_error_code = $nativeErrorCode
+        hresult = $hresult
+    }
+    $json = $diagnostic | ConvertTo-Json -Compress -Depth 3
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    if ($bytes.Length -gt 8192) { throw 'credential launch diagnostics exceeded the bounded size' }
+    return $json
+}
+
 function Invoke-AsStandardUser {
     [CmdletBinding()]
     param(
@@ -124,25 +191,53 @@ function Invoke-AsStandardUser {
     }
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
-    $startInfo.FileName = $FilePath
-    $startInfo.UseShellExecute = $false
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.UserName = [string]$User.Name
-    $startInfo.Domain = [string]$User.Domain
-    $startInfo.Password = $User.Password
-    foreach ($argument in $ArgumentList) {
-        [void]$startInfo.ArgumentList.Add($argument)
+    $failedField = 'unknown'
+    $argumentCount = 0
+    try {
+        $failedField = 'file_name'
+        $startInfo.FileName = $FilePath
+        $failedField = 'use_shell_execute'
+        $startInfo.UseShellExecute = $false
+        $failedField = 'redirect_standard_output'
+        $startInfo.RedirectStandardOutput = $true
+        $failedField = 'redirect_standard_error'
+        $startInfo.RedirectStandardError = $true
+        $failedField = 'username'
+        $startInfo.UserName = [string]$User.Name
+        $failedField = 'domain'
+        $startInfo.Domain = [string]$User.Domain
+        $failedField = 'password'
+        $startInfo.Password = $User.Password
+        foreach ($argument in $ArgumentList) {
+            $failedField = 'argument_list'
+            [void]$startInfo.ArgumentList.Add($argument)
+            $argumentCount++
+        }
+    } catch {
+        $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'configuration' -FailureKind 'configuration' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $_
+        throw "credentialed launch failed: $diagnostic"
     }
 
     $process = [Diagnostics.Process]::new()
     try {
-        $process.StartInfo = $startInfo
-        if (-not $process.Start()) { throw 'failed to start standard-user process' }
+        try {
+            $failedField = 'process_start_info'
+            $process.StartInfo = $startInfo
+        } catch {
+            $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'configuration' -FailureKind 'configuration' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $_
+            throw "credentialed launch failed: $diagnostic"
+        }
+        try {
+            $failedField = 'process_start'
+            if (-not $process.Start()) { throw 'process start returned false' }
+        } catch {
+            $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $_
+            throw "credentialed launch failed: $diagnostic"
+        }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            try { $process.Kill($true) } catch { Write-Warning "could not terminate standard-user process: $($_.Exception.Message)" }
+            try { $process.Kill($true) } catch { Write-Warning 'could not terminate standard-user process after timeout' }
             throw "standard-user process did not exit within $TimeoutSeconds seconds"
         }
         $exitCode = $process.ExitCode

@@ -31,6 +31,35 @@ _ACL_DIAGNOSTIC_FORBIDDEN_FIELDS = (
     "secret",
     "token",
 )
+_CREDENTIAL_LAUNCH_DIAGNOSTIC_FIELDS = (
+    "launch_stage",
+    "failure_kind",
+    "failed_field",
+    "has_username",
+    "has_domain",
+    "has_secure_password",
+    "use_shell_execute",
+    "redirects",
+    "has_working_directory",
+    "load_user_profile",
+    "argument_count",
+    "executable_class",
+    "native_error_code",
+    "hresult",
+)
+_CREDENTIAL_LAUNCH_DIAGNOSTIC_FORBIDDEN_FIELDS = (
+    "username",
+    "domain",
+    "password",
+    "arguments",
+    "path",
+    "file_path",
+    "environment",
+    "token",
+    "exception",
+    "exception_class",
+    "message",
+)
 
 
 def read_module(name: str) -> str:
@@ -39,8 +68,8 @@ def read_module(name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _acl_diagnostic_projection(source: str) -> tuple[tuple[str, ...], dict[str, str]]:
-    start = source.index("function Get-AclDiagnostic")
+def _ordered_projection(source: str, function_name: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    start = source.index(f"function {function_name}")
     projection_start = source.index("[ordered]@{", start) + len("[ordered]@{")
     depth = 1
     end = projection_start
@@ -55,11 +84,172 @@ def _acl_diagnostic_projection(source: str) -> tuple[tuple[str, ...], dict[str, 
         r"(?m)^\s*(?P<key>[A-Za-z_]\w*)\s*=\s*(?P<value>[^\r\n]+?)\s*$",
         projection,
     )
-    assert assignments, "ACL diagnostic projection must contain ordered assignments"
+    assert assignments, f"{function_name} projection must contain ordered assignments"
     keys = tuple(key for key, _ in assignments)
     values = dict(assignments)
-    assert len(keys) == len(values), "ACL diagnostic projection contains duplicate keys"
+    assert len(keys) == len(values), f"{function_name} projection contains duplicate keys"
     return keys, values
+
+
+def _acl_diagnostic_projection(source: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    return _ordered_projection(source, "Get-AclDiagnostic")
+
+
+def _credential_launch_diagnostic_projection(
+    source: str,
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    return _ordered_projection(source, "Get-CredentialLaunchDiagnostic")
+
+
+_CREDENTIAL_LAUNCH_TUPLE_RE = re.compile(
+    r"Get-CredentialLaunchDiagnostic\s+"
+    r"-LaunchStage\s+'(?P<launch_stage>[^']+)'\s+"
+    r"-FailureKind\s+'(?P<failure_kind>[^']+)'\s+"
+    r"-FailedField\s+(?P<failed_field>\$[A-Za-z_]\w*)"
+)
+_CREDENTIAL_LAUNCH_FAILURES = (
+    (
+        "$startInfo.FileName = $FilePath",
+        "file_name",
+        ("configuration", "configuration", "file_name"),
+    ),
+    (
+        "$process.StartInfo = $startInfo",
+        "process_start_info",
+        ("configuration", "configuration", "process_start_info"),
+    ),
+    (
+        "$process.Start()",
+        "process_start",
+        ("native_start", "native", "process_start"),
+    ),
+)
+
+
+def _powershell_braced_block_end(source: str, opening_brace: int) -> int:
+    depth = 0
+    quote: str | None = None
+    index = opening_brace
+    while index < len(source):
+        character = source[index]
+        if quote == "'":
+            if character == "'":
+                if index + 1 < len(source) and source[index + 1] == "'":
+                    index += 2
+                    continue
+                quote = None
+        elif quote == '"':
+            if character == "`":
+                index += 2
+                continue
+            if character == '"':
+                if index + 1 < len(source) and source[index + 1] == '"':
+                    index += 2
+                    continue
+                quote = None
+        elif character in ("'", '"'):
+            quote = character
+        elif character == "#":
+            newline = source.find("\n", index)
+            index = len(source) if newline == -1 else newline
+            continue
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    raise AssertionError("unclosed PowerShell brace")
+
+
+def _powershell_catch_blocks(source: str) -> tuple[str, ...]:
+    blocks = []
+    for match in re.finditer(r"\bcatch\s*\{", source):
+        end = _powershell_braced_block_end(source, match.end() - 1)
+        blocks.append(source[match.start() : end])
+    return tuple(blocks)
+
+
+def _powershell_try_catch_spans(source: str) -> tuple[tuple[int, int, int, int], ...]:
+    spans = []
+    for match in re.finditer(r"\btry\s*\{", source):
+        try_end = _powershell_braced_block_end(source, match.end() - 1)
+        catch_match = re.match(r"\s*(catch)\s*\{", source[try_end:])
+        if catch_match is None:
+            continue
+        catch_start = try_end + catch_match.start(1)
+        catch_end = _powershell_braced_block_end(
+            source, try_end + catch_match.end() - 1
+        )
+        spans.append((match.start(), try_end, catch_start, catch_end))
+    return tuple(spans)
+
+
+def _credential_launch_catch_spans(source: str) -> tuple[tuple[int, int], ...]:
+    invoke_start = source.index("function Invoke-AsStandardUser")
+    invoke_end = source.index("function Assert-StandardUserCannotReadWrite")
+    invoke = source[invoke_start:invoke_end]
+    pairs = _powershell_try_catch_spans(invoke)
+    spans = []
+    for marker, failed_field, _ in _CREDENTIAL_LAUNCH_FAILURES:
+        matches = [
+            (catch_start, catch_end)
+            for try_start, try_end, catch_start, catch_end in pairs
+            if marker in invoke[try_start:try_end]
+            and f"$failedField = '{failed_field}'" in invoke[try_start:try_end]
+        ]
+        assert len(matches) == 1, f"missing unique launch catch for {marker!r}"
+        catch_start, catch_end = matches[0]
+        spans.append((invoke_start + catch_start, invoke_start + catch_end))
+    return tuple(spans)
+
+
+def _credential_launch_failure_tuples(source: str) -> tuple[tuple[str, str, str], ...]:
+    tuples = []
+    for (catch_start, catch_end), (_, failed_field, _) in zip(
+        _credential_launch_catch_spans(source), _CREDENTIAL_LAUNCH_FAILURES
+    ):
+        catch_block = source[catch_start:catch_end]
+        matches = tuple(_CREDENTIAL_LAUNCH_TUPLE_RE.finditer(catch_block))
+        assert len(matches) == 1
+        match = matches[0]
+        tuples.append((match["launch_stage"], match["failure_kind"], failed_field))
+    return tuple(tuples)
+
+
+def _assert_exact_credential_launch_failure_tuples(source: str) -> None:
+    spans = _credential_launch_catch_spans(source)
+    assert all(
+        "-FailedField $failedField" in source[start:end] for start, end in spans
+    )
+    actual = _credential_launch_failure_tuples(source)
+    expected = tuple(expected for _, _, expected in _CREDENTIAL_LAUNCH_FAILURES)
+    assert actual == expected
+
+
+def _mutate_credential_launch_catch(
+    source: str,
+    catch_index: int,
+    replacement: tuple[str, str, str],
+) -> str:
+    catch_start, catch_end = _credential_launch_catch_spans(source)[catch_index]
+    catch_block = source[catch_start:catch_end]
+    match = _CREDENTIAL_LAUNCH_TUPLE_RE.search(catch_block)
+    assert match is not None
+    replacement_text = (
+        "Get-CredentialLaunchDiagnostic "
+        f"-LaunchStage '{replacement[0]}' "
+        f"-FailureKind '{replacement[1]}' "
+        f"-FailedField {replacement[2]}"
+    )
+    catch_start, catch_end = _credential_launch_catch_spans(source)[catch_index]
+    mutated_block = (
+        source[catch_start : catch_start + match.start()]
+        + replacement_text
+        + source[catch_start + match.end() : catch_end]
+    )
+    return source[:catch_start] + mutated_block + source[catch_end:]
 
 
 def _assert_exact_acl_diagnostic_schema(source: str) -> None:
@@ -458,6 +648,136 @@ def test_credentialed_process_does_not_request_ignored_window_suppression() -> N
     assert "$startInfo.CreateNoWindow" not in start_info
 
 
+def test_credentialed_launch_diagnostic_schema_is_exact_and_bounded() -> None:
+    module = read_module("Security.psm1")
+    projection = module[
+        module.index("function Get-CredentialLaunchDiagnostic") : module.index(
+            "function Invoke-AsStandardUser"
+        )
+    ]
+    keys, values = _credential_launch_diagnostic_projection(projection)
+    assert keys == _CREDENTIAL_LAUNCH_DIAGNOSTIC_FIELDS
+    assert values == {
+        "launch_stage": "$LaunchStage",
+        "failure_kind": "$FailureKind",
+        "failed_field": "$FailedField",
+        "has_username": "-not [string]::IsNullOrEmpty($StartInfo.UserName)",
+        "has_domain": "-not [string]::IsNullOrEmpty($StartInfo.Domain)",
+        "has_secure_password": "$null -ne $StartInfo.Password",
+        "use_shell_execute": "[bool]$StartInfo.UseShellExecute",
+        "redirects": "$redirects",
+        "has_working_directory": "-not [string]::IsNullOrEmpty($StartInfo.WorkingDirectory)",
+        "load_user_profile": "[bool]$StartInfo.LoadUserProfile",
+        "argument_count": "$ArgumentCount",
+        "executable_class": "$executableClass",
+        "native_error_code": "$nativeErrorCode",
+        "hresult": "$hresult",
+    }
+    assert "if ($bytes.Length -gt 8192)" in projection
+    assert "ConvertTo-Json -Compress -Depth 3" in projection
+    assert "[Text.Encoding]::UTF8" in projection
+    assert "New-Object byte[]" not in projection
+    assert "Exception.Message" not in projection
+    assert "InnerException" in projection
+
+
+def test_credentialed_launch_diagnostic_schema_rejects_privacy_mutations() -> None:
+    module = read_module("Security.psm1")
+    projection = module[
+        module.index("function Get-CredentialLaunchDiagnostic") : module.index(
+            "function Invoke-AsStandardUser"
+        )
+    ]
+    mutation = projection.replace(
+        "launch_stage = $LaunchStage\n",
+        "credential_value = 'forbidden'\n        launch_stage = $LaunchStage\n",
+        1,
+    )
+    keys, _ = _credential_launch_diagnostic_projection(mutation)
+    assert keys != _CREDENTIAL_LAUNCH_DIAGNOSTIC_FIELDS
+    assert not any(
+        re.search(rf"(?m)^\s*{re.escape(forbidden)}\s*=", projection)
+        for forbidden in _CREDENTIAL_LAUNCH_DIAGNOSTIC_FORBIDDEN_FIELDS
+    )
+    for sensitive_value in ("$User.Name", "$User.Domain", "$FilePath", "$ArgumentList"):
+        assert sensitive_value not in projection
+
+
+def test_credentialed_launch_catches_have_exact_failure_tuples() -> None:
+    module = read_module("Security.psm1")
+    _assert_exact_credential_launch_failure_tuples(module)
+
+
+def test_credentialed_launch_catch_tuple_mutations_are_rejected() -> None:
+    module = read_module("Security.psm1")
+    expected = tuple(expected for _, _, expected in _CREDENTIAL_LAUNCH_FAILURES)
+    mutations = []
+    for index, (_, _, expected_tuple) in enumerate(_CREDENTIAL_LAUNCH_FAILURES):
+        for component, replacement in enumerate(
+            (
+                ("native_start", expected_tuple[1], expected_tuple[2]),
+                (expected_tuple[0], "native", expected_tuple[2]),
+                (expected_tuple[0], expected_tuple[1], "$wrongField"),
+            )
+        ):
+            if replacement == expected_tuple:
+                continue
+            mutations.append(
+                (
+                    f"catch {index} component {component}",
+                    _mutate_credential_launch_catch(module, index, replacement),
+                )
+            )
+    for left, right in ((0, 2), (1, 2)):
+        left_tuple = _CREDENTIAL_LAUNCH_FAILURES[left][2]
+        right_tuple = _CREDENTIAL_LAUNCH_FAILURES[right][2]
+        mutations.append(
+            (
+                f"swap catches {left} and {right}",
+                _mutate_credential_launch_catch(
+                    _mutate_credential_launch_catch(module, left, right_tuple),
+                    right,
+                    left_tuple,
+                ),
+            )
+        )
+    for label, mutation in mutations:
+        try:
+            _assert_exact_credential_launch_failure_tuples(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError(f"credential launch tuple mutation was accepted: {label}")
+    assert _credential_launch_failure_tuples(module) == expected
+
+
+def test_credentialed_launch_classifies_configuration_and_native_failures() -> None:
+    module = read_module("Security.psm1")
+    helper = module[
+        module.index("function Get-CredentialLaunchDiagnostic") : module.index(
+            "function Invoke-AsStandardUser"
+        )
+    ]
+    invoke = module[module.index("function Invoke-AsStandardUser") : module.index("function Assert-StandardUserCannotReadWrite")]
+    for required in (
+        "-LaunchStage 'configuration'",
+        "-LaunchStage 'native_start'",
+        "-FailureKind 'configuration'",
+        "-FailureKind 'native'",
+        "$failedField = 'process_start'",
+        "-FailedField $failedField",
+        "NativeErrorCode",
+        "HResult",
+        "Get-CredentialLaunchDiagnostic",
+        "throw \"credentialed launch failed: $diagnostic\"",
+    ):
+        assert required in helper or required in invoke, f"missing credential launch classification {required!r}"
+    assert "Assert-ChildIsStandardUser" in module
+    assert "read_denied" in module and "write_denied" in module
+    assert invoke.index("$startInfo.UserName") < invoke.index("$process.StartInfo = $startInfo")
+    assert invoke.index("$process.StartInfo = $startInfo") < invoke.index("$process.Start()")
+    assert "CreateNoWindow" not in invoke
+
+
 def test_diagnostics_are_allowlisted_and_size_bounded() -> None:
     module = read_module("Diagnostics.psm1")
     assert "function Get-BoundedText" in module
@@ -709,6 +1029,11 @@ def main() -> None:
     test_elevated_result_requires_msi_and_direct_scm_success_in_both_modes()
     test_security_module_proves_standard_user_token_and_access_denials()
     test_credentialed_process_does_not_request_ignored_window_suppression()
+    test_credentialed_launch_diagnostic_schema_is_exact_and_bounded()
+    test_credentialed_launch_diagnostic_schema_rejects_privacy_mutations()
+    test_credentialed_launch_catches_have_exact_failure_tuples()
+    test_credentialed_launch_catch_tuple_mutations_are_rejected()
+    test_credentialed_launch_classifies_configuration_and_native_failures()
     test_diagnostics_are_allowlisted_and_size_bounded()
     test_cleanup_runs_every_action_and_reports_failures()
     test_cleanup_persists_bounded_failure_diagnostics()
