@@ -67,7 +67,7 @@ def test_acl_contract_is_sid_based_and_rejects_broad_allows() -> None:
     module = read_module("Acl.psm1")
     for required in (
         "function Get-AclContract",
-        "function Ensure-AclContract",
+        "function Set-AclContract",
         "function Assert-AclContract",
         "S-1-5-18",
         "S-1-5-32-544",
@@ -91,7 +91,11 @@ def test_acl_contract_is_sid_based_and_rejects_broad_allows() -> None:
     assert "Users" not in module
     assert "Everyone" not in module
     assert "Authenticated Users" not in module
-    assert "Export-ModuleMember -Function Get-NormalizedAcl, Assert-AclPrincipal, Get-AclContract, Ensure-AclContract, Assert-AclContract" in module
+    assert "Export-ModuleMember -Function Get-NormalizedAcl, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclContract" in module
+    assert "Ensure-AclContract" not in module
+    assert "$matches =" not in module
+    assert "[CmdletBinding(SupportsShouldProcess = $true)]" in module
+    assert "$PSCmdlet.ShouldProcess($Path" in module
 
 
 def test_acl_fixture_rejects_arbitrary_extra_allow_but_preserves_deny_rules() -> None:
@@ -109,7 +113,7 @@ def test_acl_fixture_rejects_arbitrary_extra_allow_but_preserves_deny_rules() ->
     extra_allow_sids = allow_sids - canonical_sids
 
     assert extra_allow_sids == {"S-1-5-21-424242-424242-424242-4242"}
-    repair = module[module.index("function Ensure-AclContract"):module.index("function Assert-AclPrincipal")]
+    repair = module[module.index("function Set-AclContract"):module.index("function Assert-AclPrincipal")]
     assert "-not $canonicalAllowSids.Contains($sid)" in repair
     assert repair.count("AccessControlType]::Allow") == repair.count("RemoveAccessRule") + 1
     assert repair.count("RemoveAccessRule") == 2
@@ -186,6 +190,17 @@ def test_security_module_proves_standard_user_token_and_access_denials() -> None
     assert "ValidateSet('Leaf', 'Container')" in module
     assert "identity-class=standard-user" in module
     assert "access=read-write-denied" in module
+    assert "ConvertTo-SecureString" not in module
+    assert "[Security.SecureString]::new()" in module
+    assert "AppendChar" in module
+    assert module.count("[CmdletBinding(SupportsShouldProcess = $true)]") == 2
+    assert "$PSCmdlet.ShouldProcess($Name" in module
+    assert "$PSCmdlet.ShouldProcess($User.Name" in module
+    assert "$PSCmdlet.ShouldProcess($userProfile" in module
+    assert "$profile =" not in module
+    assert "foreach ($profile" not in module
+    probe_start = module.index("$probe = @'")
+    assert "$AccessDeniedHResult = -2147024891" not in module[:probe_start]
 
 
 def test_diagnostics_are_allowlisted_and_size_bounded() -> None:
@@ -223,7 +238,7 @@ def test_cleanup_persists_bounded_failure_diagnostics() -> None:
 def test_lifecycle_applies_acl_contract_and_covers_runtime_artifacts() -> None:
     script = LIFECYCLE.read_text(encoding="utf-8")
     for required in (
-        "Ensure-AclContract",
+        "Acl\\Set-AclContract",
         "Assert-AclContract",
         "Assert-ChildIsStandardUser",
         "state.toml",
@@ -232,7 +247,7 @@ def test_lifecycle_applies_acl_contract_and_covers_runtime_artifacts() -> None:
     ):
         assert required in script, f"MSI lifecycle script missing {required!r}"
     validate_position = script.index("Assert-AclContract -Path $dataRoot")
-    repair_position = script.index("Ensure-AclContract")
+    repair_position = script.index("Acl\\Set-AclContract")
     assert validate_position < repair_position
     assert "Get-TokenProof" not in script
     assert "-PathType $artifact.Type" in script

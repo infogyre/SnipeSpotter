@@ -100,12 +100,32 @@ def test_lifecycle_starts_service_before_runtime_artifact_waits() -> None:
     assert "Wait-ConditionStable" in SCRIPT
 
 
-def test_lifecycle_validates_acl_before_optional_repair() -> None:
+def test_lifecycle_collects_only_present_runtime_artifacts_and_uses_scoped_acl_commands() -> None:
+    acl_import = SCRIPT.index("Import-Module (Join-Path $testSupportRoot 'Acl.psm1')")
     artifact_wait = SCRIPT.index("$runtimeArtifacts = @(")
-    validation = SCRIPT.index("Assert-AclContract -Path $dataRoot", artifact_wait)
-    repair = SCRIPT.index("Ensure-AclContract -Path $dataRoot")
-    assert artifact_wait < validation < repair
-    assert "Ensure-AclContract" not in SCRIPT[artifact_wait:validation]
+    required_artifact_block_end = SCRIPT.index("    foreach ($artifact in $runtimeArtifacts)", artifact_wait)
+    required_artifact_block = SCRIPT[artifact_wait:required_artifact_block_end]
+    validation = SCRIPT.index("Acl\\Assert-AclContract", artifact_wait)
+    repair = SCRIPT.index("Acl\\Set-AclContract")
+
+    assert acl_import < artifact_wait < validation < repair
+    for required_artifact in (
+        "[pscustomobject]@{ Path = $dataRoot; Type = 'Container' }",
+        "[pscustomobject]@{ Path = $settingsPath; Type = 'Leaf' }",
+        "state-hmac-key.bin",
+        "[pscustomobject]@{ Path = (Join-Path $dataRoot 'logs'); Type = 'Container' }",
+    ):
+        assert required_artifact in required_artifact_block
+    assert "state.toml" not in required_artifact_block
+    assert "operations.jsonl" not in required_artifact_block
+    assert "foreach ($optionalArtifact in @('state.toml', 'operations.jsonl'))" in SCRIPT
+    assert "if (Test-Path -LiteralPath $optionalPath -PathType Leaf)" in SCRIPT
+    assert "Get-ChildItem -LiteralPath (Join-Path $dataRoot 'logs') -Filter 'spotter-svc.log*' -File" in SCRIPT
+    assert "Wait-Condition -Description 'service rolling log file'" not in SCRIPT
+    assert "Acl\\Assert-AclContract -Path $dataRoot" in SCRIPT
+    assert "Acl\\Set-AclContract -Path $dataRoot" in SCRIPT
+    assert "Ensure-AclContract" not in SCRIPT
+    assert not re.search(r"(?<!\\)Assert-AclContract -Path \$dataRoot", SCRIPT)
 
 
 def test_lifecycle_asserts_child_probe_result_not_parent_token() -> None:
@@ -181,7 +201,7 @@ def test_lifecycle_discovers_actual_rolling_log_artifacts() -> None:
     log_directory = "Join-Path $dataRoot 'logs'"
     assert f"Get-ChildItem -LiteralPath ({log_directory}) -Filter 'spotter-svc.log*' -File" in SCRIPT
     assert "$logFiles = @(" in SCRIPT
-    assert "Wait-Condition -Description 'service rolling log file'" in SCRIPT
+    assert "Wait-Condition -Description 'service rolling log file'" not in SCRIPT
     assert "Path = $_.FullName" in SCRIPT
     assert "Join-Path $dataRoot 'logs\\spotter-svc.log'" not in SCRIPT
 
@@ -196,9 +216,9 @@ def test_preserved_settings_file_has_direct_wix_acl_entries() -> None:
 
 def test_acl_helper_validates_before_repair_and_uses_real_acl_contract() -> None:
     assert "function Assert-AclContract" in ACL
-    assert "function Ensure-AclContract" in ACL
+    assert "function Set-AclContract" in ACL
     validation = ACL.index("function Assert-AclContract")
-    repair = ACL.index("function Ensure-AclContract")
+    repair = ACL.index("function Set-AclContract")
     assert validation < repair
     assert "Get-AclContract -Path $Path" in ACL
     assert "Set-Acl -LiteralPath $Path -AclObject $acl" in ACL
@@ -315,7 +335,7 @@ def test_service_log_capture_preserves_primary_error_on_setup_failure() -> None:
     helper = _function_text(SCRIPT, "Save-ServiceLogDiagnostic", "Get-MachinePathEntry")
     invocation = "Save-ServiceLogDiagnostic -DataRoot $dataRoot -Destination $LogDirectory"
     assert invocation in SCRIPT
-    observed_acl = SCRIPT.index("[void](Assert-AclContract -Path $dataRoot)")
+    observed_acl = SCRIPT.index("[void](Acl\\Assert-AclContract -Path $dataRoot)")
     assert observed_acl < SCRIPT.index(invocation)
     assert "Write-Warning \"service log capture failed:" in SCRIPT
     assert helper.count("try {") >= 2
@@ -513,7 +533,7 @@ def main() -> None:
     test_lifecycle_checks_named_pipe_and_unconfigured_cli_status()
     test_lifecycle_uses_valid_test_path_types()
     test_lifecycle_starts_service_before_runtime_artifact_waits()
-    test_lifecycle_validates_acl_before_optional_repair()
+    test_lifecycle_collects_only_present_runtime_artifacts_and_uses_scoped_acl_commands()
     test_lifecycle_asserts_child_probe_result_not_parent_token()
     test_product_and_atomic_writer_apply_the_same_protected_acl_contract()
     test_startup_repairs_existing_runtime_artifact_acls_before_access()

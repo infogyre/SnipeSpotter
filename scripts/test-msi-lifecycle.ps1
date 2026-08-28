@@ -20,6 +20,7 @@ $ErrorActionPreference = 'Stop'
 $testSupportRoot = Join-Path $PSScriptRoot 'TestSupport'
 Import-Module (Join-Path $testSupportRoot 'Scm.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Wait.psm1') -Force
+Import-Module (Join-Path $testSupportRoot 'Acl.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Diagnostics.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Security.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Cleanup.psm1') -Force
@@ -231,33 +232,33 @@ try {
     }
     Assert-True ((Get-MachinePathEntry) -contains $binRoot) 'MSI did not append the binary directory to machine PATH'
 
-    $logFiles = @(
-        Wait-Condition -Description 'service rolling log file' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
-            @(Get-ChildItem -LiteralPath (Join-Path $dataRoot 'logs') -Filter 'spotter-svc.log*' -File -ErrorAction SilentlyContinue)
-        }
-    )
     $runtimeArtifacts = @(
         [pscustomobject]@{ Path = $dataRoot; Type = 'Container' },
         [pscustomobject]@{ Path = $settingsPath; Type = 'Leaf' },
-        [pscustomobject]@{ Path = (Join-Path $dataRoot 'state.toml'); Type = 'Leaf' },
         [pscustomobject]@{ Path = (Join-Path $dataRoot 'state-hmac-key.bin'); Type = 'Leaf' },
-        [pscustomobject]@{ Path = (Join-Path $dataRoot 'operations.jsonl'); Type = 'Leaf' },
         [pscustomobject]@{ Path = (Join-Path $dataRoot 'logs'); Type = 'Container' }
-    )
-    $runtimeArtifacts += @(
-        $logFiles | ForEach-Object {
-            [pscustomobject]@{ Path = $_.FullName; Type = 'Leaf' }
-        }
     )
     foreach ($artifact in $runtimeArtifacts) {
         Wait-Condition -Description "runtime artifact $($artifact.Path)" -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
             Test-Path -LiteralPath $artifact.Path -PathType $artifact.Type
         } | Out-Null
     }
-    [void](Assert-AclContract -Path $dataRoot)
+    foreach ($optionalArtifact in @('state.toml', 'operations.jsonl')) {
+        $optionalPath = Join-Path $dataRoot $optionalArtifact
+        if (Test-Path -LiteralPath $optionalPath -PathType Leaf) {
+            $runtimeArtifacts += [pscustomobject]@{ Path = $optionalPath; Type = 'Leaf' }
+        }
+    }
+    $logFiles = @(Get-ChildItem -LiteralPath (Join-Path $dataRoot 'logs') -Filter 'spotter-svc.log*' -File -ErrorAction SilentlyContinue)
+    $runtimeArtifacts += @(
+        $logFiles | ForEach-Object {
+            [pscustomobject]@{ Path = $_.FullName; Type = 'Leaf' }
+        }
+    )
+    [void](Acl\Assert-AclContract -Path $dataRoot)
     $artifactAclBefore = @{}
     foreach ($artifact in $runtimeArtifacts) {
-        $artifactAclBefore[$artifact.Path] = @(Get-NormalizedAcl -Path $artifact.Path)
+        $artifactAclBefore[$artifact.Path] = @(Acl\Get-NormalizedAcl -Path $artifact.Path)
     }
 
     $replacementInterval = '12'
@@ -272,7 +273,7 @@ try {
         }
     } | Out-Null
     Wait-ConditionStable -Description 'settings ACL after atomic replacement' -StabilitySeconds 2 -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
-        $candidate = @(Get-NormalizedAcl -Path $settingsPath)
+        $candidate = @(Acl\Get-NormalizedAcl -Path $settingsPath)
         (Compare-Object $artifactAclBefore[$settingsPath] $candidate | Measure-Object).Count -eq 0
     } | Out-Null
 
@@ -295,7 +296,7 @@ try {
     Wait-ServiceState -Name $serviceName -State 'Running' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
     Assert-ServiceRunsAsSystem -Name $serviceName
     foreach ($artifact in $runtimeArtifacts) {
-        $afterRestart = @(Get-NormalizedAcl -Path $artifact.Path)
+        $afterRestart = @(Acl\Get-NormalizedAcl -Path $artifact.Path)
         if ((Compare-Object $artifactAclBefore[$artifact.Path] $afterRestart | Measure-Object).Count -ne 0) {
             throw "runtime artifact ACL changed across service restart: $($artifact.Path)"
         }
@@ -311,11 +312,11 @@ try {
     try {
         if (Test-Path -LiteralPath $dataRoot) {
             try {
-                [void](Assert-AclContract -Path $dataRoot)
+                [void](Acl\Assert-AclContract -Path $dataRoot)
             } catch {
                 Write-Warning "observed invalid ACL before diagnostics: $($_.Exception.Message)"
                 try {
-                    Ensure-AclContract -Path $dataRoot
+                    Acl\Set-AclContract -Path $dataRoot
                 } catch {
                     Write-Warning "could not repair ACL for diagnostics: $($_.Exception.Message)"
                 }

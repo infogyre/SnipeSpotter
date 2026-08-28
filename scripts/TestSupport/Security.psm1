@@ -2,10 +2,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AccessDeniedHResult = -2147024891
-
 function New-TemporaryStandardUser {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Name,
         [Parameter(Mandatory = $false)][ValidateNotNullOrEmpty()][string]$Domain = $env:COMPUTERNAME
@@ -18,8 +16,14 @@ function New-TemporaryStandardUser {
         throw "refusing to reuse an existing local user: $Name"
     }
 
-    $passwordText = [Guid]::NewGuid().ToString('N') + 'aA!7'
-    $password = ConvertTo-SecureString -String $passwordText -AsPlainText -Force
+    $password = [Security.SecureString]::new()
+    foreach ($character in ([Guid]::NewGuid().ToString('N') + 'aA!7').ToCharArray()) {
+        $password.AppendChar($character)
+    }
+    $password.MakeReadOnly()
+    if (-not $PSCmdlet.ShouldProcess($Name, 'Create temporary standard user')) {
+        return
+    }
     $user = New-LocalUser -Name $Name -Password $password -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword -Description 'temporary SnipeSpotter ACL test account'
     try {
         $member = Get-LocalGroupMember -Group 'Administrators' -ErrorAction SilentlyContinue |
@@ -39,7 +43,7 @@ function New-TemporaryStandardUser {
 }
 
 function Remove-TemporaryStandardUser {
-    [CmdletBinding()]
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param([Parameter(Mandatory = $true)][psobject]$User)
 
     if ([string]::IsNullOrWhiteSpace($User.Name)) {
@@ -48,9 +52,13 @@ function Remove-TemporaryStandardUser {
     $localUser = Get-LocalUser -Name $User.Name -ErrorAction SilentlyContinue
     if ($null -ne $localUser) {
         $profiles = @(Get-CimInstance Win32_UserProfile -Filter "LocalPath LIKE '%\$($User.Name)'" -ErrorAction SilentlyContinue)
-        Remove-LocalUser -Name $User.Name -ErrorAction Stop
-        foreach ($profile in $profiles) {
-            Remove-CimInstance -InputObject $profile -ErrorAction Stop
+        if ($PSCmdlet.ShouldProcess($User.Name, 'Remove temporary standard user')) {
+            Remove-LocalUser -Name $User.Name -ErrorAction Stop
+        }
+        foreach ($userProfile in $profiles) {
+            if ($PSCmdlet.ShouldProcess($userProfile.LocalPath, 'Remove temporary user profile')) {
+                Remove-CimInstance -InputObject $userProfile -ErrorAction Stop
+            }
         }
     }
 }

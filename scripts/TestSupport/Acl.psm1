@@ -99,22 +99,22 @@ function Assert-AclContract {
         throw "ACL contract for $Path contains non-canonical Allow SID(s): $($unexpectedAllowSids -join ', ')"
     }
     foreach ($required in $contract.required) {
-        $matches = @($allowRules | Where-Object {
+        $matchingRules = @($allowRules | Where-Object {
             $_.sid -eq $required.sid -and $_.type -eq $required.type -and
             $_.rights_mask -eq $required.rights_mask -and
             $_.inheritance_mask -eq $required.inheritance_mask -and
             $_.propagation_mask -eq $required.propagation_mask -and
             $_.inherited -eq $required.inherited
         })
-        if ($matches.Count -ne 1) {
+        if ($matchingRules.Count -ne 1) {
             throw "ACL contract for $Path lacks exactly one canonical Allow rule for $($required.sid)"
         }
     }
     return $contract
 }
 
-function Ensure-AclContract {
-    [CmdletBinding()]
+function Set-AclContract {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param([Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path)
 
     $acl = Get-Acl -LiteralPath $Path
@@ -155,7 +155,9 @@ function Ensure-AclContract {
     if ($removedAllowCount -gt 0) {
         Write-Verbose "removed $removedAllowCount non-canonical Allow ACL rule(s) for SID(s): $($removedAllowSids -join ', ')"
     }
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    if ($PSCmdlet.ShouldProcess($Path, 'Set canonical ACL contract')) {
+        Set-Acl -LiteralPath $Path -AclObject $acl
+    }
     $updatedOwner = ConvertTo-SecurityIdentifier -IdentityReference (Get-Acl -LiteralPath $Path).Owner
     if ($updatedOwner -ne $owner) {
         throw "ACL repair changed owner SID for $Path"
@@ -184,4 +186,4 @@ function Assert-AclPrincipal {
     return $match[0]
 }
 
-Export-ModuleMember -Function Get-NormalizedAcl, Assert-AclPrincipal, Get-AclContract, Ensure-AclContract, Assert-AclContract
+Export-ModuleMember -Function Get-NormalizedAcl, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclContract
