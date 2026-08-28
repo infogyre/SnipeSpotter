@@ -21,6 +21,7 @@ $testSupportRoot = Join-Path $PSScriptRoot 'TestSupport'
 Import-Module (Join-Path $testSupportRoot 'Scm.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Wait.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Diagnostics.psm1') -Force
+Import-Module (Join-Path $testSupportRoot 'Security.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Cleanup.psm1') -Force
 
 function Assert-True {
@@ -131,10 +132,25 @@ function Invoke-InstalledCli {
     $stdoutPath = Join-Path $LogDirectory 'cli-stdout.txt'
     $stderrPath = Join-Path $LogDirectory 'cli-stderr.txt'
     $process = Start-Process -FilePath $cliPath -ArgumentList $Arguments -Wait -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
-    $stderrExcerpt = Get-BoundedText -Path $stderrPath -MaxCharacters 512
-    $failureDetail = if ([string]::IsNullOrWhiteSpace($stderrExcerpt)) { 'no stderr output' } else { $stderrExcerpt }
-    Assert-True ($process.ExitCode -eq 0) "$Description failed with exit code $($process.ExitCode): $failureDetail"
-    return (Get-BoundedText -Path $stdoutPath -MaxCharacters 65536)
+    [pscustomobject]@{
+        ExitCode = $process.ExitCode
+        Stdout = Get-BoundedText -Path $stdoutPath -MaxCharacters 65536
+        Stderr = Get-BoundedText -Path $stderrPath -MaxCharacters 512
+        Description = $Description
+    }
+}
+
+function Assert-InstalledCliContract {
+    param(
+        [Parameter(Mandatory = $true)][psobject]$Result,
+        [Parameter(Mandatory = $true)][int]$ExpectedExitCode,
+        [Parameter(Mandatory = $true)][string]$ExpectedStdout,
+        [Parameter(Mandatory = $true)][string]$ExpectedStderr
+    )
+
+    Assert-True ($Result.ExitCode -eq $ExpectedExitCode) "installed CLI $($Result.Description) returned an unexpected exit code"
+    Assert-True ($Result.Stdout -ceq $ExpectedStdout) "installed CLI $($Result.Description) returned an unexpected stdout contract"
+    Assert-True ($Result.Stderr -ceq $ExpectedStderr) "installed CLI $($Result.Description) returned an unexpected stderr contract"
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -179,6 +195,26 @@ try {
     $expectedExe = Join-Path $binRoot 'spotter-svc.exe'
     Assert-True ($service.PathName.Trim('"') -eq $expectedExe) "service path is $($service.PathName), expected $expectedExe"
 
+    Start-Service -Name $serviceName -ErrorAction Stop
+    Wait-ServiceState -Name $serviceName -State 'Running' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
+    Wait-ConditionStable -Description "service $serviceName to remain Running" -StabilitySeconds $StableRunningSeconds -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        $candidate = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        $null -ne $candidate -and $candidate.Status -eq 'Running'
+    }
+    Assert-ServiceRunsAsSystem -Name $serviceName
+    $pipePath = '\\.\pipe\SnipeSpotter'
+    Wait-Condition -Description 'SnipeSpotter named pipe' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        Test-Path -LiteralPath $pipePath
+    } | Out-Null
+    Wait-Condition -Description 'SnipeSpotter status response' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        try {
+            $candidate = (Invoke-InstalledCli -Arguments @('--json', 'status') -Description 'installed CLI status request').Stdout | ConvertFrom-Json
+            $candidate.type -eq 'status' -and $candidate.data.state -eq 'Unconfigured'
+        } catch {
+            $false
+        }
+    } | Out-Null
+
     foreach ($relative in @(
         'bin\spotter-svc.exe',
         'bin\spotter-cli.exe',
@@ -193,38 +229,98 @@ try {
     if ($PreviousMsiPath) {
         Assert-True ((Get-Content -Raw -LiteralPath $settingsPath).Contains('# lifecycle-preservation-marker')) 'major upgrade did not preserve settings.toml'
     }
-
-    $acl = Get-Acl -LiteralPath $dataRoot
-    $systemRule = $acl.Access | Where-Object { $_.IdentityReference.Value -eq 'NT AUTHORITY\SYSTEM' -and $_.FileSystemRights.ToString().Contains('FullControl') }
-    $adminRule = $acl.Access | Where-Object { $_.IdentityReference.Value -match '\\Administrators$' -and $_.FileSystemRights.ToString().Contains('FullControl') }
-    Assert-True ($null -ne $systemRule) 'ProgramData ACL does not grant SYSTEM full control'
-    Assert-True ($null -ne $adminRule) 'ProgramData ACL does not grant Administrators full control'
     Assert-True ((Get-MachinePathEntry) -contains $binRoot) 'MSI did not append the binary directory to machine PATH'
 
-    Start-Service -Name $serviceName -ErrorAction Stop
-    Wait-ServiceState -Name $serviceName -State 'Running' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
-    Wait-ConditionStable -Description "service $serviceName to remain Running" -StabilitySeconds $StableRunningSeconds -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
-        $candidate = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
-        $null -ne $candidate -and $candidate.Status -eq 'Running'
+    $logFiles = @(
+        Wait-Condition -Description 'service rolling log file' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+            @(Get-ChildItem -LiteralPath (Join-Path $dataRoot 'logs') -Filter 'spotter-svc.log*' -File -ErrorAction SilentlyContinue)
+        }
+    )
+    $runtimeArtifacts = @(
+        [pscustomobject]@{ Path = $dataRoot; Type = 'Container' },
+        [pscustomobject]@{ Path = $settingsPath; Type = 'Leaf' },
+        [pscustomobject]@{ Path = (Join-Path $dataRoot 'state.toml'); Type = 'Leaf' },
+        [pscustomobject]@{ Path = (Join-Path $dataRoot 'state-hmac-key.bin'); Type = 'Leaf' },
+        [pscustomobject]@{ Path = (Join-Path $dataRoot 'operations.jsonl'); Type = 'Leaf' },
+        [pscustomobject]@{ Path = (Join-Path $dataRoot 'logs'); Type = 'Container' }
+    )
+    $runtimeArtifacts += @(
+        $logFiles | ForEach-Object {
+            [pscustomobject]@{ Path = $_.FullName; Type = 'Leaf' }
+        }
+    )
+    foreach ($artifact in $runtimeArtifacts) {
+        Wait-Condition -Description "runtime artifact $($artifact.Path)" -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+            Test-Path -LiteralPath $artifact.Path -PathType $artifact.Type
+        } | Out-Null
     }
-    Assert-ServiceRunsAsSystem -Name $serviceName
-    $pipePath = '\\.\pipe\SnipeSpotter'
-    Wait-Condition -Description 'SnipeSpotter named pipe' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
-        Test-Path -LiteralPath $pipePath
+    [void](Assert-AclContract -Path $dataRoot)
+    $artifactAclBefore = @{}
+    foreach ($artifact in $runtimeArtifacts) {
+        $artifactAclBefore[$artifact.Path] = @(Get-NormalizedAcl -Path $artifact.Path)
     }
-    $statusOutput = Invoke-InstalledCli -Arguments @('--json', 'status') -Description 'installed CLI status request'
-    $status = $statusOutput | ConvertFrom-Json
-    Assert-True ($status.type -eq 'status') "status response type was $($status.type), expected status"
-    Assert-True ($status.data.state -eq 'Unconfigured') "unconfigured service status was $($status.data.state)"
+
+    $replacementInterval = '12'
+    $settingsUpdate = Invoke-InstalledCli -Arguments @('config', 'set', 'polling.interval_hours', $replacementInterval) -Description 'installed settings update'
+    Assert-InstalledCliContract -Result $settingsUpdate -ExpectedExitCode 0 -ExpectedStdout 'updated polling.interval_hours' -ExpectedStderr ''
+    Wait-Condition -Description 'settings committed by CLI' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        try {
+            $settingsText = Get-Content -Raw -LiteralPath $settingsPath -ErrorAction Stop
+            $settingsText.Contains("interval_hours = $replacementInterval")
+        } catch {
+            $false
+        }
+    } | Out-Null
+    Wait-ConditionStable -Description 'settings ACL after atomic replacement' -StabilitySeconds 2 -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        $candidate = @(Get-NormalizedAcl -Path $settingsPath)
+        (Compare-Object $artifactAclBefore[$settingsPath] $candidate | Measure-Object).Count -eq 0
+    } | Out-Null
+
+    $standardUser = New-TemporaryStandardUser -Name ("SnipeSpotterAcl" + (Get-Random -Minimum 10000 -Maximum 99999))
+    try {
+        foreach ($artifact in $runtimeArtifacts) {
+            $probeResult = Assert-StandardUserCannotReadWrite -User $standardUser -Path $artifact.Path -PathType $artifact.Type -TimeoutSeconds $WaitTimeoutSeconds
+            [void](Assert-ChildIsStandardUser -Result $probeResult)
+        }
+    } finally {
+        Remove-TemporaryStandardUser -User $standardUser
+    }
 
     Stop-Service -Name $serviceName -ErrorAction Stop
     Wait-Condition -Description 'SnipeSpotter service to stop' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
         $candidate = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
         $null -ne $candidate -and $candidate.Status -eq 'Stopped'
+    } | Out-Null
+    Start-Service -Name $serviceName -ErrorAction Stop
+    Wait-ServiceState -Name $serviceName -State 'Running' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
+    Assert-ServiceRunsAsSystem -Name $serviceName
+    foreach ($artifact in $runtimeArtifacts) {
+        $afterRestart = @(Get-NormalizedAcl -Path $artifact.Path)
+        if ((Compare-Object $artifactAclBefore[$artifact.Path] $afterRestart | Measure-Object).Count -ne 0) {
+            throw "runtime artifact ACL changed across service restart: $($artifact.Path)"
+        }
     }
+
+    Stop-Service -Name $serviceName -ErrorAction Stop
+    Wait-Condition -Description 'SnipeSpotter service to stop after ACL verification' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        $candidate = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        $null -ne $candidate -and $candidate.Status -eq 'Stopped'
+    } | Out-Null
 } catch {
     $primaryError = $_
     try {
+        if (Test-Path -LiteralPath $dataRoot) {
+            try {
+                [void](Assert-AclContract -Path $dataRoot)
+            } catch {
+                Write-Warning "observed invalid ACL before diagnostics: $($_.Exception.Message)"
+                try {
+                    Ensure-AclContract -Path $dataRoot
+                } catch {
+                    Write-Warning "could not repair ACL for diagnostics: $($_.Exception.Message)"
+                }
+            }
+        }
         Save-ServiceLogDiagnostic -DataRoot $dataRoot -Destination $LogDirectory
     } catch {
         Write-Warning "service log capture failed: $($_.Exception.Message)"

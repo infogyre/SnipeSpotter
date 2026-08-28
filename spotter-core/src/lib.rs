@@ -16,5 +16,5 @@ pub use config::{
 
 pub use identity::{
     COMPANY_NAME, MUTEX_NAME, PIPE_NAME, PRODUCT_NAME, RUNTIME_SERVICE_PRINCIPAL, SERVICE_ACCOUNT,
-    SERVICE_NAME, data_dir,
+    SERVICE_NAME, ServiceRuntimeOptions, data_dir,
 };

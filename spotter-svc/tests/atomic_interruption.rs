@@ -1,13 +1,62 @@
 #![cfg(all(windows, feature = "test-support"))]
 
-use std::fs;
+use std::{
+    fs,
+    path::Path,
+    process::{Child, Command},
+    time::{Duration, Instant},
+};
 
 use anyhow::Result;
-use spotter_svc::atomic_file::test_support::{FaultPoint, write_with_fault};
+use spotter_svc::{
+    atomic_file::{
+        test_support::{
+            FaultPoint, create_owned_temporary_for_test, recover_stale_temporary_files,
+            write_with_fault,
+        },
+        write,
+    },
+    windows_acl::read_acl_sddl,
+};
 
 fn assert_old_or_new(path: &std::path::Path, old: &[u8], new: &[u8]) -> Result<()> {
     let contents = fs::read(path)?;
     assert!(contents == old || contents == new);
+    Ok(())
+}
+
+#[test]
+fn first_create_applies_the_protected_data_acl() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.toml");
+
+    write(&path, b"new-state")?;
+
+    assert_acl_contract(&path)
+}
+
+#[test]
+fn existing_replacement_preserves_the_protected_data_acl() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.toml");
+    fs::write(&path, b"old-state")?;
+
+    write(&path, b"new-state")?;
+
+    assert_acl_contract(&path)
+}
+
+fn assert_acl_contract(path: &Path) -> Result<()> {
+    let sddl = read_acl_sddl(path)?;
+    assert!(sddl.starts_with("D:P"), "ACL must be protected: {sddl}");
+    assert_eq!(sddl.matches("(A;OICI;GA;;;SY)").count(), 1, "{sddl}");
+    assert_eq!(sddl.matches("(A;OICI;GA;;;BA)").count(), 1, "{sddl}");
+    for forbidden in [";;;WD", ";;;BU", ";;;AU"] {
+        assert!(
+            !sddl.contains(forbidden),
+            "ACL contains broad allow {forbidden}: {sddl}"
+        );
+    }
     Ok(())
 }
 
@@ -93,5 +142,102 @@ fn temporary_flush_failure_preserves_existing_destination() -> Result<()> {
 
     assert!(error.to_string().contains("temporary flush"));
     assert_eq!(fs::read(&path)?, b"old-state");
+    Ok(())
+}
+
+#[test]
+fn stale_recovery_removes_only_dead_owned_temporary_files() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.toml");
+    let mut dead_owner = Command::new("cmd.exe")
+        .args(["/C", "exit", "0"])
+        .spawn()
+        .expect("short-lived dead-owner process must start");
+    let dead_owner_pid = dead_owner.id();
+    let dead_owner_status = dead_owner.wait()?;
+    assert!(
+        dead_owner_status.success(),
+        "short-lived dead-owner process failed: {dead_owner_status}"
+    );
+    let dead = create_owned_temporary_for_test(&path, dead_owner_pid, 7)?;
+    let live = create_owned_temporary_for_test(&path, std::process::id(), 8)?;
+
+    let removed = recover_stale_temporary_files(directory.path(), std::process::id(), 0)?;
+
+    assert_eq!(removed, 1);
+    assert!(!dead.exists());
+    assert!(live.exists());
+    Ok(())
+}
+
+#[test]
+fn barrier_write_leaves_complete_old_or_new_content() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.toml");
+    fs::write(&path, b"old-state")?;
+    let marker = directory.path().join("marker.txt");
+    let child = marker_child(&path, &marker, "before-replace");
+    let result = wait_for_marker(&marker, "before-replace");
+    if result.is_ok() {
+        terminate(child)?;
+    } else {
+        let _ = terminate(child);
+    }
+    result?;
+    assert_old_or_new(&path, b"old-state", b"new-state")?;
+    Ok(())
+}
+
+#[test]
+fn after_replace_barrier_can_be_terminated_with_complete_content() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("state.toml");
+    fs::write(&path, b"old-state")?;
+    let marker = directory.path().join("marker.txt");
+    let child = marker_child(&path, &marker, "after-replace");
+    let result = wait_for_marker(&marker, "after-replace");
+    if result.is_ok() {
+        terminate(child)?;
+    } else {
+        let _ = terminate(child);
+    }
+    result?;
+    assert_old_or_new(&path, b"old-state", b"new-state")?;
+    let removed = recover_stale_temporary_files(directory.path(), std::process::id(), 0)?;
+    assert_eq!(removed, 1);
+    assert_eq!(fs::read(&path)?, b"new-state");
+    Ok(())
+}
+
+fn marker_child(path: &Path, marker: &Path, point: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_spotter-atomic-helper"))
+        .args([
+            path.to_string_lossy().as_ref(),
+            marker.to_string_lossy().as_ref(),
+            point,
+        ])
+        .spawn()
+        .expect("atomic helper process must start")
+}
+
+fn wait_for_marker(marker: &Path, expected: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if fs::read_to_string(marker)
+            .map(|value| value.trim() == expected)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for atomic marker {expected}")
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn terminate(mut child: Child) -> Result<()> {
+    child.kill()?;
+    let _ = child.wait()?;
     Ok(())
 }

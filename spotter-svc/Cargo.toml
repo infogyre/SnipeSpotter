@@ -19,6 +19,11 @@ path = "src/lib.rs"
 name = "spotter-svc"
 path = "src/main.rs"
 
+[[bin]]
+name = "spotter-atomic-helper"
+path = "src/bin/spotter-atomic-helper.rs"
+required-features = ["test-support"]
+
 [dependencies]
 anyhow = { workspace = true }
 chrono = { workspace = true }

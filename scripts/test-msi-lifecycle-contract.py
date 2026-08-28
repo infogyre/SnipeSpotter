@@ -12,7 +12,13 @@ ROOT = Path(__file__).parent
 SCRIPT = (ROOT / "test-msi-lifecycle.ps1").read_text(encoding="utf-8")
 WAIT = (ROOT / "TestSupport" / "Wait.psm1").read_text(encoding="utf-8")
 DIAGNOSTICS = (ROOT / "TestSupport" / "Diagnostics.psm1").read_text(encoding="utf-8")
+SECURITY = (ROOT / "TestSupport" / "Security.psm1").read_text(encoding="utf-8")
+ACL = (ROOT / "TestSupport" / "Acl.psm1").read_text(encoding="utf-8")
 SERVICE = (ROOT.parent / "spotter-svc" / "src" / "service.rs").read_text(encoding="utf-8")
+ATOMIC_FILE = (ROOT.parent / "spotter-svc" / "src" / "atomic_file.rs").read_text(encoding="utf-8")
+WINDOWS_ACL = (ROOT.parent / "spotter-svc" / "src" / "windows_acl.rs").read_text(encoding="utf-8") if (ROOT.parent / "spotter-svc" / "src" / "windows_acl.rs").is_file() else ""
+PRODUCT_WXS = (ROOT.parent / "installer" / "Product.wxs").read_text(encoding="utf-8")
+DIRECT_SCM = (ROOT / "test-direct-scm-lifecycle.ps1").read_text(encoding="utf-8") if (ROOT / "test-direct-scm-lifecycle.ps1").is_file() else ""
 
 
 def _function_body(source: str, name: str) -> str:
@@ -31,6 +37,12 @@ def _function_text(source: str, name: str, next_name: str) -> str:
     return source[start:end]
 
 
+def _text_until(source: str, name: str, marker: str) -> str:
+    start = source.index(f"function {name}")
+    end = source.index(marker, start)
+    return source[start:end]
+
+
 def test_lifecycle_requires_sustained_running_service() -> None:
     assert "Running or Stopped" not in SCRIPT
     assert "Wait-ConditionStable" in SCRIPT
@@ -46,8 +58,8 @@ def test_lifecycle_imports_wait_helpers_after_scm_module() -> None:
 
 
 def test_service_enters_runtime_before_fsm_spawn() -> None:
-    runtime_creation = SERVICE.index("let runtime = tokio::runtime::Builder")
-    runtime_enter = SERVICE.index("let _runtime_guard = runtime.enter()")
+    runtime_creation = SERVICE.index("let tokio_runtime = tokio::runtime::Builder")
+    runtime_enter = SERVICE.index("let _runtime_guard = tokio_runtime.enter()")
     fsm_spawn = SERVICE.index("let fsm = crate::fsm::spawn")
     assert runtime_creation < runtime_enter < fsm_spawn
 
@@ -66,6 +78,136 @@ def test_lifecycle_checks_named_pipe_and_unconfigured_cli_status() -> None:
     assert "spotter-cli.exe" in SCRIPT
     assert "@('--json', 'status')" in SCRIPT
     assert "Unconfigured" in SCRIPT
+
+
+def test_lifecycle_uses_valid_test_path_types() -> None:
+    assert "Type = 'Leaf'" in SCRIPT
+    assert "Type = 'Container'" in SCRIPT
+    assert "Type = 'File'" not in SCRIPT
+    assert "Type = 'Directory'" not in SCRIPT
+    assert "-PathType $artifact.Type" in SCRIPT
+    assert not re.search(r"-PathType\s+(?:File|Directory)\b", SCRIPT)
+
+
+def test_lifecycle_starts_service_before_runtime_artifact_waits() -> None:
+    start = SCRIPT.index("Start-Service -Name $serviceName")
+    service_ready = SCRIPT.index("Wait-ServiceState -Name $serviceName", start)
+    pipe_ready = SCRIPT.index("Wait-Condition -Description 'SnipeSpotter named pipe'", service_ready)
+    status_ready = SCRIPT.index("Wait-Condition -Description 'SnipeSpotter status response'", pipe_ready)
+    artifact_wait = SCRIPT.index("$runtimeArtifacts = @(")
+    assert start < service_ready < pipe_ready < status_ready < artifact_wait
+    assert "Wait-Condition -Description 'SnipeSpotter service registration'" in SCRIPT
+    assert "Wait-ConditionStable" in SCRIPT
+
+
+def test_lifecycle_validates_acl_before_optional_repair() -> None:
+    artifact_wait = SCRIPT.index("$runtimeArtifacts = @(")
+    validation = SCRIPT.index("Assert-AclContract -Path $dataRoot", artifact_wait)
+    repair = SCRIPT.index("Ensure-AclContract -Path $dataRoot")
+    assert artifact_wait < validation < repair
+    assert "Ensure-AclContract" not in SCRIPT[artifact_wait:validation]
+
+
+def test_lifecycle_asserts_child_probe_result_not_parent_token() -> None:
+    probe = SCRIPT.index("Assert-StandardUserCannotReadWrite")
+    child_assertion = SCRIPT.index("Assert-ChildIsStandardUser -Result", probe)
+    artifact_loop = SCRIPT.index("foreach ($artifact in $runtimeArtifacts)", probe)
+    assert child_assertion < artifact_loop
+    assert "Get-TokenProof" not in SCRIPT[probe:child_assertion]
+
+
+def test_standard_user_helper_returns_the_child_probe_result_once() -> None:
+    helper = _function_body(SECURITY, "Assert-StandardUserCannotReadWrite")
+    assert "Assert-ChildIsStandardUser -Result $result" in helper
+    assert "[void](Assert-ChildIsStandardUser -Result $result)" in helper
+    assert helper.count("Assert-ChildIsStandardUser -Result $result") == 2
+    assert "return $result" in helper
+    assert "Invoke-AsStandardUser" in helper
+    assert "Get-TokenProof" not in helper
+
+
+def test_child_probe_proves_unprivileged_token_and_denied_access() -> None:
+    helper = _function_body(SECURITY, "Assert-StandardUserCannotReadWrite")
+    for field in (
+        "child_is_administrator=$isAdministrator",
+        "child_is_system=$isSystem",
+        "child_is_standard_user=$(-not $isSystem -and -not $isAdministrator)",
+        "read_denied=$readDenied",
+        "write_denied=$writeDenied",
+    ):
+        assert field in helper
+    assert "if (-not $readDenied -or -not $writeDenied)" in helper
+    assert "exit 20" in helper
+    assert "exit 21" in helper
+
+
+def test_product_and_atomic_writer_apply_the_same_protected_acl_contract() -> None:
+    assert 'User="SYSTEM" GenericAll="yes" Inheritable="no"' in PRODUCT_WXS
+    assert 'User="Administrators" GenericAll="yes" Inheritable="no"' in PRODUCT_WXS
+    assert "Sddl=" not in PRODUCT_WXS
+    assert "User=\"Everyone\"" not in PRODUCT_WXS
+    assert "User=\"Users\"" not in PRODUCT_WXS
+    assert "SetAccessRuleProtection" not in SCRIPT
+    assert "apply_runtime_acl_contract(&root)" in SERVICE
+    assert "apply_acl_contract(&temporary)" in ATOMIC_FILE
+    assert "apply_acl_contract(path)" in ATOMIC_FILE
+    assert 'pub const DATA_ACL_SDDL: &str = "D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)";' in WINDOWS_ACL
+    assert "SetNamedSecurityInfoW" in WINDOWS_ACL
+    assert "DACL_SECURITY_INFORMATION" in WINDOWS_ACL
+    assert "PROTECTED_DACL_SECURITY_INFORMATION" in WINDOWS_ACL
+
+
+def test_startup_repairs_existing_runtime_artifact_acls_before_access() -> None:
+    helper = SERVICE[SERVICE.index("fn apply_runtime_acl_contract"):SERVICE.index("fn service_main")]
+    startup = SERVICE[SERVICE.index("fn run_service"):]
+    assert "apply_runtime_acl_contract(&root)" in startup
+    assert startup.index("apply_runtime_acl_contract(&root)") < startup.index('root.join("settings.toml")')
+    for artifact in (
+        'root.join("settings.toml")',
+        'root.join("state.toml")',
+        'root.join("state-hmac-key.bin")',
+        'root.join("operations.jsonl")',
+        'root.join("logs")',
+    ):
+        assert artifact in helper
+    assert "fs::read_dir(&logs_dir)" in helper
+    assert "SERVICE_LOG_PREFIX" in helper
+    assert "starts_with(crate::logging::SERVICE_LOG_PREFIX)" in helper
+    assert "file_type" in helper
+    assert 'root.join("logs").join("spotter-svc.log")' not in helper
+
+
+def test_lifecycle_discovers_actual_rolling_log_artifacts() -> None:
+    log_directory = "Join-Path $dataRoot 'logs'"
+    assert f"Get-ChildItem -LiteralPath ({log_directory}) -Filter 'spotter-svc.log*' -File" in SCRIPT
+    assert "$logFiles = @(" in SCRIPT
+    assert "Wait-Condition -Description 'service rolling log file'" in SCRIPT
+    assert "Path = $_.FullName" in SCRIPT
+    assert "Join-Path $dataRoot 'logs\\spotter-svc.log'" not in SCRIPT
+
+
+def test_preserved_settings_file_has_direct_wix_acl_entries() -> None:
+    settings_start = PRODUCT_WXS.index('<File Id="SettingsTemplate"')
+    settings_end = PRODUCT_WXS.index("</File>", settings_start) + len("</File>")
+    settings_file = PRODUCT_WXS[settings_start:settings_end]
+    assert '<util:PermissionEx User="SYSTEM" GenericAll="yes" Inheritable="no" />' in settings_file
+    assert '<util:PermissionEx User="Administrators" GenericAll="yes" Inheritable="no" />' in settings_file
+
+
+def test_acl_helper_validates_before_repair_and_uses_real_acl_contract() -> None:
+    assert "function Assert-AclContract" in ACL
+    assert "function Ensure-AclContract" in ACL
+    validation = ACL.index("function Assert-AclContract")
+    repair = ACL.index("function Ensure-AclContract")
+    assert validation < repair
+    assert "Get-AclContract -Path $Path" in ACL
+    assert "Set-Acl -LiteralPath $Path -AclObject $acl" in ACL
+
+
+def test_atomic_windows_contract_applies_acl_to_temporary_and_replaced_files() -> None:
+    assert "#[cfg(all(windows, feature = \"test-support\"))]" in ATOMIC_FILE
+    assert "apply_acl_contract(&temporary)" in ATOMIC_FILE
+    assert "apply_acl_contract(path)" in ATOMIC_FILE
 
 
 def test_lifecycle_uses_shared_support_modules() -> None:
@@ -173,7 +315,8 @@ def test_service_log_capture_preserves_primary_error_on_setup_failure() -> None:
     helper = _function_text(SCRIPT, "Save-ServiceLogDiagnostic", "Get-MachinePathEntry")
     invocation = "Save-ServiceLogDiagnostic -DataRoot $dataRoot -Destination $LogDirectory"
     assert invocation in SCRIPT
-    assert "try {\n        Save-ServiceLogDiagnostic" in SCRIPT
+    observed_acl = SCRIPT.index("[void](Assert-AclContract -Path $dataRoot)")
+    assert observed_acl < SCRIPT.index(invocation)
     assert "Write-Warning \"service log capture failed:" in SCRIPT
     assert helper.count("try {") >= 2
     assert helper.count("catch {") >= 2
@@ -272,11 +415,110 @@ def test_elevated_source_artifact_contains_complete_msi_stage() -> None:
     assert "expectedStageFiles" in build
 
 
+def test_direct_scm_lifecycle_contract_is_separate_and_condition_based() -> None:
+    assert DIRECT_SCM, "missing direct SCM lifecycle script"
+    for required in (
+        "test-support",
+        "ServiceInstall",
+        "Start-Service",
+        "Get-CimInstance Win32_Service",
+        "already installed",
+        "not installed",
+        "Assert-ServiceRunsAsSystem",
+        "Wait-ServiceState",
+        "Wait-ServiceRemoved",
+        "Get-NormalizedAcl",
+        "Invoke-FailureSafeCleanup",
+    ):
+        assert required in DIRECT_SCM, f"direct SCM script missing {required!r}"
+    assert "Start-Sleep -Seconds 5" not in DIRECT_SCM
+    assert "test-support CLI arguments" in DIRECT_SCM
+    assert "SnipeSpotterDirect-" in DIRECT_SCM
+    assert "SnipeSpotter\\\"" not in DIRECT_SCM
+    workflow = (ROOT.parent / ".github" / "workflows" / "elevated-windows.yml").read_text(encoding="utf-8")
+    assert "--features test-support" in workflow
+    assert "spotter-cli-test-support.exe" in workflow
+    assert "direct-scm" in workflow
+    assert "packaged/spotter-cli.exe" not in workflow[workflow.index("- name: Validate direct CLI SCM lifecycle") : workflow.index("- name: Capture bounded lifecycle diagnostics")]
+
+
+def test_direct_scm_service_executable_is_staged_for_both_artifact_modes() -> None:
+    workflow = (ROOT.parent / ".github" / "workflows" / "elevated-windows.yml").read_text(encoding="utf-8")
+    source_build = workflow[workflow.index("- name: Build source MSI") : workflow.index("- name: Validate MSI lifecycle")]
+    direct_stage = workflow[workflow.index("- name: Stage direct SCM service executable") : workflow.index("- name: Build direct SCM test-support CLI")]
+    direct_validation = workflow[workflow.index("- name: Validate direct CLI SCM lifecycle") : workflow.index("- name: Capture bounded lifecycle diagnostics")]
+
+    assert "spotter-svc.exe" in source_build
+    assert "Copy-Item" in source_build
+    assert "Test-Path -LiteralPath $serviceSource -PathType Leaf" in direct_stage
+    assert "Expand-Archive" in direct_stage
+    assert "*-symbols.zip" in direct_stage
+    assert "[int64](Get-Item -LiteralPath $serviceSource -Force).Length -le 0" in direct_stage
+    assert "Test-Path -LiteralPath $servicePath -PathType Leaf" in direct_stage
+    assert "[int64](Get-Item -LiteralPath $servicePath -Force).Length -le 0" in direct_stage
+    assert "$servicePath = Join-Path (Resolve-Path -LiteralPath packaged).Path 'spotter-svc.exe'" in direct_validation
+
+
+def test_direct_scm_process_timeout_covers_two_registrar_waits() -> None:
+    assert "[ValidateRange(185, 1200)]" in DIRECT_SCM
+    assert "[int]$ProcessTimeoutSeconds = 185" in DIRECT_SCM
+    assert "$MinimumProcessTimeoutSeconds = ($RegistrarWaitTimeoutSeconds * 2) + 5" in DIRECT_SCM
+    assert "$ProcessTimeoutSeconds -ge $MinimumProcessTimeoutSeconds" in DIRECT_SCM
+    assert "ProcessTimeoutSeconds" in DIRECT_SCM
+    workflow = (ROOT.parent / ".github" / "workflows" / "elevated-windows.yml").read_text(encoding="utf-8")
+    assert "-ProcessTimeoutSeconds" not in workflow
+
+
+def test_direct_scm_probes_standard_user_after_runtime_artifacts_and_cleans_up() -> None:
+    import_position = DIRECT_SCM.index("Import-Module (Join-Path $testSupportRoot 'Security.psm1')")
+    start_position = DIRECT_SCM.index("Start-Service -Name $serviceName")
+    artifacts_position = DIRECT_SCM.index("$runtimeArtifacts = @(")
+    user_position = DIRECT_SCM.index("New-TemporaryStandardUser", artifacts_position)
+    denial_position = DIRECT_SCM.index("Assert-StandardUserCannotReadWrite", user_position)
+    cleanup_position = DIRECT_SCM.index("Remove-TemporaryStandardUser -User $standardUser", denial_position)
+    assert import_position < start_position < artifacts_position < user_position < denial_position
+    assert "Assert-ChildIsStandardUser -Result $probeResult" in DIRECT_SCM
+    assert cleanup_position > denial_position
+    assert "finally" in DIRECT_SCM[ user_position : cleanup_position + 120 ]
+    assert "Get-TokenProof" not in DIRECT_SCM[user_position:]
+
+
+def test_direct_scm_standard_user_name_fits_security_helper_contract() -> None:
+    match = re.search(r'New-TemporaryStandardUser -Name \(\"([^\"]+)\"', DIRECT_SCM)
+    assert match, "direct SCM script must generate a temporary standard-user name"
+    assert len(match.group(1)) + 5 <= 20
+
+
+def test_msi_acl_replacement_uses_installed_atomic_config_writer_and_exact_cli_contract() -> None:
+    assert "Add-Content -LiteralPath $settingsPath -Value \"`n$replacementMarker\"" not in SCRIPT
+    update = "Invoke-InstalledCli -Arguments @('config', 'set', 'polling.interval_hours', $replacementInterval)"
+    assert update in SCRIPT
+    assert "Assert-InstalledCliContract" in SCRIPT
+    assert "ExpectedStdout 'updated polling.interval_hours'" in SCRIPT
+    assert "ExpectedStderr ''" in SCRIPT
+    assert "Wait-Condition -Description 'settings committed by CLI'" in SCRIPT
+    assert "Compare-Object $artifactAclBefore[$settingsPath] $candidate" in SCRIPT
+    update_position = SCRIPT.index(update)
+    committed_position = SCRIPT.index("settings committed by CLI", update_position)
+    denial_position = SCRIPT.index("Assert-StandardUserCannotReadWrite", committed_position)
+    assert update_position < committed_position < denial_position
+    assert "lifecycle-preservation-marker" in SCRIPT
+    assert SCRIPT.index("lifecycle-preservation-marker") < update_position
+
+
 def main() -> None:
     test_lifecycle_requires_sustained_running_service()
     test_lifecycle_imports_wait_helpers_after_scm_module()
     test_service_enters_runtime_before_fsm_spawn()
     test_lifecycle_checks_named_pipe_and_unconfigured_cli_status()
+    test_lifecycle_uses_valid_test_path_types()
+    test_lifecycle_starts_service_before_runtime_artifact_waits()
+    test_lifecycle_validates_acl_before_optional_repair()
+    test_lifecycle_asserts_child_probe_result_not_parent_token()
+    test_product_and_atomic_writer_apply_the_same_protected_acl_contract()
+    test_startup_repairs_existing_runtime_artifact_acls_before_access()
+    test_preserved_settings_file_has_direct_wix_acl_entries()
+    test_atomic_windows_contract_applies_acl_to_temporary_and_replaced_files()
     test_lifecycle_uses_shared_support_modules()
     test_lifecycle_verifies_running_service_process_owner()
     test_lifecycle_attempts_post_uninstall_cleanup_after_uninstall_failure()
@@ -291,6 +533,12 @@ def main() -> None:
     test_elevated_source_artifact_producer_matches_packaged_consumer()
     test_ci_uses_reusable_elevated_result_or_successful_skip()
     test_elevated_source_artifact_contains_complete_msi_stage()
+    test_direct_scm_lifecycle_contract_is_separate_and_condition_based()
+    test_direct_scm_service_executable_is_staged_for_both_artifact_modes()
+    test_direct_scm_process_timeout_covers_two_registrar_waits()
+    test_direct_scm_probes_standard_user_after_runtime_artifacts_and_cleans_up()
+    test_direct_scm_standard_user_name_fits_security_helper_contract()
+    test_msi_acl_replacement_uses_installed_atomic_config_writer_and_exact_cli_contract()
     print("lifecycle contract: OK")
 
 

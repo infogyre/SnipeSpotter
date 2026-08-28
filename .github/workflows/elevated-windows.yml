@@ -120,6 +120,57 @@ jobs:
             throw "packaged MSI was not found: $msiPath"
           }
           ./scripts/test-msi-lifecycle.ps1 -MsiPath $msiPath
+      - name: Stage direct SCM service executable
+        shell: pwsh
+        env:
+          SOURCE_ARTIFACT: ${{ inputs.source_artifact }}
+          RUN_IDENTITY: ${{ inputs.run_identity }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packaged = (Resolve-Path -LiteralPath packaged).Path
+          $serviceSource = if ($env:SOURCE_ARTIFACT -eq 'true') {
+            Join-Path (Get-Location) 'target/x86_64-pc-windows-msvc/release/spotter-svc.exe'
+          } else {
+            $symbols = @(Get-ChildItem -LiteralPath $packaged -Filter '*-symbols.zip' -File)
+            if ($symbols.Count -ne 1) { throw "expected exactly one release symbols archive in $packaged" }
+            $extract = Join-Path $env:RUNNER_TEMP "snipespotter-direct-$env:RUN_IDENTITY-symbols"
+            if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force }
+            Expand-Archive -LiteralPath $symbols[0].FullName -DestinationPath $extract -Force
+            Join-Path $extract 'spotter-svc.exe'
+          }
+          if (-not (Test-Path -LiteralPath $serviceSource -PathType Leaf)) {
+            throw "direct SCM service executable was not staged: $serviceSource"
+          }
+          if ([int64](Get-Item -LiteralPath $serviceSource -Force).Length -le 0) {
+            throw "direct SCM service executable is empty: $serviceSource"
+          }
+          $servicePath = Join-Path $packaged 'spotter-svc.exe'
+          Copy-Item -LiteralPath $serviceSource -Destination $servicePath -Force
+          if (-not (Test-Path -LiteralPath $servicePath -PathType Leaf)) {
+            throw "direct SCM service executable copy is missing: $servicePath"
+          }
+          if ([int64](Get-Item -LiteralPath $servicePath -Force).Length -le 0) {
+            throw "direct SCM service executable copy is empty: $servicePath"
+          }
+      - name: Build direct SCM test-support CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build -p spotter-cli --features test-support --release --locked --target x86_64-pc-windows-msvc
+          $source = 'target/x86_64-pc-windows-msvc/release/spotter-cli.exe'
+          if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "test-support CLI was not built: $source" }
+          Copy-Item -LiteralPath $source -Destination (Join-Path (Resolve-Path -LiteralPath packaged).Path 'spotter-cli-test-support.exe')
+      - name: Validate direct CLI SCM lifecycle
+        id: direct_scm
+        shell: pwsh
+        env:
+          RUN_IDENTITY: ${{ inputs.run_identity }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cliPath = Join-Path (Resolve-Path -LiteralPath packaged).Path 'spotter-cli-test-support.exe'
+          $servicePath = Join-Path (Resolve-Path -LiteralPath packaged).Path 'spotter-svc.exe'
+          $directDataRoot = Join-Path $env:RUNNER_TEMP "snipespotter-direct-$env:RUN_IDENTITY-data"
+          ./scripts/test-direct-scm-lifecycle.ps1 -CliPath $cliPath -ServicePath $servicePath -RunIdentity $env:RUN_IDENTITY -DataRoot $directDataRoot -LogDirectory (Join-Path $env:RUNNER_TEMP 'snipespotter-msi-logs')
       - name: Capture bounded lifecycle diagnostics
         if: always()
         shell: pwsh
@@ -158,11 +209,15 @@ jobs:
         id: result
         if: always()
         env:
-          VALIDATE_OUTCOME: ${{ steps.validate.outcome }}
+          MSI_OUTCOME: ${{ steps.validate.outcome }}
+          DIRECT_SCM_OUTCOME: ${{ steps.direct_scm.outcome }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          "lifecycle_result=$env:VALIDATE_OUTCOME" | Set-Content -LiteralPath $env:GITHUB_OUTPUT
+          $msiPassed = $env:MSI_OUTCOME -eq 'success'
+          $directScmPassed = $env:DIRECT_SCM_OUTCOME -eq 'success'
+          $result = if ($msiPassed -and $directScmPassed) { 'success' } else { 'failure' }
+          "lifecycle_result=$result" | Set-Content -LiteralPath $env:GITHUB_OUTPUT
       - name: Upload MSI lifecycle logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

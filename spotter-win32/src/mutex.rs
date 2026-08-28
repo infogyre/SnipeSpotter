@@ -13,7 +13,7 @@ use windows::{
         Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE},
         System::Threading::{CreateMutexW, ReleaseMutex},
     },
-    core::w,
+    core::PCWSTR,
 };
 
 /// A successfully acquired process-wide mutex.
@@ -46,16 +46,27 @@ impl Drop for MutexGuard {
 /// Returns a distinct error when another process already owns the named mutex. Other failures
 /// include inability to create the mutex or a Windows API failure while querying the last error.
 pub fn try_acquire_global_mutex() -> Result<MutexGuard> {
-    // `MUTEX_NAME` is the shared identity value. Its UTF-16 equivalent is kept as a compile-time
-    // literal so no temporary Windows string allocation is required for this fixed name.
-    let name = if MUTEX_NAME == "Global\\SnipeSpotter" {
-        w!("Global\\SnipeSpotter")
-    } else {
-        bail!("unexpected SnipeSpotter mutex identity")
-    };
+    try_acquire_named_mutex(MUTEX_NAME)
+}
+
+/// Attempt to acquire a named global Windows mutex.
+///
+/// # Errors
+///
+/// Returns a distinct error when another process already owns the named mutex. Other failures
+/// include inability to create the mutex or a Windows API failure while querying the last error.
+pub fn try_acquire_named_mutex(name: &str) -> Result<MutexGuard> {
+    if name.is_empty() || name.contains('\0') {
+        bail!("mutex name must not be empty or contain NUL bytes")
+    }
+    let name = name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let name = PCWSTR::from_raw(name.as_ptr());
 
     // SAFETY: Passing no security attributes requests the default mutex security descriptor; the
-    // fixed nul-terminated name is valid for the duration of this call.
+    // UTF-16 buffer remains alive for the duration of this call.
     let handle = unsafe { CreateMutexW(None, true, name) }.context("failed to create mutex")?;
     let already_exists = {
         // SAFETY: GetLastError reads the thread-local result immediately after CreateMutexW.
@@ -89,5 +100,14 @@ mod tests {
         let reacquired = try_acquire_global_mutex()?;
         drop(reacquired);
         Ok(())
+    }
+
+    #[test]
+    fn isolated_mutex_names_are_supported() -> Result<()> {
+        let name = format!("Global\\SnipeSpotter-test-{}", std::process::id());
+        let first = try_acquire_named_mutex(&name)?;
+        assert!(try_acquire_named_mutex(&name).is_err());
+        drop(first);
+        try_acquire_named_mutex(&name).map(|_| ())
     }
 }

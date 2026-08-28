@@ -46,10 +46,13 @@
       </Component>
       <Component Directory="DataFolder" Id="SettingsComponent" Bitness="always64" NeverOverwrite="yes">
         <CreateFolder>
-          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
-          <util:PermissionEx User="Administrators" GenericAll="yes" />
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" Inheritable="no" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" Inheritable="no" />
         </CreateFolder>
-        <File Id="SettingsTemplate" Source="settings.toml" Name="settings.toml" KeyPath="yes" />
+        <File Id="SettingsTemplate" Source="settings.toml" Name="settings.toml" KeyPath="yes">
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" Inheritable="no" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" Inheritable="no" />
+        </File>
       </Component>
     </ComponentGroup>
   </Fragment>

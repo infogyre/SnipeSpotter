@@ -9,6 +9,9 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [lib]
 path = "src/lib.rs"
 

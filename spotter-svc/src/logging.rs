@@ -9,6 +9,8 @@ use spotter_core::config::LoggingSettings;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+pub(crate) const SERVICE_LOG_PREFIX: &str = "spotter-svc.log";
+
 /// Initialize daily rolling service logs and remove files beyond the configured retention count.
 ///
 /// The returned guard must remain alive for the process lifetime so buffered records are flushed.
@@ -25,7 +27,7 @@ pub fn initialize(log_dir: &Path, settings: &LoggingSettings) -> Result<WorkerGu
     prune_logs(log_dir, settings.max_files)?;
     let filter = EnvFilter::try_new(&settings.level)
         .with_context(|| format!("invalid logging level {}", settings.level))?;
-    let appender = tracing_appender::rolling::daily(log_dir, "spotter-svc.log");
+    let appender = tracing_appender::rolling::daily(log_dir, SERVICE_LOG_PREFIX);
     let (writer, guard) = tracing_appender::non_blocking(appender);
     tracing_subscriber::registry()
         .with(filter)
@@ -49,7 +51,7 @@ fn prune_logs(log_dir: &Path, max_files: u32) -> Result<()> {
             entry
                 .file_name()
                 .to_string_lossy()
-                .starts_with("spotter-svc.log")
+                .starts_with(SERVICE_LOG_PREFIX)
         })
         .filter_map(|entry| {
             let modified = entry.metadata().ok()?.modified().ok()?;

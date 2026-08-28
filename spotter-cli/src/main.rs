@@ -12,9 +12,19 @@ use spotter_cli::{
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let mut transport = NamedPipeTransport::default();
+    let mut transport = spotter_cli::transport_endpoint(&cli)
+        .map_or_else(NamedPipeTransport::default, |endpoint| {
+            NamedPipeTransport::with_endpoint(std::time::Duration::from_secs(30), endpoint)
+        });
     let mut tokens = ConsoleTokenReader;
-    let mut registrar = WindowsServiceRegistrar;
+    let registration = match spotter_cli::registration_options(&cli) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut registrar = WindowsServiceRegistrar::new(registration);
     let elevation = ProcessElevationChecker;
     let mut confirmation = ConsoleConfirmationReader;
 

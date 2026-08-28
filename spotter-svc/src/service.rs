@@ -2,16 +2,15 @@
 
 //! Windows Service Control Manager lifecycle and runtime orchestration.
 
-use std::{ffi::OsString, sync::mpsc, time::Duration};
+use std::{ffi::OsString, fs, path::Path, sync::mpsc, time::Duration};
 
 use crate::owner_ports::{
     Clock, HardwareDiscovery, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
 };
 use anyhow::{Context as _, Result};
 use spotter_core::{
-    SERVICE_NAME,
+    ServiceRuntimeOptions,
     config::config_status,
-    data_dir,
     ipc::{
         IpcResponse, ServiceCommand, apply_settings_update, redact_settings, validate_config_field,
     },
@@ -28,6 +27,43 @@ use windows_service::{
 };
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+
+fn runtime_options(arguments: &[OsString]) -> Result<ServiceRuntimeOptions> {
+    let arguments = arguments
+        .iter()
+        .map(|argument| {
+            argument
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("service launch argument is not valid UTF-8"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let arguments = arguments
+        .first()
+        .filter(|argument| !argument.starts_with("--"))
+        .map_or_else(|| arguments.as_slice(), |_| &arguments[1..]);
+    ServiceRuntimeOptions::from_arguments(arguments)
+        .map_err(|error| anyhow::anyhow!("invalid service runtime arguments: {error}"))
+}
+
+fn runtime_options_for_service_process(
+    process_arguments: &[OsString],
+    callback_arguments: &[OsString],
+) -> Result<ServiceRuntimeOptions> {
+    let runtime = runtime_options(process_arguments)?;
+    if let Some(callback_name) = callback_arguments
+        .first()
+        .and_then(|argument| argument.to_str())
+        && !callback_name.starts_with("--")
+        && callback_name != runtime.service_name
+    {
+        anyhow::bail!(
+            "service callback name {callback_name} does not match registered service {}",
+            runtime.service_name
+        )
+    }
+    Ok(runtime)
+}
 
 #[derive(Debug)]
 struct SavedCandidateError(anyhow::Error);
@@ -443,12 +479,89 @@ fn protocol_error(error: anyhow::Error) -> IpcResponse {
 ///
 /// Returns an error when the process was not launched by SCM or dispatcher registration fails.
 pub fn run_dispatcher() -> Result<()> {
-    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let runtime = runtime_options(&arguments)?;
+    run_dispatcher_with_runtime(&runtime)
+}
+
+/// Register the service dispatcher for an explicit runtime identity.
+///
+/// This entry point is intended for isolated integration-service registrations. The production
+/// executable calls [`run_dispatcher`], which retains the fixed product identity.
+///
+/// # Errors
+/// Returns an error when dispatcher registration fails.
+pub fn run_dispatcher_with_runtime(runtime: &ServiceRuntimeOptions) -> Result<()> {
+    service_dispatcher::start(&runtime.service_name, ffi_service_main)
         .context("failed to start Windows service dispatcher")
 }
 
-fn service_main(_arguments: Vec<OsString>) {
-    if let Err(error) = run_service() {
+fn apply_runtime_acl_contract(root: &Path) -> Result<()> {
+    for path in [
+        root.join("settings.toml"),
+        root.join("state.toml"),
+        root.join("state-hmac-key.bin"),
+        root.join("operations.jsonl"),
+        root.join("logs"),
+    ] {
+        apply_acl_if_present(&path)?;
+    }
+
+    let logs_dir = root.join("logs");
+    let entries = match fs::read_dir(&logs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect runtime log directory {}",
+                    logs_dir.display()
+                )
+            });
+        }
+    };
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to inspect runtime log directory {}",
+                logs_dir.display()
+            )
+        })?;
+        let file_type = entry.file_type().with_context(|| {
+            format!(
+                "failed to inspect runtime artifact {}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(crate::logging::SERVICE_LOG_PREFIX)
+        {
+            apply_acl_if_present(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_acl_if_present(path: &Path) -> Result<()> {
+    match fs::metadata(path) {
+        Ok(_) => crate::windows_acl::apply_acl_contract(path)
+            .with_context(|| format!("failed to apply protected data ACL to {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect runtime artifact {}", path.display())),
+    }
+}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "windows-service::define_windows_service! requires an owned Vec<OsString> callback"
+)]
+fn service_main(callback_arguments: Vec<OsString>) {
+    let process_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if let Err(error) = run_service(&process_arguments, &callback_arguments) {
         tracing::error!(%error, "service terminated with an error");
     }
 }
@@ -457,13 +570,19 @@ fn service_main(_arguments: Vec<OsString>) {
     clippy::too_many_lines,
     reason = "service startup with diagnostic tracing for elevated lane debugging"
 )]
-fn run_service() -> Result<()> {
-    tracing::info!("SnipeSpotter service starting");
-    let _instance = spotter_win32::mutex::try_acquire_global_mutex()
+fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) -> Result<()> {
+    let runtime = runtime_options_for_service_process(process_arguments, callback_arguments)?;
+    tracing::info!(service = %runtime.service_name, "SnipeSpotter service starting");
+    let _instance = spotter_win32::mutex::try_acquire_named_mutex(&runtime.mutex_name)
         .context("another SnipeSpotter service instance is already running")?;
     tracing::info!("acquired global mutex");
-    let root = data_dir();
+    let root = runtime.data_root.clone();
     tracing::info!(root = %root.display(), "using data directory");
+    crate::windows_acl::apply_acl_contract(&root).context("failed to apply protected data ACL")?;
+    apply_runtime_acl_contract(&root)?;
+    crate::atomic_file::recover_stale_temporary_files(&root, std::process::id(), 300).inspect_err(
+        |e| tracing::warn!(%e, root = %root.display(), "stale temporary-file recovery failed"),
+    )?;
     let settings_path = root.join("settings.toml");
     let settings = crate::config_io::load_settings(&settings_path).inspect_err(
         |e| tracing::error!(%e, path = %settings_path.display(), "failed to load settings"),
@@ -477,9 +596,10 @@ fn run_service() -> Result<()> {
     tracing::info!("persisted state loaded");
     let _log_guard = crate::logging::initialize(&root.join("logs"), &settings.logging)
         .inspect_err(|e| tracing::error!(%e, "failed to initialize logging"))?;
+    apply_runtime_acl_contract(&root)?;
     tracing::info!("logging initialized");
     let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
-    let status_handle = register_controls(shutdown_sender)
+    let status_handle = register_controls(&runtime.service_name, shutdown_sender)
         .inspect_err(|e| tracing::error!(%e, "failed to register controls"))?;
     tracing::info!("controls registered");
     set_status(
@@ -491,19 +611,19 @@ fn run_service() -> Result<()> {
     .inspect_err(|e| tracing::error!(%e, "failed to set StartPending"))?;
     tracing::info!("StartPending reported");
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to create service runtime")?;
     tracing::info!("runtime created");
-    let _runtime_guard = runtime.enter();
+    let _runtime_guard = tokio_runtime.enter();
     tracing::info!("runtime entered");
     let configured = config_status(&settings).is_empty();
     let state_path = root.join("state.toml");
     let journal_path = root.join("operations.jsonl");
     let mut persisted_state = persisted_state;
     if configured {
-        runtime.block_on(recover_operations(
+        tokio_runtime.block_on(recover_operations(
             &settings,
             &state_path,
             &journal_path,
@@ -556,10 +676,11 @@ fn run_service() -> Result<()> {
     set_status(&status_handle, ServiceState::Running, 0, Duration::ZERO)
         .inspect_err(|e| tracing::error!(%e, "failed to set Running"))?;
     tracing::info!("Running reported; entering main loop");
-    runtime.block_on(async move {
+    tokio_runtime.block_on(async move {
         let timer_fsm = fsm.clone();
         let timer = tokio::spawn(run_polling_timer(timer_fsm, polling_receiver));
-        let pipe = tokio::spawn(crate::ipc_server::run_named_pipe(fsm));
+        let pipe_endpoint = runtime.pipe_endpoint.clone();
+        let pipe = tokio::spawn(crate::ipc_server::run_named_pipe_at(fsm, pipe_endpoint));
         tokio::task::spawn_blocking(move || shutdown_receiver.recv())
             .await
             .context("shutdown listener task failed")?
@@ -642,7 +763,10 @@ async fn recover_operations(
     recover_owner_state(journal_path, &state_store, &mut client, persisted_state).await
 }
 
-fn register_controls(sender: mpsc::SyncSender<()>) -> Result<ServiceStatusHandle> {
+fn register_controls(
+    service_name: &str,
+    sender: mpsc::SyncSender<()>,
+) -> Result<ServiceStatusHandle> {
     let handler = move |control| match control {
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         ServiceControl::Stop => {
@@ -651,7 +775,7 @@ fn register_controls(sender: mpsc::SyncSender<()>) -> Result<ServiceStatusHandle
         }
         _ => ServiceControlHandlerResult::NotImplemented,
     };
-    service_control_handler::register(SERVICE_NAME, handler)
+    service_control_handler::register(service_name, handler)
         .context("failed to register service control handler")
 }
 
@@ -739,6 +863,55 @@ mod tests {
                 .push(settings.clone());
             Ok(())
         }
+    }
+
+    #[test]
+    fn service_runtime_arguments_roundtrip_and_reject_invalid_values() -> Result<()> {
+        let runtime = ServiceRuntimeOptions::new(
+            "SnipeSpotter-test",
+            std::path::PathBuf::from(r"C:\Temp\SnipeSpotter-test"),
+            r"\\.\pipe\SnipeSpotter-test",
+            r"Global\SnipeSpotter-test",
+        )
+        .map_err(anyhow::Error::msg)?;
+        let arguments = runtime
+            .launch_arguments()
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(runtime_options(&arguments)?, runtime);
+        let mut prefixed = vec![OsString::from("SnipeSpotter-test")];
+        prefixed.extend(arguments.iter().cloned());
+        assert_eq!(runtime_options(&prefixed)?, runtime);
+        assert!(runtime_options(&[OsString::from("--data-root")]).is_err());
+        assert!(
+            runtime_options_for_service_process(&arguments, &[OsString::from("wrong-service")])
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn service_identity_comes_from_process_arguments_not_callback_prefix() -> Result<()> {
+        let runtime = ServiceRuntimeOptions::new(
+            "SnipeSpotter-test",
+            std::path::PathBuf::from(r"C:\Temp\SnipeSpotter-test"),
+            r"\\.\pipe\SnipeSpotter-test",
+            r"Global\SnipeSpotter-test",
+        )
+        .map_err(anyhow::Error::msg)?;
+        let process_arguments = runtime
+            .launch_arguments()
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        let callback_arguments = vec![OsString::from("SnipeSpotter-test")];
+
+        assert_eq!(
+            runtime_options_for_service_process(&process_arguments, &callback_arguments)?,
+            runtime
+        );
+        Ok(())
     }
 
     #[test]

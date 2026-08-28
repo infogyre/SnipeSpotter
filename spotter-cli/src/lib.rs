@@ -2,7 +2,9 @@
 
 //! Testable command-line shell for `SnipeSpotter`.
 
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
+#[cfg(windows)]
+use std::{thread, time::Instant};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -30,6 +32,21 @@ impl std::error::Error for ServiceUnavailable {}
 pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
+    #[cfg(feature = "test-support")]
+    #[arg(long, global = true, hide = true)]
+    pub test_service_name: Option<String>,
+    #[cfg(feature = "test-support")]
+    #[arg(long, global = true, hide = true)]
+    pub test_data_root: Option<PathBuf>,
+    #[cfg(feature = "test-support")]
+    #[arg(long, global = true, hide = true)]
+    pub test_pipe_endpoint: Option<String>,
+    #[cfg(feature = "test-support")]
+    #[arg(long, global = true, hide = true)]
+    pub test_mutex_name: Option<String>,
+    #[cfg(feature = "test-support")]
+    #[arg(long, global = true, hide = true)]
+    pub test_service_executable: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }
@@ -234,13 +251,21 @@ impl NamedPipeTransport {
     }
 
     /// Construct a transport for an explicit Windows named-pipe endpoint.
-    #[cfg(windows)]
     #[must_use]
+    #[cfg(windows)]
     pub fn with_endpoint(timeout: Duration, endpoint: impl Into<String>) -> Self {
         Self {
             timeout,
             endpoint: endpoint.into(),
         }
+    }
+
+    /// Construct a transport for an explicit endpoint on a non-Windows host.
+    #[must_use]
+    #[cfg(not(windows))]
+    pub fn with_endpoint(timeout: Duration, endpoint: impl Into<String>) -> Self {
+        let _ = endpoint.into();
+        Self::new(timeout)
     }
 }
 
@@ -395,8 +420,209 @@ impl ElevationChecker for ProcessElevationChecker {
     }
 }
 
+/// Configuration needed to register one isolated Windows service instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRegistrationOptions {
+    /// Runtime identity passed to the service executable.
+    pub runtime: spotter_core::identity::ServiceRuntimeOptions,
+    /// Executable registered with the Service Control Manager.
+    pub executable_path: PathBuf,
+}
+
+impl ServiceRegistrationOptions {
+    /// Construct registration options without performing filesystem or SCM I/O.
+    #[must_use]
+    pub fn new(
+        runtime: spotter_core::identity::ServiceRuntimeOptions,
+        executable_path: PathBuf,
+    ) -> Self {
+        Self {
+            runtime,
+            executable_path,
+        }
+    }
+
+    #[cfg(any(windows, feature = "test-support", test))]
+    fn validate(&self) -> Result<()> {
+        if self.executable_path.as_os_str().is_empty() {
+            bail!("service executable path must not be empty")
+        }
+        if self.runtime.service_name.trim().is_empty() {
+            bail!("service name must not be empty")
+        }
+        if self.runtime.data_root.as_os_str().is_empty() {
+            bail!("service data root must not be empty")
+        }
+        if self.runtime.pipe_endpoint.trim().is_empty() {
+            bail!("pipe endpoint must not be empty")
+        }
+        if !self.runtime.pipe_endpoint.starts_with(r"\\.\pipe\") {
+            bail!("pipe endpoint must use the Windows named-pipe namespace")
+        }
+        if self.runtime.mutex_name.trim().is_empty() {
+            bail!("mutex name must not be empty")
+        }
+        if self.runtime.service_name.contains('\0')
+            || self.runtime.pipe_endpoint.contains('\0')
+            || self.runtime.mutex_name.contains('\0')
+            || self.runtime.data_root.to_string_lossy().contains('\0')
+            || self.executable_path.to_string_lossy().contains('\0')
+        {
+            bail!("service registration values must not contain NUL bytes")
+        }
+        Ok(())
+    }
+
+    /// Return registration options for the fixed production service identity.
+    #[must_use]
+    pub fn production() -> Self {
+        let executable_path = std::env::current_exe().map_or_else(
+            |_| PathBuf::from("spotter-svc.exe"),
+            |path| path.with_file_name("spotter-svc.exe"),
+        );
+        Self::new(
+            spotter_core::identity::ServiceRuntimeOptions::production(),
+            executable_path,
+        )
+    }
+}
+
+/// Build the service registration identity selected by the parsed CLI.
+///
+/// The production build always returns the fixed product registration. Test-support builds require
+/// all isolated identity fields together, preventing a test service from accidentally sharing one of
+/// the production resources.
+///
+/// # Errors
+/// Returns an error when test-support overrides are incomplete or invalid.
+#[cfg(feature = "test-support")]
+pub fn registration_options(cli: &Cli) -> Result<ServiceRegistrationOptions> {
+    let values = (
+        cli.test_service_name.as_deref(),
+        cli.test_data_root.as_deref(),
+        cli.test_pipe_endpoint.as_deref(),
+        cli.test_mutex_name.as_deref(),
+        cli.test_service_executable.as_deref(),
+    );
+    if values.0.is_none()
+        && values.1.is_none()
+        && values.2.is_none()
+        && values.3.is_none()
+        && values.4.is_none()
+    {
+        return Ok(ServiceRegistrationOptions::production());
+    }
+    let (
+        Some(service_name),
+        Some(data_root),
+        Some(pipe_endpoint),
+        Some(mutex_name),
+        Some(executable),
+    ) = values
+    else {
+        bail!("test service registration requires every runtime option")
+    };
+    let runtime = spotter_core::identity::ServiceRuntimeOptions::new(
+        service_name,
+        data_root.to_path_buf(),
+        pipe_endpoint,
+        mutex_name,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid test service runtime options: {error}"))?;
+    let options = ServiceRegistrationOptions::new(runtime, executable.to_path_buf());
+    options.validate()?;
+    Ok(options)
+}
+
+#[cfg(feature = "test-support")]
+/// Return the explicit test-support pipe endpoint, when selected.
+#[must_use]
+pub fn transport_endpoint(cli: &Cli) -> Option<String> {
+    cli.test_pipe_endpoint.clone()
+}
+
+#[cfg(not(feature = "test-support"))]
+/// Return no endpoint override for the fixed production transport.
+#[must_use]
+pub const fn transport_endpoint(_cli: &Cli) -> Option<String> {
+    None
+}
+
+#[cfg(not(feature = "test-support"))]
+/// Return the fixed production registration identity.
+///
+/// # Errors
+/// This fallback never fails; the `Result` preserves the test-support API shape.
+pub fn registration_options(_cli: &Cli) -> Result<ServiceRegistrationOptions> {
+    Ok(ServiceRegistrationOptions::production())
+}
+
 /// Production Windows Service Control Manager adapter.
-pub struct WindowsServiceRegistrar;
+#[cfg(windows)]
+const SCM_WAIT_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(windows)]
+const SCM_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScmErrorClass {
+    Missing,
+    AlreadyExists,
+    AccessDenied,
+    MarkedForDelete,
+    Other,
+}
+
+#[cfg(any(windows, test))]
+fn classify_scm_error_code(code: Option<i32>) -> ScmErrorClass {
+    match code {
+        Some(5) => ScmErrorClass::AccessDenied,
+        Some(1060) => ScmErrorClass::Missing,
+        Some(1072) => ScmErrorClass::MarkedForDelete,
+        Some(1073) => ScmErrorClass::AlreadyExists,
+        _ => ScmErrorClass::Other,
+    }
+}
+
+#[cfg(windows)]
+fn classify_scm_error(error: &windows_service::Error) -> ScmErrorClass {
+    match error {
+        windows_service::Error::Winapi(io_error) => {
+            classify_scm_error_code(io_error.raw_os_error())
+        }
+        _ => ScmErrorClass::Other,
+    }
+}
+
+pub struct WindowsServiceRegistrar {
+    options: ServiceRegistrationOptions,
+}
+
+impl WindowsServiceRegistrar {
+    /// Construct a registrar for an explicit service identity and executable.
+    #[must_use]
+    pub fn new(options: ServiceRegistrationOptions) -> Self {
+        Self { options }
+    }
+
+    /// Construct a registrar using the fixed production service identity.
+    #[must_use]
+    pub fn production() -> Self {
+        Self::default()
+    }
+
+    /// Return the registration options used by this registrar.
+    #[must_use]
+    pub const fn options(&self) -> &ServiceRegistrationOptions {
+        &self.options
+    }
+}
+
+impl Default for WindowsServiceRegistrar {
+    fn default() -> Self {
+        Self::new(ServiceRegistrationOptions::production())
+    }
+}
 
 #[cfg(windows)]
 impl ServiceRegistrar for WindowsServiceRegistrar {
@@ -409,35 +635,74 @@ impl ServiceRegistrar for WindowsServiceRegistrar {
             service_manager::{ServiceManager, ServiceManagerAccess},
         };
 
+        self.options.validate()?;
+        if !self.options.executable_path.is_file() {
+            bail!(
+                "service executable not found: {}",
+                self.options.executable_path.display()
+            )
+        }
         let manager = ServiceManager::local_computer(
             None::<&str>,
             ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
         )
         .context("failed to connect to the Windows Service Control Manager")?;
-        let executable = std::env::current_exe()
-            .context("failed to locate spotter-cli executable")?
-            .with_file_name("spotter-svc.exe");
-        if !executable.is_file() {
-            bail!("service executable not found: {}", executable.display())
+        match manager.open_service(
+            &self.options.runtime.service_name,
+            ServiceAccess::QUERY_STATUS,
+        ) {
+            Ok(_) => bail!(
+                "service {} is already installed",
+                self.options.runtime.service_name
+            ),
+            Err(error) => match classify_scm_error(&error) {
+                ScmErrorClass::Missing => {}
+                ScmErrorClass::MarkedForDelete => bail!(
+                    "service {} is marked for deletion",
+                    self.options.runtime.service_name
+                ),
+                _ => {
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "failed to determine whether service {} is installed",
+                        self.options.runtime.service_name
+                    )));
+                }
+            },
         }
         let info = ServiceInfo {
-            name: OsString::from(spotter_core::SERVICE_NAME),
-            display_name: OsString::from(spotter_core::PRODUCT_NAME),
+            name: OsString::from(&self.options.runtime.service_name),
+            display_name: OsString::from(&self.options.runtime.service_name),
             service_type: ServiceType::OWN_PROCESS,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
-            executable_path: executable,
-            launch_arguments: Vec::new(),
+            executable_path: self.options.executable_path.clone(),
+            launch_arguments: self
+                .options
+                .runtime
+                .launch_arguments()
+                .into_iter()
+                .map(OsString::from)
+                .collect(),
             dependencies: Vec::new(),
             account_name: None,
             account_password: None,
         };
         let service = manager
             .create_service(&info, ServiceAccess::CHANGE_CONFIG)
-            .context("failed to install SnipeSpotter service")?;
+            .with_context(|| {
+                format!(
+                    "failed to install {} service",
+                    self.options.runtime.service_name
+                )
+            })?;
         service
             .set_description("Synchronizes local hardware inventory with Snipe-IT")
-            .context("failed to set SnipeSpotter service description")?;
+            .with_context(|| {
+                format!(
+                    "failed to set {} service description",
+                    self.options.runtime.service_name
+                )
+            })?;
         Ok(())
     }
 
@@ -451,24 +716,83 @@ impl ServiceRegistrar for WindowsServiceRegistrar {
             .context("failed to connect to the Windows Service Control Manager")?;
         let service = manager
             .open_service(
-                spotter_core::SERVICE_NAME,
+                &self.options.runtime.service_name,
                 ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
             )
-            .context("failed to open SnipeSpotter service")?;
+            .map_err(|error| match classify_scm_error(&error) {
+                ScmErrorClass::Missing => anyhow::anyhow!(
+                    "service {} is not installed",
+                    self.options.runtime.service_name
+                ),
+                _ => anyhow::Error::new(error).context(format!(
+                    "failed to open service {} for uninstall",
+                    self.options.runtime.service_name
+                )),
+            })?;
         if service
             .query_status()
-            .context("failed to query SnipeSpotter service")?
+            .context("failed to query service status")?
             .current_state
             != ServiceState::Stopped
         {
-            service
-                .stop()
-                .context("failed to stop SnipeSpotter service")?;
+            service.stop().context("failed to stop service")?;
+            wait_for_service_state(&service, ServiceState::Stopped)?;
         }
-        service
-            .delete()
-            .context("failed to remove SnipeSpotter service")?;
+        service.delete().context("failed to remove service")?;
+        drop(service);
+        wait_for_service_removed(&manager, &self.options.runtime.service_name)?;
         Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_service_state(
+    service: &windows_service::service::Service,
+    expected: windows_service::service::ServiceState,
+) -> Result<()> {
+    let deadline = Instant::now() + SCM_WAIT_TIMEOUT;
+    loop {
+        let status = service
+            .query_status()
+            .context("failed to query service status while waiting")?;
+        if status.current_state == expected {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("service did not reach {expected:?} before the timeout")
+        }
+        thread::sleep(SCM_POLL_INTERVAL);
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_service_removed(
+    manager: &windows_service::service_manager::ServiceManager,
+    service_name: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + SCM_WAIT_TIMEOUT;
+    loop {
+        match manager.open_service(
+            service_name,
+            windows_service::service::ServiceAccess::QUERY_STATUS,
+        ) {
+            Ok(_) if Instant::now() < deadline => thread::sleep(SCM_POLL_INTERVAL),
+            Ok(_) => bail!("service {service_name} remained registered after the timeout"),
+            Err(error) => match classify_scm_error(&error) {
+                ScmErrorClass::Missing => return Ok(()),
+                ScmErrorClass::MarkedForDelete if Instant::now() < deadline => {
+                    thread::sleep(SCM_POLL_INTERVAL);
+                }
+                ScmErrorClass::MarkedForDelete => {
+                    bail!("service {service_name} remained marked for deletion after the timeout")
+                }
+                _ => {
+                    return Err(anyhow::Error::new(error).context(format!(
+                        "failed to query service {service_name} while waiting for removal"
+                    )));
+                }
+            },
+        }
     }
 }
 
@@ -703,6 +1027,32 @@ mod tests {
         let error = anyhow::Error::new(ServiceUnavailable);
         assert_eq!(exit_code(&error), EXIT_SERVICE_UNAVAILABLE);
         assert_eq!(exit_code(&anyhow::anyhow!("other")), 1);
+    }
+
+    #[test]
+    fn scm_error_codes_have_distinct_lifecycle_classifications() {
+        assert_eq!(classify_scm_error_code(Some(1060)), ScmErrorClass::Missing);
+        assert_eq!(
+            classify_scm_error_code(Some(1073)),
+            ScmErrorClass::AlreadyExists
+        );
+        assert_eq!(
+            classify_scm_error_code(Some(5)),
+            ScmErrorClass::AccessDenied
+        );
+        assert_eq!(
+            classify_scm_error_code(Some(1072)),
+            ScmErrorClass::MarkedForDelete
+        );
+        assert_eq!(classify_scm_error_code(Some(1722)), ScmErrorClass::Other);
+        assert_eq!(classify_scm_error_code(None), ScmErrorClass::Other);
+    }
+
+    #[test]
+    fn service_registration_rejects_empty_executable_path() {
+        let runtime = spotter_core::ServiceRuntimeOptions::production();
+        let options = ServiceRegistrationOptions::new(runtime, PathBuf::new());
+        assert!(options.validate().is_err());
     }
 
     #[test]

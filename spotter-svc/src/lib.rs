@@ -130,6 +130,8 @@ pub mod test_support {
 pub mod snipeit_client;
 pub mod state_io;
 pub mod sync_engine;
+#[cfg(windows)]
+pub mod windows_acl;
 
 use spotter_core::{
     config::{Settings, config_status},
