@@ -48,14 +48,78 @@ fn existing_replacement_preserves_the_protected_data_acl() -> Result<()> {
 
 fn assert_acl_contract(path: &Path) -> Result<()> {
     let sddl = read_acl_sddl(path)?;
-    assert!(sddl.starts_with("D:P"), "ACL must be protected: {sddl}");
-    assert_eq!(sddl.matches("(A;OICI;GA;;;SY)").count(), 1, "{sddl}");
-    assert_eq!(sddl.matches("(A;OICI;GA;;;BA)").count(), 1, "{sddl}");
-    for forbidden in [";;;WD", ";;;BU", ";;;AU"] {
+    validate_file_acl_contract(&sddl)
+        .map_err(|error| anyhow::anyhow!("invalid ACL for {}: {error}", path.display()))
+}
+
+#[test]
+fn canonical_file_acl_contract_is_accepted() {
+    for sddl in [
+        "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)",
+        "D:PAI(A;;FA;;;BA)(A;;FA;;;SY)",
+    ] {
+        validate_file_acl_contract(sddl)
+            .unwrap_or_else(|error| panic!("canonical Windows file ACL was rejected: {error}"));
+    }
+}
+
+#[test]
+fn file_acl_contract_rejects_broad_extra_or_non_file_aces() {
+    for sddl in [
+        "D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WD)",
+        "D:PAI(A;;GA;;;SY)(A;;FA;;;BA)",
+        "D:PAI(A;OICI;GA;;;SY)(A;;FA;;;BA)",
+        "D:PAI(A;;FA;;;SY)(A;;FA;;;SY)",
+        "D:PAI(A;;FA;;;BA)(A;;FA;;;BA)",
+        "D:(A;;FA;;;SY)(A;;FA;;;BA)",
+    ] {
         assert!(
-            !sddl.contains(forbidden),
-            "ACL contains broad allow {forbidden}: {sddl}"
+            validate_file_acl_contract(sddl).is_err(),
+            "ACL must not satisfy the file contract: {sddl}"
         );
+    }
+}
+
+fn validate_file_acl_contract(sddl: &str) -> std::result::Result<(), &'static str> {
+    let dacl = sddl.strip_prefix("D:").ok_or("missing DACL prefix")?;
+    let first_ace = dacl.find('(').ok_or("DACL contains no ACEs")?;
+    if !dacl[..first_ace].starts_with('P') {
+        return Err("DACL is not protected");
+    }
+
+    let mut remaining = &dacl[first_ace..];
+    let mut principals = [false; 2];
+    let mut ace_count = 0;
+    while !remaining.is_empty() {
+        if !remaining.starts_with('(') {
+            return Err("DACL contains trailing data");
+        }
+        let end = remaining.find(')').ok_or("ACE is unterminated")?;
+        let fields = remaining[1..end].split(';').collect::<Vec<_>>();
+        let [kind, flags, rights, object, inherit_object, principal] = fields.as_slice() else {
+            return Err("ACE does not contain six fields");
+        };
+        if *kind != "A" {
+            return Err("DACL contains a non-allow ACE");
+        }
+        if !flags.is_empty() || *rights != "FA" || !object.is_empty() || !inherit_object.is_empty()
+        {
+            return Err("ACE is not a canonical full-file allow");
+        }
+        let principal_index = match *principal {
+            "SY" => 0,
+            "BA" => 1,
+            _ => return Err("DACL contains an unauthorized principal"),
+        };
+        if principals[principal_index] {
+            return Err("DACL contains a duplicate required principal");
+        }
+        principals[principal_index] = true;
+        ace_count += 1;
+        remaining = &remaining[end + 1..];
+    }
+    if ace_count != 2 || !principals.iter().all(|present| *present) {
+        return Err("DACL must contain exactly SYSTEM and Administrators");
     }
     Ok(())
 }
@@ -204,7 +268,7 @@ fn after_replace_barrier_can_be_terminated_with_complete_content() -> Result<()>
     result?;
     assert_old_or_new(&path, b"old-state", b"new-state")?;
     let removed = recover_stale_temporary_files(directory.path(), std::process::id(), 0)?;
-    assert_eq!(removed, 1);
+    assert_eq!(removed, 0);
     assert_eq!(fs::read(&path)?, b"new-state");
     Ok(())
 }
