@@ -117,7 +117,8 @@ function Get-CredentialLaunchDiagnostic {
         [Parameter(Mandatory = $true)][ValidateSet('file_name', 'use_shell_execute', 'redirect_standard_output', 'redirect_standard_error', 'username', 'domain', 'password', 'argument_list', 'process_start_info', 'process_start', 'unknown')][string]$FailedField,
         [Parameter(Mandatory = $true)][Diagnostics.ProcessStartInfo]$StartInfo,
         [Parameter(Mandatory = $true)][ValidateRange(0, 4096)][int]$ArgumentCount,
-        [Parameter(Mandatory = $true)][object]$ErrorRecord
+        [Parameter(Mandatory = $true)][object]$ErrorRecord,
+        [Parameter(Mandatory = $false)][object]$NativeProbe = 'probe_unavailable'
     )
 
     $nativeErrorCode = 0
@@ -169,11 +170,70 @@ function Get-CredentialLaunchDiagnostic {
         executable_class = $executableClass
         native_error_code = $nativeErrorCode
         hresult = $hresult
+        native_probe = $NativeProbe
     }
+    if ($LaunchStage -ne 'native_start') { [void]$diagnostic.Remove('native_probe') }
     $json = $diagnostic | ConvertTo-Json -Compress -Depth 3
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
     if ($bytes.Length -gt 8192) { throw 'credential launch diagnostics exceeded the bounded size' }
     return $json
+}
+
+function ConvertTo-CredentialLaunchProbeEvidence {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ProbeJson
+    )
+
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($ProbeJson)
+        if ($bytes.Length -gt 4096) { throw 'credential launch probe exceeded the bounded size' }
+        $records = @(ConvertFrom-Json -InputObject $ProbeJson -Depth 3 -ErrorAction Stop)
+        $expectedCases = @(
+            'short_null_application',
+            'long_null_application',
+            'short_explicit_application'
+        )
+        if ($records.Count -ne $expectedCases.Count) { throw 'credential launch probe record count was invalid' }
+        $normalized = @()
+        for ($index = 0; $index -lt $expectedCases.Count; $index++) {
+            $record = $records[$index]
+            $recordProperties = @($record.PSObject.Properties.Name | Sort-Object)
+            if (($recordProperties -join ',') -cne 'case,length_bucket,native_error,success') {
+                throw 'credential launch probe record schema was invalid'
+            }
+            if ($record.case -isnot [string] -or $record.length_bucket -isnot [string]) {
+                throw 'credential launch probe string fields were invalid'
+            }
+            if ($record.success -isnot [bool] -or $record.native_error -isnot [long]) {
+                throw 'credential launch probe numeric fields were invalid'
+            }
+            $nativeError = [int64]$record.native_error
+            if ($nativeError -lt 0 -or $nativeError -gt [int]::MaxValue) {
+                throw 'credential launch probe native error was outside the Int32 range'
+            }
+            if ([string]$record.case -cne $expectedCases[$index]) { throw 'credential launch probe case was invalid' }
+            if ([bool]$record.success -and $nativeError -ne 0) {
+                throw 'credential launch probe success record had an error'
+            }
+            if (-not [bool]$record.success -and $nativeError -eq 0) {
+                throw 'credential launch probe failure record lacked an error'
+            }
+            $expectedLengthBucket = if ($index -eq 1) { 'over_1024' } else { 'short' }
+            if ([string]$record.length_bucket -cne $expectedLengthBucket) {
+                throw 'credential launch probe length bucket was invalid'
+            }
+            $normalized += [ordered]@{
+                case = [string]$record.case
+                success = [bool]$record.success
+                native_error = [int]$nativeError
+                length_bucket = [string]$record.length_bucket
+            }
+        }
+        return (, $normalized)
+    } catch {
+        return 'probe_unavailable'
+    }
 }
 
 if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type])) {
@@ -519,12 +579,12 @@ function Invoke-AsStandardUser {
             if (-not $process.Start()) { throw 'process start returned false' }
         } catch {
             $nativeStartErrorRecord = $_
+            $nativeProbe = 'probe_unavailable'
             try {
-                Invoke-CredentialLaunchProbe -User $User
-            } catch {
-                $null = $_
-            }
-            $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $nativeStartErrorRecord
+                $probeJson = Invoke-CredentialLaunchProbe -User $User
+                $nativeProbe = ConvertTo-CredentialLaunchProbeEvidence -ProbeJson ([string]$probeJson)
+            } catch { $nativeProbe = 'probe_unavailable' }
+            $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $nativeStartErrorRecord -NativeProbe $nativeProbe
             throw "credentialed launch failed: $diagnostic"
         }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
