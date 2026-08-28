@@ -60,6 +60,35 @@ _CREDENTIAL_LAUNCH_DIAGNOSTIC_FORBIDDEN_FIELDS = (
     "exception_class",
     "message",
 )
+_CREDENTIAL_LAUNCH_PROBE_FIELDS = (
+    "case",
+    "success",
+    "native_error",
+    "length_bucket",
+)
+_CREDENTIAL_LAUNCH_PROBE_CASES = (
+    "short_null_application",
+    "long_null_application",
+    "short_explicit_application",
+)
+_CREDENTIAL_LAUNCH_PROBE_LENGTH_BUCKETS = (
+    "short",
+    "over_1024",
+)
+_CREDENTIAL_LAUNCH_PROBE_FORBIDDEN_FIELDS = (
+    "username",
+    "domain",
+    "password",
+    "path",
+    "file_path",
+    "command",
+    "command_line",
+    "payload",
+    "environment",
+    "exception",
+    "message",
+    "handle",
+)
 
 
 def read_module(name: str) -> str:
@@ -652,7 +681,7 @@ def test_credentialed_launch_diagnostic_schema_is_exact_and_bounded() -> None:
     module = read_module("Security.psm1")
     projection = module[
         module.index("function Get-CredentialLaunchDiagnostic") : module.index(
-            "function Invoke-AsStandardUser"
+            "if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type]))"
         )
     ]
     keys, values = _credential_launch_diagnostic_projection(projection)
@@ -685,7 +714,7 @@ def test_credentialed_launch_diagnostic_schema_rejects_privacy_mutations() -> No
     module = read_module("Security.psm1")
     projection = module[
         module.index("function Get-CredentialLaunchDiagnostic") : module.index(
-            "function Invoke-AsStandardUser"
+            "if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type]))"
         )
     ]
     mutation = projection.replace(
@@ -776,6 +805,481 @@ def test_credentialed_launch_classifies_configuration_and_native_failures() -> N
     assert invoke.index("$startInfo.UserName") < invoke.index("$process.StartInfo = $startInfo")
     assert invoke.index("$process.StartInfo = $startInfo") < invoke.index("$process.Start()")
     assert "CreateNoWindow" not in invoke
+
+
+def _credential_launch_probe_text(source: str) -> str:
+    return source[
+        source.index("function Invoke-CredentialLaunchProbe") : source.index(
+            "function Invoke-AsStandardUser"
+        )
+    ]
+
+
+def _credential_launch_probe_projection(
+    source: str,
+) -> tuple[tuple[str, ...], dict[str, str]]:
+    return _ordered_projection(_credential_launch_probe_text(source), "Invoke-CredentialLaunchProbe")
+
+
+def _assert_exact_credential_launch_probe_cases(probe: str) -> None:
+    expected = (
+        ("short_null_application", "$shortCommand", "$null"),
+        ("long_null_application", "$longCommand", "$null"),
+        ("short_explicit_application", "$explicitCommand", "$commandExecutable"),
+    )
+    case_block_start = probe.index("$cases = @(")
+    case_block_end = probe.index("\n    )", case_block_start)
+    case_block = probe[case_block_start:case_block_end]
+    actual = tuple(
+        re.findall(
+            r"Case = '([^']+)'\s*;\s*Command = (\$[A-Za-z_]\w*)\s*;\s*"
+            r"ApplicationName = (\$null|\$[A-Za-z_]\w*)",
+            case_block,
+        )
+    )
+    assert actual == expected
+    assert "$longCommand = $shortCommand + ('x' * 1100)" in probe
+    assert "$lengthBucket = if ($command.Length -gt 1024)" in probe
+
+
+def _assert_native_start_catch_saves_original_error(source: str) -> None:
+    catch_start, catch_end = _credential_launch_catch_spans(source)[2]
+    catch = source[catch_start:catch_end]
+    assert re.search(
+        r"catch\s*\{\s*\$nativeStartErrorRecord\s*=\s*\$_\s*"
+        r"try\s*\{",
+        catch,
+    )
+    assert catch.count("$nativeStartErrorRecord = $_") == 1
+    assert catch.count("-ErrorRecord $nativeStartErrorRecord") == 1
+    assert "-ErrorRecord $_" not in catch
+
+
+def test_credentialed_native_start_catch_saves_original_error_record() -> None:
+    module = read_module("Security.psm1")
+    _assert_native_start_catch_saves_original_error(module)
+
+
+def test_credentialed_native_start_error_mutations_are_rejected() -> None:
+    module = read_module("Security.psm1")
+    mutations = (
+        module.replace(
+            "$nativeStartErrorRecord = $_",
+            "$nativeStartErrorRecord = $replacementErrorRecord",
+            1,
+        ),
+        module.replace(
+            "-ErrorRecord $nativeStartErrorRecord",
+            "-ErrorRecord $_",
+            1,
+        ),
+        module.replace(
+            "$nativeStartErrorRecord = $_",
+            "$otherErrorRecord = $_",
+            1,
+        ).replace(
+            "-ErrorRecord $nativeStartErrorRecord",
+            "-ErrorRecord $otherErrorRecord",
+            1,
+        ),
+    )
+    for mutation in mutations:
+        try:
+            _assert_native_start_catch_saves_original_error(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError("native-start error-record mutation was accepted")
+
+
+def _assert_credential_launch_probe_wait_and_termination_contract(
+    module: str,
+) -> None:
+    probe = _credential_launch_probe_text(module)
+    for declaration in (
+        "public const uint WAIT_OBJECT_0 = 0x00000000;",
+        "public const uint WAIT_TIMEOUT = 0x00000102;",
+        "public const uint WAIT_FAILED = 0xffffffff;",
+        "public static extern bool TerminateProcess(",
+    ):
+        assert declaration in module, f"native wait contract is missing {declaration!r}"
+    assert probe.count("WaitForSingleObject(") == 2
+    assert (
+        "$waitResult = "
+        "[SnipeSpotter.CredentialLaunchNative]::WaitForSingleObject($processInfo.hProcess, 5000)"
+    ) in probe
+    assert (
+        "$terminationWaitResult = "
+        "[SnipeSpotter.CredentialLaunchNative]::WaitForSingleObject($processInfo.hProcess, 1000)"
+    ) in probe
+    for status in ("WAIT_OBJECT_0", "WAIT_TIMEOUT", "WAIT_FAILED"):
+        assert f"::${status}" not in probe
+        assert f"::{status}" in probe
+    assert (
+        "$terminateSucceeded = "
+        "[SnipeSpotter.CredentialLaunchNative]::TerminateProcess($processInfo.hProcess, 1)"
+    ) in probe
+    assert (
+        "$terminationWaitResult = "
+        "[SnipeSpotter.CredentialLaunchNative]::WaitForSingleObject($processInfo.hProcess, 1000)"
+    ) in probe
+    assert "$nativeError = [int]$waitResult" in probe
+    assert "$nativeError = [int]$terminationWaitResult" in probe
+    for branch in (
+        "if (-not $terminateSucceeded) {",
+        "} elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {",
+        "} elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {",
+    ):
+        branch_start = probe.index(branch)
+        branch_end = probe.index("throw ", branch_start)
+        branch_body = probe[branch_start:branch_end]
+        assert branch_body.count(
+            "$nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()"
+        ) == 1
+    assert probe.index("$waitResult =") < probe.index("WAIT_TIMEOUT")
+    assert probe.index("WAIT_TIMEOUT") < probe.index("TerminateProcess")
+    assert probe.index("TerminateProcess") < probe.index("$terminationWaitResult =")
+    assert probe.index("$terminationWaitResult =") < probe.index("$lengthBucket =")
+
+
+def test_credential_launch_probe_models_bounded_wait_and_termination() -> None:
+    module = read_module("Security.psm1")
+    _assert_credential_launch_probe_wait_and_termination_contract(module)
+
+
+def test_credential_launch_probe_wait_and_termination_mutations_are_rejected() -> None:
+    module = read_module("Security.psm1")
+    mutations = (
+        module.replace("WAIT_TIMEOUT", "WAIT_OBJECT_0", 1),
+        module.replace("TerminateProcess", "CloseHandle", 1),
+        module.replace("hProcess, 1", "hThread, 1", 1),
+        module.replace(
+            "} elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {\n"
+            "                        $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()",
+            "} elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {\n"
+            "                        $nativeError = 1",
+            1,
+        ),
+        module.replace(
+            "hProcess, 1000)",
+            "hProcess, 0)",
+            1,
+        ),
+    )
+    for mutation in mutations:
+        try:
+            _assert_credential_launch_probe_wait_and_termination_contract(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError("native wait or termination mutation was accepted")
+
+
+def _assert_credential_launch_probe_cleanup_contract(probe: str) -> None:
+    case_start = probe.index("foreach ($case in $cases)")
+    case_end = probe.index("$lengthBucket =", case_start)
+    case_block = probe[case_start:case_end]
+    assert case_block.count("finally {") == 1
+    finally_start = case_block.index("finally {")
+    cleanup = case_block[finally_start:]
+    match = re.search(r"foreach \(\$handle in @\((?P<handles>.*?)\)\)", cleanup, re.DOTALL)
+    assert match is not None
+    handles = tuple(
+        re.findall(r"(?m)^\s*(\$[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?),?\s*$", match["handles"])
+    )
+    assert handles == (
+        "$hInputRead",
+        "$hInputWrite",
+        "$hOutputRead",
+        "$hOutputWrite",
+        "$hErrorRead",
+        "$hErrorWrite",
+        "$processInfo.hProcess",
+        "$processInfo.hThread",
+    )
+    assert cleanup.count("CloseHandle($handle)") == 1
+    assert cleanup.count("FreeHGlobal($commandPointer)") == 1
+    assert "ZeroFreeBSTR($passwordPointer)" not in cleanup
+    assert probe.count("CloseHandle($handle)") == 1
+    assert probe.count("FreeHGlobal($commandPointer)") == 1
+    outer_cleanup = probe[probe.index("} finally {", case_end) :]
+    assert "ZeroFreeBSTR($passwordPointer)" in outer_cleanup
+    assert "FreeHGlobal($commandPointer)" not in outer_cleanup
+
+
+def test_credential_launch_probe_has_exact_cleanup_scopes_and_handles() -> None:
+    module = read_module("Security.psm1")
+    _assert_credential_launch_probe_cleanup_contract(_credential_launch_probe_text(module))
+
+
+def test_credential_launch_probe_cleanup_mutations_are_rejected() -> None:
+    module = read_module("Security.psm1")
+    probe = _credential_launch_probe_text(module)
+    expected = (
+        "$hInputRead",
+        "$hInputWrite",
+        "$hOutputRead",
+        "$hOutputWrite",
+        "$hErrorRead",
+        "$hErrorWrite",
+        "$processInfo.hProcess",
+        "$processInfo.hThread",
+    )
+    mutations = (
+        probe.replace("                    $hErrorWrite,\n", "", 1),
+        probe.replace("                    $processInfo.hProcess,\n", "                    $processInfo.hThread,\n", 1),
+        probe.replace("                    $hInputRead,\n", "                    $extraHandle,\n                    $hInputRead,\n", 1),
+        probe.replace(
+            "ZeroFreeBSTR($passwordPointer)",
+            "FreeHGlobal($passwordPointer)",
+            1,
+        ),
+    )
+    assert expected[-1] in probe
+    for mutation in mutations:
+        try:
+            _assert_credential_launch_probe_cleanup_contract(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError("native probe cleanup mutation was accepted")
+
+
+_CREDENTIAL_LAUNCH_PROBE_OUTPUT_CHANNEL_RE = re.compile(
+    r"(?i)\bWrite-(?:Output|Host|Verbose|Debug|Information|Warning|Error)\b"
+    r"|\[Console\]\s*::"
+)
+
+
+def _assert_credential_launch_probe_privacy_contract(probe: str) -> None:
+    assert not _CREDENTIAL_LAUNCH_PROBE_OUTPUT_CHANNEL_RE.search(probe)
+    assert probe.count("return $json") == 1
+    bounded_check = probe.index("if ($bytes.Length -gt 4096)")
+    assert bounded_check < probe.index("return $json")
+    assert probe.rstrip().endswith("return $json\n}")
+
+
+def test_credential_launch_probe_rejects_all_alternate_output_channels() -> None:
+    module = read_module("Security.psm1")
+    probe = _credential_launch_probe_text(module)
+    _assert_credential_launch_probe_privacy_contract(probe)
+    for command in (
+        "Write-Output",
+        "Write-Host",
+        "Write-Verbose",
+        "Write-Debug",
+        "Write-Information",
+        "Write-Warning",
+        "Write-Error",
+        "[Console]::WriteLine",
+        "[Console]::Error.WriteLine",
+    ):
+        mutation = probe.replace(
+            "            $records += [ordered]@{",
+            f"            {command} $User.Name\n            $records += [ordered]@{{",
+            1,
+        )
+        try:
+            _assert_credential_launch_probe_privacy_contract(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError(f"credential probe output-channel mutation was accepted: {command}")
+
+
+def test_credential_launch_probe_rejects_sensitive_console_mutations() -> None:
+    module = read_module("Security.psm1")
+    probe = _credential_launch_probe_text(module)
+    for command in ("Write-Output", "[Console]::WriteLine"):
+        mutation = probe.replace(
+            "            $records += [ordered]@{",
+            f"            {command} $User.Password\n            $records += [ordered]@{{",
+            1,
+        )
+        try:
+            _assert_credential_launch_probe_privacy_contract(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError(f"sensitive probe output mutation was accepted: {command}")
+    inline_mutation = probe.replace(
+        "            $records += [ordered]@{",
+        "            $records += [ordered]@{}; Write-Output $User.Name\n"
+        "            $records += [ordered]@{",
+        1,
+    )
+    try:
+        _assert_credential_launch_probe_privacy_contract(inline_mutation)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("inline sensitive probe output mutation was accepted")
+
+
+def test_credential_launch_probe_has_exact_privacy_safe_schema() -> None:
+    module = read_module("Security.psm1")
+    probe = _credential_launch_probe_text(module)
+    keys, values = _credential_launch_probe_projection(module)
+    assert keys == _CREDENTIAL_LAUNCH_PROBE_FIELDS
+    assert values == {
+        "case": "$case.Case",
+        "success": "$success",
+        "native_error": "$nativeError",
+        "length_bucket": "$lengthBucket",
+    }
+    assert "ConvertTo-Json -Compress" in probe
+    assert "[Text.Encoding]::UTF8.GetBytes" in probe
+    assert "if ($bytes.Length -gt 4096)" in probe
+    assert "return $json" in probe
+    for forbidden in _CREDENTIAL_LAUNCH_PROBE_FORBIDDEN_FIELDS:
+        assert not re.search(rf"(?m)^\s*{re.escape(forbidden)}\s*=", probe)
+    assert "Exception.Message" not in probe
+    assert "Write-Output $User" not in probe
+    assert "Write-Output $command" not in probe
+
+
+def test_credential_launch_probe_schema_rejects_privacy_mutations() -> None:
+    module = read_module("Security.psm1")
+    probe = _credential_launch_probe_text(module)
+    for forbidden in _CREDENTIAL_LAUNCH_PROBE_FORBIDDEN_FIELDS:
+        mutation = probe.replace(
+            "            case = $case.Case\n",
+            f"            {forbidden} = 'forbidden'\n            case = $case.Case\n",
+            1,
+        )
+        try:
+            keys, _ = _credential_launch_probe_projection(mutation)
+            assert keys == _CREDENTIAL_LAUNCH_PROBE_FIELDS
+        except (AssertionError, ValueError):
+            continue
+        raise AssertionError(f"credential launch probe privacy mutation was accepted: {forbidden}")
+
+
+def test_credential_launch_probe_cases_are_exact_and_mutation_aware() -> None:
+    module = read_module("Security.psm1")
+    probe = _credential_launch_probe_text(module)
+    _assert_exact_credential_launch_probe_cases(probe)
+    mutations = (
+        probe.replace("long_null_application", "short_null_application", 1),
+        probe.replace("ApplicationName = $null", "ApplicationName = $commandExecutable", 1),
+        probe.replace("$command.Length -gt 1024", "$command.Length -gt 1023", 1),
+        probe.replace("$longCommand = $shortCommand + ('x' * 1100)", "$longCommand = $shortCommand", 1),
+    )
+    for mutation in mutations:
+        try:
+            _assert_exact_credential_launch_probe_cases(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError("credential launch probe case mutation was accepted")
+    assert "('x' * 1100)" in probe
+    assert "$lengthBucket = if ($command.Length -gt 1024)" in probe
+
+
+def test_credential_launch_probe_preserves_native_credential_and_handle_contract() -> None:
+    module = read_module("Security.psm1")
+    probe = _credential_launch_probe_text(module)
+    for required in (
+        "CreateProcessWithLogonW",
+        "CreatePipe",
+        "SetHandleInformation",
+        "STARTF_USESTDHANDLES",
+        "$User.Name",
+        "$User.Domain",
+        "$User.Password",
+        "$logonFlags = 0",
+        "$null",
+        "[IntPtr]::Zero",
+        "StringToHGlobalUni",
+        "ZeroFreeBSTR",
+        "FreeHGlobal",
+        "CloseHandle",
+        "hStdOutput",
+        "hStdError",
+        "hStdInput",
+        "$bInheritHandles = $true",
+        "finally",
+    ):
+        assert required in probe, f"native probe is missing {required!r}"
+    assert "CREATE_NO_WINDOW" not in probe
+    assert "dwCreationFlags = 0" in probe
+    assert "$bInheritHandles = $true" in probe
+    assert "$lpEnvironment = [IntPtr]::Zero" in probe
+    assert "$lpCurrentDirectory = $null" in probe
+    assert probe.index("$passwordPointer =") < probe.index("foreach ($case in $cases)")
+    assert probe.index("ZeroFreeBSTR") > probe.index("foreach ($case in $cases)")
+    assert probe.count("CloseHandle") == 1
+    assert probe.count("CreateProcessWithLogonW") == 1
+    assert module.count("CreateProcessWithLogonW") == 2
+    assert "public static extern bool CreateProcessWithLogonW" in module
+    assert "::CreateProcessWithLogonW" in probe
+
+
+def _assert_exact_credential_launch_probe_native_contract(probe: str) -> None:
+    required = (
+        "$logonFlags = 0",
+        "$dwCreationFlags = 0",
+        "$lpEnvironment = [IntPtr]::Zero",
+        "$lpCurrentDirectory = $null",
+        "$bInheritHandles = $true",
+        "[Runtime.InteropServices.Marshal]::StringToHGlobalUni($command)",
+        "[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)",
+        "[Runtime.InteropServices.Marshal]::FreeHGlobal($commandPointer)",
+        "[SnipeSpotter.CredentialLaunchNative]::CloseHandle($handle)",
+    )
+    for required_text in required:
+        assert required_text in probe, f"native probe contract is missing {required_text!r}"
+    assert "CREATE_NO_WINDOW" not in probe
+    assert "[ref]$startupInfo" in probe
+    assert "[ref]$processInfo" in probe
+    assert "[Runtime.InteropServices.Marshal]::GetLastWin32Error()" in probe
+    assert "WaitForSingleObject($processInfo.hProcess, 5000)" in probe
+    assert all(
+        variable in probe
+        for variable in (
+            "$hInputRead",
+            "$hInputWrite",
+            "$hOutputRead",
+            "$hOutputWrite",
+            "$hErrorRead",
+            "$hErrorWrite",
+            "$processInfo.hProcess",
+            "$processInfo.hThread",
+        )
+    )
+
+
+def test_credential_launch_probe_native_contract_mutations_are_rejected() -> None:
+    module = read_module("Security.psm1")
+    probe = _credential_launch_probe_text(module)
+    _assert_exact_credential_launch_probe_native_contract(probe)
+    required_pairs = (
+        ("$logonFlags = 0", "$logonFlags = 2"),
+        ("$dwCreationFlags = 0", "$dwCreationFlags = 16"),
+        ("$lpEnvironment = [IntPtr]::Zero", "$lpEnvironment = $environment"),
+        ("$lpCurrentDirectory = $null", "$lpCurrentDirectory = $workingDirectory"),
+        ("ZeroFreeBSTR($passwordPointer)", "FreeBSTR($passwordPointer)"),
+        ("StringToHGlobalUni($command)", "StringToCoTaskMemUni($command)"),
+    )
+    for expected, replacement in required_pairs:
+        mutation = probe.replace(expected, replacement, 1)
+        assert expected in probe
+        assert replacement in mutation
+        try:
+            _assert_exact_credential_launch_probe_native_contract(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError(f"credential launch native contract mutation was accepted: {expected}")
+
+
+def test_credential_launch_probe_runs_only_at_native_start_failure_boundary() -> None:
+    module = read_module("Security.psm1")
+    spans = _credential_launch_catch_spans(module)
+    assert len(spans) == 3
+    catches = tuple(module[start:end] for start, end in spans)
+    assert catches[2].count("Invoke-CredentialLaunchProbe -User $User") == 1
+    assert "Invoke-CredentialLaunchProbe" not in catches[0]
+    assert "Invoke-CredentialLaunchProbe" not in catches[1]
+    invoke_start = module.index("function Invoke-AsStandardUser")
+    invoke_end = module.index("function Assert-StandardUserCannotReadWrite", invoke_start)
+    invoke = module[invoke_start:invoke_end]
+    assert invoke.count("Invoke-CredentialLaunchProbe") == 1
+    assert invoke.index("Invoke-CredentialLaunchProbe") > invoke.index("$process.Start()")
+    assert "Write-Output" not in catches[2]
 
 
 def test_diagnostics_are_allowlisted_and_size_bounded() -> None:
@@ -1034,6 +1538,20 @@ def main() -> None:
     test_credentialed_launch_catches_have_exact_failure_tuples()
     test_credentialed_launch_catch_tuple_mutations_are_rejected()
     test_credentialed_launch_classifies_configuration_and_native_failures()
+    test_credentialed_native_start_catch_saves_original_error_record()
+    test_credentialed_native_start_error_mutations_are_rejected()
+    test_credential_launch_probe_models_bounded_wait_and_termination()
+    test_credential_launch_probe_wait_and_termination_mutations_are_rejected()
+    test_credential_launch_probe_has_exact_cleanup_scopes_and_handles()
+    test_credential_launch_probe_cleanup_mutations_are_rejected()
+    test_credential_launch_probe_rejects_all_alternate_output_channels()
+    test_credential_launch_probe_rejects_sensitive_console_mutations()
+    test_credential_launch_probe_has_exact_privacy_safe_schema()
+    test_credential_launch_probe_schema_rejects_privacy_mutations()
+    test_credential_launch_probe_cases_are_exact_and_mutation_aware()
+    test_credential_launch_probe_preserves_native_credential_and_handle_contract()
+    test_credential_launch_probe_native_contract_mutations_are_rejected()
+    test_credential_launch_probe_runs_only_at_native_start_failure_boundary()
     test_diagnostics_are_allowlisted_and_size_bounded()
     test_cleanup_runs_every_action_and_reports_failures()
     test_cleanup_persists_bounded_failure_diagnostics()

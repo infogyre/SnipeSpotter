@@ -176,6 +176,293 @@ function Get-CredentialLaunchDiagnostic {
     return $json
 }
 
+if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace SnipeSpotter
+{
+    public static class CredentialLaunchNative
+    {
+        public const int STARTF_USESTDHANDLES = 0x00000100;
+        public const uint HANDLE_FLAG_INHERIT = 0x00000001;
+        public const uint WAIT_OBJECT_0 = 0x00000000;
+        public const uint WAIT_TIMEOUT = 0x00000102;
+        public const uint WAIT_FAILED = 0xffffffff;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SECURITY_ATTRIBUTES
+        {
+            public int nLength;
+            public IntPtr lpSecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)] public bool bInheritHandle;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct STARTUPINFO
+        {
+            public int cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public int dwX;
+            public int dwY;
+            public int dwXSize;
+            public int dwYSize;
+            public int dwXCountChars;
+            public int dwYCountChars;
+            public int dwFillAttribute;
+            public int dwFlags;
+            public short wShowWindow;
+            public short cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput;
+            public IntPtr hStdOutput;
+            public IntPtr hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public int dwProcessId;
+            public int dwThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CreatePipe(
+            out IntPtr hReadPipe,
+            out IntPtr hWritePipe,
+            ref SECURITY_ATTRIBUTES lpPipeAttributes,
+            int nSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetHandleInformation(
+            IntPtr hObject,
+            uint dwMask,
+            uint dwFlags);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CreateProcessWithLogonW(
+            string lpUsername,
+            string lpDomain,
+            IntPtr lpPassword,
+            uint dwLogonFlags,
+            string lpApplicationName,
+            IntPtr lpCommandLine,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFO lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+    }
+}
+'@
+}
+
+function Invoke-CredentialLaunchProbe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][psobject]$User
+    )
+
+    $commandExecutable = Join-Path $PSHOME 'pwsh.exe'
+    $shortCommand = "`"$commandExecutable`" -NoLogo -NoProfile -NonInteractive -Command `"exit 0`""
+    $longCommand = $shortCommand + ('x' * 1100)
+    $explicitCommand = $shortCommand
+    $cases = @(
+        [pscustomobject]@{ Case = 'short_null_application'; Command = $shortCommand; ApplicationName = $null }
+        [pscustomobject]@{ Case = 'long_null_application'; Command = $longCommand; ApplicationName = $null }
+        [pscustomobject]@{ Case = 'short_explicit_application'; Command = $explicitCommand; ApplicationName = $commandExecutable }
+    )
+
+    $logonFlags = 0
+    $dwCreationFlags = 0
+    $lpEnvironment = [IntPtr]::Zero
+    $lpCurrentDirectory = $null
+    $bInheritHandles = $true
+    $passwordPointer = [IntPtr]::Zero
+    $records = @()
+    try {
+        $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($User.Password)
+        foreach ($case in $cases) {
+            $command = $case.Command
+            $commandPointer = [IntPtr]::Zero
+            $hInputRead = [IntPtr]::Zero
+            $hInputWrite = [IntPtr]::Zero
+            $hOutputRead = [IntPtr]::Zero
+            $hOutputWrite = [IntPtr]::Zero
+            $hErrorRead = [IntPtr]::Zero
+            $hErrorWrite = [IntPtr]::Zero
+            $processInfo = [SnipeSpotter.CredentialLaunchNative+PROCESS_INFORMATION]::new()
+            $success = $false
+            $nativeError = 0
+            try {
+                $securityAttributes = [SnipeSpotter.CredentialLaunchNative+SECURITY_ATTRIBUTES]::new()
+                $securityAttributes.nLength = [Runtime.InteropServices.Marshal]::SizeOf($securityAttributes)
+                $securityAttributes.bInheritHandle = $bInheritHandles
+                if (-not [SnipeSpotter.CredentialLaunchNative]::CreatePipe(
+                        [ref]$hInputRead,
+                        [ref]$hInputWrite,
+                        [ref]$securityAttributes,
+                        0
+                    )) {
+                    $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw 'credential probe input pipe creation failed'
+                }
+                if (-not [SnipeSpotter.CredentialLaunchNative]::CreatePipe(
+                        [ref]$hOutputRead,
+                        [ref]$hOutputWrite,
+                        [ref]$securityAttributes,
+                        0
+                    )) {
+                    $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw 'credential probe output pipe creation failed'
+                }
+                if (-not [SnipeSpotter.CredentialLaunchNative]::CreatePipe(
+                        [ref]$hErrorRead,
+                        [ref]$hErrorWrite,
+                        [ref]$securityAttributes,
+                        0
+                    )) {
+                    $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw 'credential probe error pipe creation failed'
+                }
+                if (-not [SnipeSpotter.CredentialLaunchNative]::SetHandleInformation(
+                        $hInputWrite,
+                        [SnipeSpotter.CredentialLaunchNative]::HANDLE_FLAG_INHERIT,
+                        0
+                    )) {
+                    $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw 'credential probe input handle setup failed'
+                }
+                if (-not [SnipeSpotter.CredentialLaunchNative]::SetHandleInformation(
+                        $hOutputRead,
+                        [SnipeSpotter.CredentialLaunchNative]::HANDLE_FLAG_INHERIT,
+                        0
+                    )) {
+                    $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw 'credential probe output handle setup failed'
+                }
+                if (-not [SnipeSpotter.CredentialLaunchNative]::SetHandleInformation(
+                        $hErrorRead,
+                        [SnipeSpotter.CredentialLaunchNative]::HANDLE_FLAG_INHERIT,
+                        0
+                    )) {
+                    $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    throw 'credential probe error handle setup failed'
+                }
+
+                $startupInfo = [SnipeSpotter.CredentialLaunchNative+STARTUPINFO]::new()
+                $startupInfo.cb = [Runtime.InteropServices.Marshal]::SizeOf($startupInfo)
+                $startupInfo.dwFlags = [SnipeSpotter.CredentialLaunchNative]::STARTF_USESTDHANDLES
+                $startupInfo.hStdInput = $hInputRead
+                $startupInfo.hStdOutput = $hOutputWrite
+                $startupInfo.hStdError = $hErrorWrite
+                $commandPointer = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($command)
+                $success = [SnipeSpotter.CredentialLaunchNative]::CreateProcessWithLogonW(
+                    $User.Name,
+                    $User.Domain,
+                    $passwordPointer,
+                    $logonFlags,
+                    $case.ApplicationName,
+                    $commandPointer,
+                    $dwCreationFlags,
+                    $lpEnvironment,
+                    $lpCurrentDirectory,
+                    [ref]$startupInfo,
+                    [ref]$processInfo
+                )
+                if (-not $success) {
+                    $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                } else {
+                    $waitResult = [SnipeSpotter.CredentialLaunchNative]::WaitForSingleObject($processInfo.hProcess, 5000)
+                    if ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_OBJECT_0) {
+                        # The credentialed probe child exited within the bounded wait.
+                    } elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT) {
+                        $nativeError = [int]$waitResult
+                        $terminateSucceeded = [SnipeSpotter.CredentialLaunchNative]::TerminateProcess($processInfo.hProcess, 1)
+                        if (-not $terminateSucceeded) {
+                            $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                            throw 'credential probe child termination failed'
+                        }
+                        $terminationWaitResult = [SnipeSpotter.CredentialLaunchNative]::WaitForSingleObject($processInfo.hProcess, 1000)
+                        if ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_OBJECT_0) {
+                            # The timed-out credentialed probe child was terminated within the bounded wait.
+                        } elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT) {
+                            $nativeError = [int]$terminationWaitResult
+                            throw 'credential probe child termination did not complete within the bounded wait'
+                        } elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {
+                            $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                            throw 'credential probe child termination wait failed'
+                        } else {
+                            $nativeError = [int]$terminationWaitResult
+                            throw 'credential probe child termination returned an unexpected wait status'
+                        }
+                    } elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {
+                        $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        throw 'credential probe child wait failed'
+                    } else {
+                        $nativeError = [int]$waitResult
+                        throw 'credential probe child returned an unexpected wait status'
+                    }
+                }
+            } catch {
+                if ($nativeError -eq 0) { $nativeError = 1 }
+            } finally {
+                if ($commandPointer -ne [IntPtr]::Zero) {
+                    [Runtime.InteropServices.Marshal]::FreeHGlobal($commandPointer)
+                }
+                foreach ($handle in @(
+                    $hInputRead,
+                    $hInputWrite,
+                    $hOutputRead,
+                    $hOutputWrite,
+                    $hErrorRead,
+                    $hErrorWrite,
+                    $processInfo.hProcess,
+                    $processInfo.hThread
+                )) {
+                    if ($handle -ne [IntPtr]::Zero) {
+                        [void][SnipeSpotter.CredentialLaunchNative]::CloseHandle($handle)
+                    }
+                }
+            }
+            $lengthBucket = if ($command.Length -gt 1024) { 'over_1024' } else { 'short' }
+            $records += [ordered]@{
+                case = $case.Case
+                success = $success
+                native_error = $nativeError
+                length_bucket = $lengthBucket
+            }
+        }
+    } finally {
+        if ($passwordPointer -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
+        }
+    }
+    $json = $records | ConvertTo-Json -Compress -Depth 3
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    if ($bytes.Length -gt 4096) { throw 'credential launch probe exceeded the bounded size' }
+    return $json
+}
+
 function Invoke-AsStandardUser {
     [CmdletBinding()]
     param(
@@ -231,7 +518,13 @@ function Invoke-AsStandardUser {
             $failedField = 'process_start'
             if (-not $process.Start()) { throw 'process start returned false' }
         } catch {
-            $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $_
+            $nativeStartErrorRecord = $_
+            try {
+                Invoke-CredentialLaunchProbe -User $User
+            } catch {
+                $null = $_
+            }
+            $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $nativeStartErrorRecord
             throw "credentialed launch failed: $diagnostic"
         }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
