@@ -63,6 +63,25 @@ def test_acl_module_normalizes_identity_and_inheritance_metadata() -> None:
     assert "function Assert-AclPrincipal" in module
 
 
+def test_acl_identity_normalization_uses_identity_reference_string_conversion() -> None:
+    module = read_module("Acl.psm1")
+    converter_start = module.index("function ConvertTo-SecurityIdentifier")
+    converter_end = module.index("function Get-NormalizedAcl", converter_start)
+    converter = module[converter_start:converter_end]
+    normalized_start = module.index("function Get-NormalizedAcl")
+    normalized_end = module.index("function Get-AclContract", normalized_start)
+    normalized = module[normalized_start:normalized_end]
+
+    non_sid_path = converter[converter.index("$identity = $IdentityReference.ToString()"):]
+    assert "$identity = $IdentityReference.ToString()" in converter
+    assert "[Security.Principal.NTAccount]$identity" in converter
+    assert "Translate(\n            [Security.Principal.SecurityIdentifier]\n        ).Value" in converter
+    assert "$IdentityReference.Value" not in non_sid_path
+    assert "failed to translate ACL principal $identity to a SID" in converter
+    assert "identity = $_.IdentityReference.ToString()" in normalized
+    assert "identity = $_.IdentityReference.Value" not in normalized
+
+
 def test_acl_contract_is_sid_based_and_rejects_broad_allows() -> None:
     module = read_module("Acl.psm1")
     for required in (
@@ -446,6 +465,7 @@ def main() -> None:
     test_wait_module_is_deadline_and_condition_based()
     test_scm_module_proves_runtime_owner_and_bounded_state_waits()
     test_acl_module_normalizes_identity_and_inheritance_metadata()
+    test_acl_identity_normalization_uses_identity_reference_string_conversion()
     test_acl_contract_is_sid_based_and_rejects_broad_allows()
     test_acl_fixture_rejects_arbitrary_extra_allow_but_preserves_deny_rules()
     test_direct_scm_acl_assertion_uses_exact_normalized_contract()

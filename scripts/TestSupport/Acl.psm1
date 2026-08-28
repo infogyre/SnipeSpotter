@@ -16,12 +16,13 @@ function ConvertTo-SecurityIdentifier {
     if ($IdentityReference -is [Security.Principal.SecurityIdentifier]) {
         return $IdentityReference.Value
     }
+    $identity = $IdentityReference.ToString()
     try {
-        return ([Security.Principal.NTAccount]$IdentityReference.Value).Translate(
+        return ([Security.Principal.NTAccount]$identity).Translate(
             [Security.Principal.SecurityIdentifier]
         ).Value
     } catch {
-        throw "failed to translate ACL principal $($IdentityReference.Value) to a SID"
+        throw "failed to translate ACL principal $identity to a SID"
     }
 }
 
@@ -33,7 +34,7 @@ function Get-NormalizedAcl {
     @($acl.Access | ForEach-Object {
         [ordered]@{
             sid = ConvertTo-SecurityIdentifier -IdentityReference $_.IdentityReference
-            identity = $_.IdentityReference.Value
+            identity = $_.IdentityReference.ToString()
             type = $_.AccessControlType.ToString()
             rights = $_.FileSystemRights.ToString()
             rights_mask = [int]$_.FileSystemRights
