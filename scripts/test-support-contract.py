@@ -1,6 +1,7 @@
 """Static contract checks for Windows lifecycle test-support modules."""
 
 from pathlib import Path
+import re
 import xml.etree.ElementTree as ET
 
 
@@ -8,12 +9,69 @@ ROOT = Path(__file__).parent / "TestSupport"
 LIFECYCLE = ROOT.parent / "test-msi-lifecycle.ps1"
 DIRECT_SCM = ROOT.parent / "test-direct-scm-lifecycle.ps1"
 WORKFLOW = ROOT.parent.parent / ".github" / "workflows" / "elevated-windows.yml"
+_ACL_DIAGNOSTIC_FIELDS = (
+    "path_class",
+    "sid",
+    "access_type",
+    "rights_mask",
+    "inheritance_flags",
+    "propagation_flags",
+    "inherited",
+)
+_ACL_DIAGNOSTIC_FORBIDDEN_FIELDS = (
+    "account_name",
+    "identity",
+    "path",
+    "exception",
+    "error",
+    "message",
+    "contents",
+    "secret",
+    "token",
+)
 
 
 def read_module(name: str) -> str:
     path = ROOT / name
     assert path.is_file(), f"missing test-support module: {path}"
     return path.read_text(encoding="utf-8")
+
+
+def _acl_diagnostic_projection(source: str) -> tuple[tuple[str, ...], dict[str, str]]:
+    start = source.index("function Get-AclDiagnostic")
+    projection_start = source.index("[ordered]@{", start) + len("[ordered]@{")
+    depth = 1
+    end = projection_start
+    while depth:
+        if source[end] == "{":
+            depth += 1
+        elif source[end] == "}":
+            depth -= 1
+        end += 1
+    projection = source[projection_start : end - 1]
+    assignments = re.findall(
+        r"(?m)^\s*(?P<key>[A-Za-z_]\w*)\s*=\s*(?P<value>[^\r\n]+?)\s*$",
+        projection,
+    )
+    assert assignments, "ACL diagnostic projection must contain ordered assignments"
+    keys = tuple(key for key, _ in assignments)
+    values = dict(assignments)
+    assert len(keys) == len(values), "ACL diagnostic projection contains duplicate keys"
+    return keys, values
+
+
+def _assert_exact_acl_diagnostic_schema(source: str) -> None:
+    keys, values = _acl_diagnostic_projection(source)
+    assert keys == _ACL_DIAGNOSTIC_FIELDS
+    assert values == {
+        "path_class": "$PathClass",
+        "sid": "ConvertTo-SecurityIdentifier -IdentityReference $_.IdentityReference",
+        "access_type": "$_.AccessControlType.ToString()",
+        "rights_mask": "[int]$_.FileSystemRights",
+        "inheritance_flags": "$_.InheritanceFlags.ToString()",
+        "propagation_flags": "$_.PropagationFlags.ToString()",
+        "inherited": "[bool]$_.IsInherited",
+    }
 
 
 def test_required_modules_exist() -> None:
@@ -63,6 +121,41 @@ def test_acl_module_normalizes_identity_and_inheritance_metadata() -> None:
     assert "function Assert-AclPrincipal" in module
 
 
+def test_acl_diagnostic_projection_is_exact_and_bounded() -> None:
+    module = read_module("Acl.psm1")
+    diagnostic_end = module.index("function Get-AclContract")
+    diagnostic = module[module.index("function Get-AclDiagnostic") : diagnostic_end]
+    _assert_exact_acl_diagnostic_schema(diagnostic)
+    assert "ValidateSet('root', 'settings')" in diagnostic
+    assert "[string]$PathClass" in diagnostic
+    assert "[int]$MaxRules = 64" in diagnostic
+    assert "Select-Object -First $MaxRules" in diagnostic
+    assert "ValidateRange(1, 64)" in diagnostic
+    assert "function Write-AclDiagnostic" in module
+    writer = module[module.index("function Write-AclDiagnostic") : diagnostic_end]
+    assert "MaxBytes" in writer
+    assert "ConvertTo-Json -Compress" in writer
+    assert "UTF8" in writer
+    assert "WriteAllText" in writer
+
+
+def test_acl_diagnostic_projection_rejects_privacy_schema_mutations() -> None:
+    module = read_module("Acl.psm1")
+    diagnostic_end = module.index("function Get-AclContract")
+    diagnostic = module[module.index("function Get-AclDiagnostic") : diagnostic_end]
+    for forbidden in _ACL_DIAGNOSTIC_FORBIDDEN_FIELDS:
+        mutation = diagnostic.replace(
+            "            path_class = $PathClass\n",
+            f"            {forbidden} = 'forbidden'\n            path_class = $PathClass\n",
+            1,
+        )
+        try:
+            _assert_exact_acl_diagnostic_schema(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError(f"ACL diagnostic privacy mutation was accepted: {forbidden}")
+
+
 def test_acl_identity_normalization_uses_identity_reference_string_conversion() -> None:
     module = read_module("Acl.psm1")
     converter_start = module.index("function ConvertTo-SecurityIdentifier")
@@ -110,7 +203,7 @@ def test_acl_contract_is_sid_based_and_rejects_broad_allows() -> None:
     assert "Users" not in module
     assert "Everyone" not in module
     assert "Authenticated Users" not in module
-    assert "Export-ModuleMember -Function Get-NormalizedAcl, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclContract" in module
+    assert "Export-ModuleMember -Function Get-NormalizedAcl, Get-AclDiagnostic, Write-AclDiagnostic, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclContract" in module
     assert "Ensure-AclContract" not in module
     assert "$matches =" not in module
     assert "[CmdletBinding(SupportsShouldProcess = $true)]" in module
@@ -441,10 +534,7 @@ def test_wix_authors_protected_data_acl_or_calls_the_production_acl_path() -> No
     service = (root / "spotter-svc" / "src" / "service.rs").read_text(encoding="utf-8")
     windows_acl = (root / "spotter-svc" / "src" / "windows_acl.rs").read_text(encoding="utf-8")
 
-    assert (
-        '<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" '
-        'xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">'
-    ) in product
+    _validate_wix_permission_targets(product)
     for forbidden in (
         'User="Everyone"',
         'User="Users"',
@@ -465,6 +555,8 @@ def main() -> None:
     test_wait_module_is_deadline_and_condition_based()
     test_scm_module_proves_runtime_owner_and_bounded_state_waits()
     test_acl_module_normalizes_identity_and_inheritance_metadata()
+    test_acl_diagnostic_projection_is_exact_and_bounded()
+    test_acl_diagnostic_projection_rejects_privacy_schema_mutations()
     test_acl_identity_normalization_uses_identity_reference_string_conversion()
     test_acl_contract_is_sid_based_and_rejects_broad_allows()
     test_acl_fixture_rejects_arbitrary_extra_allow_but_preserves_deny_rules()

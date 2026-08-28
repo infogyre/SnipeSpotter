@@ -47,6 +47,55 @@ function Get-NormalizedAcl {
     } | Sort-Object sid, type, rights, inheritance, propagation, inherited)
 }
 
+function Get-AclDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('root', 'settings')][string]$PathClass,
+        [Parameter(Mandatory = $false)][ValidateRange(1, 64)][int]$MaxRules = 64
+    )
+
+    $acl = Get-Acl -LiteralPath $Path
+    @($acl.Access | Select-Object -First $MaxRules | ForEach-Object {
+        [ordered]@{
+            path_class = $PathClass
+            sid = ConvertTo-SecurityIdentifier -IdentityReference $_.IdentityReference
+            access_type = $_.AccessControlType.ToString()
+            rights_mask = [int]$_.FileSystemRights
+            inheritance_flags = $_.InheritanceFlags.ToString()
+            propagation_flags = $_.PropagationFlags.ToString()
+            inherited = [bool]$_.IsInherited
+        }
+    })
+}
+
+function Write-AclDiagnostic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('root', 'settings')][string]$PathClass,
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$OutputPath,
+        [Parameter(Mandatory = $false)][ValidateRange(1024, 65536)][int]$MaxBytes = 32768,
+        [Parameter(Mandatory = $false)][ValidateRange(1, 64)][int]$MaxRules = 64
+    )
+
+    $records = @(Get-AclDiagnostic -Path $Path -PathClass $PathClass -MaxRules $MaxRules)
+    $json = if ($records.Count -eq 0) {
+        '[]'
+    } else {
+        $records | ConvertTo-Json -Compress -Depth 3
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    if ($bytes.Length -gt $MaxBytes) {
+        throw "ACL diagnostics exceed $MaxBytes bytes"
+    }
+    $parent = Split-Path -Parent $OutputPath
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    [IO.File]::WriteAllText($OutputPath, $json, [Text.UTF8Encoding]::new($false))
+}
+
 function Get-AclContract {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path)
@@ -187,4 +236,4 @@ function Assert-AclPrincipal {
     return $match[0]
 }
 
-Export-ModuleMember -Function Get-NormalizedAcl, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclContract
+Export-ModuleMember -Function Get-NormalizedAcl, Get-AclDiagnostic, Write-AclDiagnostic, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclContract

@@ -162,8 +162,11 @@ def test_child_probe_proves_unprivileged_token_and_denied_access() -> None:
 
 
 def test_product_and_atomic_writer_apply_the_same_protected_acl_contract() -> None:
-    assert 'User="SYSTEM" GenericAll="yes" Inheritable="no"' in PRODUCT_WXS
-    assert 'User="Administrators" GenericAll="yes" Inheritable="no"' in PRODUCT_WXS
+    assert '<Directory Id="DataFolder" Name="SnipeSpotter" />' in PRODUCT_WXS
+    assert '<File Id="SettingsTemplate" Source="settings.toml" Name="settings.toml" KeyPath="yes">' in PRODUCT_WXS
+    assert PRODUCT_WXS.count('<util:PermissionEx User="SYSTEM" GenericAll="yes" Inheritable="no" />') == 2
+    assert PRODUCT_WXS.count('<util:PermissionEx User="Administrators" GenericAll="yes" Inheritable="no" />') == 2
+    assert "SecureObjects" not in PRODUCT_WXS
     assert "Sddl=" not in PRODUCT_WXS
     assert "User=\"Everyone\"" not in PRODUCT_WXS
     assert "User=\"Users\"" not in PRODUCT_WXS
@@ -222,6 +225,78 @@ def test_acl_helper_validates_before_repair_and_uses_real_acl_contract() -> None
     assert validation < repair
     assert "Get-AclContract -Path $Path" in ACL
     assert "Set-Acl -LiteralPath $Path -AclObject $acl" in ACL
+
+
+def test_acl_diagnostics_are_bounded_and_precede_any_repair() -> None:
+    assert "function Get-AclDiagnostic" in ACL
+    assert "function Write-AclDiagnostic" in ACL
+    assert "function Save-AclFailureDiagnostic" in SCRIPT
+    capture = SCRIPT.index("Acl\\Write-AclDiagnostic")
+    repair = SCRIPT.index("Acl\\Set-AclContract")
+    assert capture < repair
+    assert SCRIPT.count("Acl\\Write-AclDiagnostic") == 2
+    assert "-PathClass 'root'" in SCRIPT
+    assert "-PathClass 'settings'" in SCRIPT
+    assert "failure-acl-root.json" in SCRIPT
+    assert "failure-acl-settings.json" in SCRIPT
+    helper = _function_text(SCRIPT, "Save-AclFailureDiagnostic", "Get-MachinePathEntry")
+    assert helper.count("try {") == 2
+    assert helper.count("catch {") == 2
+    assert helper.index("-PathClass 'root'") < helper.index("-PathClass 'settings'")
+    assert helper.count("Test-Path -LiteralPath") == 2
+    assert "Exception.Message" not in helper
+    assert "Write-Warning 'ACL root diagnostic capture failed'" in helper
+    assert "Write-Warning 'ACL settings diagnostic capture failed'" in helper
+
+
+def test_acl_diagnostic_capture_attempts_settings_after_root_failure() -> None:
+    helper = _function_text(SCRIPT, "Save-AclFailureDiagnostic", "Get-MachinePathEntry")
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for ACL diagnostic capture independence"
+    with tempfile.TemporaryDirectory(prefix="acl-diagnostic-") as temporary_directory:
+        root = Path(temporary_directory)
+        data_root = root / "data"
+        data_root.mkdir()
+        settings_path = data_root / "settings.toml"
+        settings_path.write_text("settings", encoding="utf-8")
+        log_directory = root / "logs"
+        probe = """
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+function Acl\\Write-AclDiagnostic {
+    param(
+        [string]$Path,
+        [string]$PathClass,
+        [string]$OutputPath
+    )
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutputPath) | Out-Null
+    Add-Content -LiteralPath $OutputPath -Value $PathClass
+    if ($PathClass -eq 'root') { throw 'root capture failed' }
+}
+""" + helper + """
+$dataRoot = $env:SPOTTER_ACL_DATA_ROOT
+$settingsPath = $env:SPOTTER_ACL_SETTINGS_PATH
+$LogDirectory = $env:SPOTTER_ACL_LOG_DIRECTORY
+Save-AclFailureDiagnostic
+if (-not (Test-Path -LiteralPath (Join-Path $LogDirectory 'failure-acl-settings.json') -PathType Leaf)) {
+    throw 'settings ACL diagnostic was not attempted after root failure'
+}
+Write-Output 'independent ACL captures accepted'
+"""
+        environment = os.environ | {
+            "SPOTTER_ACL_DATA_ROOT": str(data_root),
+            "SPOTTER_ACL_SETTINGS_PATH": str(settings_path),
+            "SPOTTER_ACL_LOG_DIRECTORY": str(log_directory),
+        }
+        result = subprocess.run(
+            [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert "independent ACL captures accepted" in result.stdout
 
 
 def test_atomic_windows_contract_applies_acl_to_temporary_and_replaced_files() -> None:
@@ -536,6 +611,8 @@ def main() -> None:
     test_lifecycle_collects_only_present_runtime_artifacts_and_uses_scoped_acl_commands()
     test_lifecycle_asserts_child_probe_result_not_parent_token()
     test_product_and_atomic_writer_apply_the_same_protected_acl_contract()
+    test_acl_diagnostics_are_bounded_and_precede_any_repair()
+    test_acl_diagnostic_capture_attempts_settings_after_root_failure()
     test_startup_repairs_existing_runtime_artifact_acls_before_access()
     test_preserved_settings_file_has_direct_wix_acl_entries()
     test_atomic_windows_contract_applies_acl_to_temporary_and_replaced_files()

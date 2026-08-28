@@ -104,6 +104,23 @@ function Save-ServiceLogDiagnostic {
     }
 }
 
+function Save-AclFailureDiagnostic {
+    try {
+        if (Test-Path -LiteralPath $dataRoot -PathType Container) {
+            Acl\Write-AclDiagnostic -Path $dataRoot -PathClass 'root' -OutputPath (Join-Path $LogDirectory 'failure-acl-root.json')
+        }
+    } catch {
+        Write-Warning 'ACL root diagnostic capture failed'
+    }
+    try {
+        if (Test-Path -LiteralPath $settingsPath -PathType Leaf) {
+            Acl\Write-AclDiagnostic -Path $settingsPath -PathClass 'settings' -OutputPath (Join-Path $LogDirectory 'failure-acl-settings.json')
+        }
+    } catch {
+        Write-Warning 'ACL settings diagnostic capture failed'
+    }
+}
+
 function Get-MachinePathEntry {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     if ([string]::IsNullOrWhiteSpace($machinePath)) { return @() }
@@ -309,6 +326,7 @@ try {
     } | Out-Null
 } catch {
     $primaryError = $_
+    Save-AclFailureDiagnostic
     try {
         if (Test-Path -LiteralPath $dataRoot) {
             try {
