@@ -448,6 +448,16 @@ def test_security_module_proves_standard_user_token_and_access_denials() -> None
     assert "$AccessDeniedHResult = -2147024891" not in module[:probe_start]
 
 
+def test_credentialed_process_does_not_request_ignored_window_suppression() -> None:
+    module = read_module("Security.psm1")
+    start_info_start = module.index("$startInfo = [Diagnostics.ProcessStartInfo]::new()")
+    process_start = module.index("$process = [Diagnostics.Process]::new()", start_info_start)
+    start_info = module[start_info_start:process_start]
+    assert "$startInfo.UserName" in start_info
+    assert "$startInfo.Password" in start_info
+    assert "$startInfo.CreateNoWindow" not in start_info
+
+
 def test_diagnostics_are_allowlisted_and_size_bounded() -> None:
     module = read_module("Diagnostics.psm1")
     assert "function Get-BoundedText" in module
@@ -698,6 +708,7 @@ def main() -> None:
     test_acl_contract_callers_pass_declared_path_kinds_everywhere()
     test_elevated_result_requires_msi_and_direct_scm_success_in_both_modes()
     test_security_module_proves_standard_user_token_and_access_denials()
+    test_credentialed_process_does_not_request_ignored_window_suppression()
     test_diagnostics_are_allowlisted_and_size_bounded()
     test_cleanup_runs_every_action_and_reports_failures()
     test_cleanup_persists_bounded_failure_diagnostics()
