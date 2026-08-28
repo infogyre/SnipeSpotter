@@ -223,8 +223,22 @@ def test_acl_helper_validates_before_repair_and_uses_real_acl_contract() -> None
     validation = ACL.index("function Assert-AclContract")
     repair = ACL.index("function Set-AclContract")
     assert validation < repair
-    assert "Get-AclContract -Path $Path" in ACL
+    assert "Get-AclContract -Path $Path -PathType $PathType" in ACL
+    assert "Assert-AclRulesContract -Path $Path -PathType $PathType -Rules $contract.rules" in ACL
+    assert "path_type = $PathType" in ACL
     assert "Set-Acl -LiteralPath $Path -AclObject $acl" in ACL
+    assert "[ValidateSet('Leaf', 'Container')]" in ACL
+    assert "$canonicalChildRightsMask = 268435456" in ACL
+    assert "$canonicalChildPropagationMask" in ACL
+    assert "AddAccessRule($rule)" in ACL
+    assert "function Get-RequiredAclRule" in ACL
+
+
+def test_acl_contract_repair_preserves_deny_rules() -> None:
+    repair = ACL[ACL.index("function Set-AclContract") : ACL.index("function Assert-AclPrincipal")]
+    assert "AccessControlType]::Allow)" in repair
+    assert "AccessControlType]::Deny" not in repair
+    assert "RemoveAccessRule($rule)" in repair
 
 
 def test_acl_diagnostics_are_bounded_and_precede_any_repair() -> None:
@@ -410,7 +424,7 @@ def test_service_log_capture_preserves_primary_error_on_setup_failure() -> None:
     helper = _function_text(SCRIPT, "Save-ServiceLogDiagnostic", "Get-MachinePathEntry")
     invocation = "Save-ServiceLogDiagnostic -DataRoot $dataRoot -Destination $LogDirectory"
     assert invocation in SCRIPT
-    observed_acl = SCRIPT.index("[void](Acl\\Assert-AclContract -Path $dataRoot)")
+    observed_acl = SCRIPT.index("[void](Acl\\Assert-AclContract -Path $dataRoot -PathType Container)")
     assert observed_acl < SCRIPT.index(invocation)
     assert "Write-Warning \"service log capture failed:" in SCRIPT
     assert helper.count("try {") >= 2
@@ -615,6 +629,7 @@ def main() -> None:
     test_acl_diagnostic_capture_attempts_settings_after_root_failure()
     test_startup_repairs_existing_runtime_artifact_acls_before_access()
     test_preserved_settings_file_has_direct_wix_acl_entries()
+    test_acl_contract_repair_preserves_deny_rules()
     test_atomic_windows_contract_applies_acl_to_temporary_and_replaced_files()
     test_lifecycle_uses_shared_support_modules()
     test_lifecycle_verifies_running_service_process_owner()

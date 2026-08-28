@@ -31,7 +31,7 @@ Double-click the MSI in Explorer and follow the wizard. Administrator elevation 
    - Logon account: `LocalSystem` (runtime principal: `NT AUTHORITY\SYSTEM`)
 4. Adds `%ProgramFiles%\infogyre\SnipeSpotter\bin\` to the system `PATH` environment variable.
 5. Creates `%ProgramData%\infogyre\SnipeSpotter\` with a blank `settings.toml` template.
-6. Applies ACLs to the ProgramData tree granting inheritable full control only to `SYSTEM` and the built-in `Administrators` group.
+6. Applies a protected ACL contract to the ProgramData tree. Directories receive explicit self FullControl plus inherit-only ContainerInherit/ObjectInherit GenericAll rules for `SYSTEM` and built-in `Administrators`; files receive only explicit self FullControl rules for those SIDs. Inherited or unauthorized Allow ACEs are rejected, while Deny ACEs remain preserved.
 
 The service is registered but not started during installation. When started, it remains `Running` while unconfigured and serves the administrator-only named pipe so the CLI can complete configuration; an unconfigured state is not a service-health failure. It will start on the next boot, or you can start it manually after installation.
 

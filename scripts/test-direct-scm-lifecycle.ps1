@@ -116,10 +116,10 @@ function Assert-DirectRuntimeAcl {
 
     $normalizedRules = @(Get-NormalizedAcl -Path $DataRoot)
     Assert-True ($normalizedRules.Count -gt 0) 'direct service data root has no ACL rules'
-    [void](Assert-AclContract -Path $DataRoot)
+    [void](Assert-AclContract -Path $DataRoot -PathType Container)
     foreach ($artifact in $Artifacts) {
         if ($artifact.Path -ne $DataRoot) {
-            [void](Assert-AclContract -Path $artifact.Path)
+            [void](Assert-AclContract -Path $artifact.Path -PathType $artifact.Type)
         }
     }
 }

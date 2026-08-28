@@ -135,7 +135,7 @@ The lifecycle test is `scripts/test-msi-lifecycle.ps1`. On an elevated Windows r
    - Service `SnipeSpotter` is registered with automatic start type and `LocalSystem` account
    - Service executable path matches `%ProgramFiles%\infogyre\SnipeSpotter\bin\spotter-svc.exe`
    - All expected files exist: `bin\spotter-svc.exe`, `bin\spotter-cli.exe`, `bin\spotter_svc.pdb`, `bin\spotter_cli.pdb`, `sbom\*.cdx.json`, `settings.toml`
-2. **ACLs**: Verifies `ProgramData\infogyre\SnipeSpotter\` grants full control to `SYSTEM` and `Administrators`.
+2. **ACLs**: Verifies the protected Windows semantic contract for every runtime artifact. The data directory must have exactly one explicit self FullControl Allow and one explicit inherit-only ContainerInherit/ObjectInherit GenericAll Allow for each `SYSTEM` and built-in `Administrators` SID; each file must have exactly one explicit self FullControl Allow for each SID. Inherited and unauthorized Allow ACEs, duplicates, and mask/flag mismatches fail validation. Deny ACEs are preserved and are not counted as Allows.
 3. **PATH**: Verifies the `bin\` directory was added to the machine PATH.
 4. **Service health**: Starts the service, requires it to remain `Running` for the configured stability window, verifies the running process owner is `NT AUTHORITY\\SYSTEM`, verifies the fixed named pipe is present, invokes the installed CLI for JSON status, and requires an `Unconfigured` response before stopping it.
 5. **Uninstall**: Silently uninstalls and verifies:

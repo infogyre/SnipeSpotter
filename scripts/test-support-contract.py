@@ -1,7 +1,10 @@
 """Static contract checks for Windows lifecycle test-support modules."""
 
+import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import xml.etree.ElementTree as ET
 
 
@@ -185,8 +188,13 @@ def test_acl_contract_is_sid_based_and_rejects_broad_allows() -> None:
         "S-1-5-32-544",
         "$canonicalAllowSids",
         "$canonicalRightsMask",
+        "$canonicalChildRightsMask",
+        "$canonicalSelfInheritanceMask",
         "$canonicalInheritanceMask",
         "$canonicalPropagationMask",
+        "$canonicalChildPropagationMask",
+        "function Get-RequiredAclRule",
+        "function Assert-AclRulesContract",
         "AccessControlType]::Allow",
         "SetAccessRuleProtection",
         "ContainerInherit",
@@ -203,11 +211,17 @@ def test_acl_contract_is_sid_based_and_rejects_broad_allows() -> None:
     assert "Users" not in module
     assert "Everyone" not in module
     assert "Authenticated Users" not in module
-    assert "Export-ModuleMember -Function Get-NormalizedAcl, Get-AclDiagnostic, Write-AclDiagnostic, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclContract" in module
+    assert "Export-ModuleMember -Function Get-NormalizedAcl, Get-AclDiagnostic, Write-AclDiagnostic, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclRulesContract, Assert-AclContract" in module
     assert "Ensure-AclContract" not in module
     assert "$matches =" not in module
     assert "[CmdletBinding(SupportsShouldProcess = $true)]" in module
     assert "$PSCmdlet.ShouldProcess($Path" in module
+    assert "[ValidateSet('Leaf', 'Container')]" in module
+    assert "-PathType $PathType" in module
+    assert "AddAccessRule" in module
+    assert "RemoveAccessRule" in module
+    assert "if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow)" in module
+    assert "AccessControlType]::Deny" not in module
 
 
 def test_acl_fixture_rejects_arbitrary_extra_allow_but_preserves_deny_rules() -> None:
@@ -226,12 +240,122 @@ def test_acl_fixture_rejects_arbitrary_extra_allow_but_preserves_deny_rules() ->
 
     assert extra_allow_sids == {"S-1-5-21-424242-424242-424242-4242"}
     repair = module[module.index("function Set-AclContract"):module.index("function Assert-AclPrincipal")]
-    assert "-not $canonicalAllowSids.Contains($sid)" in repair
-    assert repair.count("AccessControlType]::Allow") == repair.count("RemoveAccessRule") + 1
-    assert repair.count("RemoveAccessRule") == 2
+    assert "AccessControlType]::Allow)" in repair
+    assert "-not $canonicalAllowSids.Contains($sid)" not in repair
+    assert "foreach ($requiredRule in @(Get-RequiredAclRule -PathType $PathType))" in repair
+    assert "AddAccessRule($rule)" in repair
+    assert "RemoveAccessRule($rule)" in repair
     assert "$owner = ConvertTo-SecurityIdentifier -IdentityReference $acl.Owner" in repair
     assert "$updatedOwner -ne $owner" in module
     assert "SetOwner" not in module
+
+
+def test_acl_contract_matches_observed_windows_directory_and_file_semantics() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for semantic ACL contract fixtures"
+    module = ROOT / "Acl.psm1"
+    probe = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+function New-FixtureRule {
+    param(
+        [string]$Sid,
+        [int]$RightsMask,
+        [int]$InheritanceMask,
+        [int]$PropagationMask,
+        [bool]$Inherited,
+        [string]$Type = 'Allow'
+    )
+    [pscustomobject]@{
+        sid = $Sid
+        type = $Type
+        rights_mask = $RightsMask
+        inheritance_mask = $InheritanceMask
+        propagation_mask = $PropagationMask
+        inherited = $Inherited
+    }
+}
+
+$system = 'S-1-5-18'
+$administrators = 'S-1-5-32-544'
+$other = 'S-1-5-21-424242-424242-424242-4242'
+$fullControl = 2032127
+$genericAll = 268435456
+$noInheritance = 0
+$containerAndObject = 3
+$inheritOnly = 2
+$selfRules = @(
+    (New-FixtureRule $system $fullControl $noInheritance $noInheritance $false),
+    (New-FixtureRule $administrators $fullControl $noInheritance $noInheritance $false)
+)
+$childRules = @(
+    (New-FixtureRule $system $genericAll $containerAndObject $inheritOnly $false),
+    (New-FixtureRule $administrators $genericAll $containerAndObject $inheritOnly $false)
+)
+$rootRules = @($selfRules + $childRules + @(
+    (New-FixtureRule $other $fullControl $noInheritance $noInheritance $false 'Deny')
+))
+$settingsRules = @($selfRules)
+$fixtures = @{
+    root = $rootRules
+    settings = $settingsRules
+    unauthorized = @($rootRules + (New-FixtureRule $other $fullControl $noInheritance $noInheritance $false))
+    duplicate = @($rootRules + (New-FixtureRule $system $fullControl $noInheritance $noInheritance $false))
+    inherited = @($rootRules + (New-FixtureRule $system $fullControl $noInheritance $noInheritance $true))
+    wrong_rights = @(
+        (New-FixtureRule $system 1 $noInheritance $noInheritance $false),
+        $selfRules[1], $childRules
+    )
+    wrong_inheritance = @(
+        $selfRules,
+        (New-FixtureRule $system $genericAll 1 $inheritOnly $false),
+        $childRules[1]
+    )
+    wrong_propagation = @(
+        $selfRules,
+        (New-FixtureRule $system $genericAll $containerAndObject $noInheritance $false),
+        $childRules[1]
+    )
+    missing = @($selfRules + $childRules[0])
+}
+Import-Module $env:SPOTTER_ACL_MODULE -Force
+[void](Assert-AclRulesContract -Path 'root' -PathType Container -Rules $fixtures.root)
+[void](Assert-AclRulesContract -Path 'settings' -PathType Leaf -Rules $fixtures.settings)
+foreach ($invalid in @('unauthorized', 'duplicate', 'inherited', 'wrong_rights', 'wrong_inheritance', 'wrong_propagation', 'missing')) {
+    $rejected = $false
+    try {
+        [void](Assert-AclRulesContract -Path $invalid -PathType Container -Rules $fixtures[$invalid])
+    } catch {
+        $rejected = $true
+    }
+    if (-not $rejected) { throw "invalid fixture was accepted: $invalid" }
+}
+$rejected = $false
+try {
+    [void](Assert-AclRulesContract -Path 'root-as-leaf' -PathType Leaf -Rules $fixtures.root)
+} catch {
+    $rejected = $true
+}
+if (-not $rejected) { throw 'directory fixture was accepted as a leaf' }
+$rejected = $false
+try {
+    [void](Assert-AclRulesContract -Path 'settings-as-directory' -PathType Container -Rules $fixtures.settings)
+} catch {
+    $rejected = $true
+}
+if (-not $rejected) { throw 'file fixture was accepted as a directory' }
+Write-Output 'semantic ACL fixtures accepted'
+'''
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"SPOTTER_ACL_MODULE": str(module)},
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "semantic ACL fixtures accepted" in result.stdout
 
 
 def test_direct_scm_acl_assertion_uses_exact_normalized_contract() -> None:
@@ -240,11 +364,21 @@ def test_direct_scm_acl_assertion_uses_exact_normalized_contract() -> None:
     end = script.index("$identity =", start)
     assertion = script[start:end]
 
-    assert "Assert-AclContract -Path $DataRoot" in assertion
+    assert "Assert-AclContract -Path $DataRoot -PathType Container" in assertion
+    assert "Assert-AclContract -Path $artifact.Path -PathType $artifact.Type" in assertion
     assert "Assert-AclPrincipal" not in assertion
     assert "NT AUTHORITY\\SYSTEM" not in assertion
     assert "Administrators" not in assertion
     assert "-match" not in assertion
+
+
+def test_acl_contract_callers_pass_declared_path_kinds_everywhere() -> None:
+    for source in (DIRECT_SCM, LIFECYCLE):
+        script = source.read_text(encoding="utf-8")
+        for match in re.finditer(r"(?:Get|Set|Assert)-AclContract\s+-Path[^\r\n]*", script):
+            assert "-PathType" in match.group(0), match.group(0)
+    assert "[void](Acl\\Assert-AclContract -Path $dataRoot -PathType Container)" in LIFECYCLE.read_text(encoding="utf-8")
+    assert "Acl\\Set-AclContract -Path $dataRoot -PathType Container" in LIFECYCLE.read_text(encoding="utf-8")
 
 
 def test_elevated_result_requires_msi_and_direct_scm_success_in_both_modes() -> None:
@@ -560,7 +694,9 @@ def main() -> None:
     test_acl_identity_normalization_uses_identity_reference_string_conversion()
     test_acl_contract_is_sid_based_and_rejects_broad_allows()
     test_acl_fixture_rejects_arbitrary_extra_allow_but_preserves_deny_rules()
+    test_acl_contract_matches_observed_windows_directory_and_file_semantics()
     test_direct_scm_acl_assertion_uses_exact_normalized_contract()
+    test_acl_contract_callers_pass_declared_path_kinds_everywhere()
     test_elevated_result_requires_msi_and_direct_scm_success_in_both_modes()
     test_security_module_proves_standard_user_token_and_access_denials()
     test_diagnostics_are_allowlisted_and_size_bounded()

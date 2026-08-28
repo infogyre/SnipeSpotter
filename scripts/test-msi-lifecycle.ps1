@@ -272,7 +272,12 @@ try {
             [pscustomobject]@{ Path = $_.FullName; Type = 'Leaf' }
         }
     )
-    [void](Acl\Assert-AclContract -Path $dataRoot)
+    [void](Acl\Assert-AclContract -Path $dataRoot -PathType Container)
+    foreach ($artifact in $runtimeArtifacts) {
+        if ($artifact.Path -ne $dataRoot) {
+            [void](Acl\Assert-AclContract -Path $artifact.Path -PathType $artifact.Type)
+        }
+    }
     $artifactAclBefore = @{}
     foreach ($artifact in $runtimeArtifacts) {
         $artifactAclBefore[$artifact.Path] = @(Acl\Get-NormalizedAcl -Path $artifact.Path)
@@ -330,11 +335,11 @@ try {
     try {
         if (Test-Path -LiteralPath $dataRoot) {
             try {
-                [void](Acl\Assert-AclContract -Path $dataRoot)
+                [void](Acl\Assert-AclContract -Path $dataRoot -PathType Container)
             } catch {
                 Write-Warning "observed invalid ACL before diagnostics: $($_.Exception.Message)"
                 try {
-                    Acl\Set-AclContract -Path $dataRoot
+                    Acl\Set-AclContract -Path $dataRoot -PathType Container
                 } catch {
                     Write-Warning "could not repair ACL for diagnostics: $($_.Exception.Message)"
                 }

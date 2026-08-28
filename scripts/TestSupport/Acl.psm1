@@ -5,9 +5,13 @@ $SystemSid = 'S-1-5-18'
 $AdministratorsSid = 'S-1-5-32-544'
 $canonicalAllowSids = @($SystemSid, $AdministratorsSid)
 $canonicalRightsMask = [int][Security.AccessControl.FileSystemRights]::FullControl
+# Windows emits GenericAll as this access-mask value for inherit-only child ACEs.
+$canonicalChildRightsMask = 268435456
+$canonicalSelfInheritanceMask = [int][Security.AccessControl.InheritanceFlags]::None
 $canonicalInheritanceMask = [int]([Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
     [Security.AccessControl.InheritanceFlags]::ObjectInherit)
 $canonicalPropagationMask = [int][Security.AccessControl.PropagationFlags]::None
+$canonicalChildPropagationMask = [int][Security.AccessControl.PropagationFlags]::InheritOnly
 
 function ConvertTo-SecurityIdentifier {
     [CmdletBinding()]
@@ -96,76 +100,111 @@ function Write-AclDiagnostic {
     [IO.File]::WriteAllText($OutputPath, $json, [Text.UTF8Encoding]::new($false))
 }
 
+function Get-RequiredAclRule {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][ValidateSet('Leaf', 'Container')][string]$PathType)
+
+    $required = @()
+    foreach ($sid in $canonicalAllowSids) {
+        $required += [pscustomobject]@{
+            sid = $sid
+            type = 'Allow'
+            rights_mask = $canonicalRightsMask
+            inheritance_mask = $canonicalSelfInheritanceMask
+            propagation_mask = $canonicalPropagationMask
+            inherited = $false
+            scope = 'self'
+        }
+        if ($PathType -eq 'Container') {
+            $required += [pscustomobject]@{
+                sid = $sid
+                type = 'Allow'
+                rights_mask = $canonicalChildRightsMask
+                inheritance_mask = $canonicalInheritanceMask
+                propagation_mask = $canonicalChildPropagationMask
+                inherited = $false
+                scope = 'children'
+            }
+        }
+    }
+    return $required
+}
+
+function Assert-AclRulesContract {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('Leaf', 'Container')][string]$PathType,
+        [Parameter(Mandatory = $true)][object[]]$Rules
+    )
+
+    $required = @(Get-RequiredAclRule -PathType $PathType)
+    $allowRules = @($Rules | Where-Object { $_.type -eq 'Allow' })
+    if ($allowRules.Count -ne $required.Count) {
+        throw "ACL contract for $Path contains $($allowRules.Count) explicit Allow rule(s); expected exactly $($required.Count) for a $PathType"
+    }
+    $unexpectedAllowSids = @($allowRules |
+        Where-Object { -not $canonicalAllowSids.Contains($_.sid) } |
+        Select-Object -ExpandProperty sid -Unique |
+        Select-Object -First 8)
+    if ($unexpectedAllowSids.Count -gt 0) {
+        throw "ACL contract for $Path contains non-canonical Allow SID(s): $($unexpectedAllowSids -join ', ')"
+    }
+    foreach ($requiredRule in $required) {
+        $matchingRules = @($allowRules | Where-Object {
+            $_.sid -eq $requiredRule.sid -and $_.type -eq $requiredRule.type -and
+            $_.rights_mask -eq $requiredRule.rights_mask -and
+            $_.inheritance_mask -eq $requiredRule.inheritance_mask -and
+            $_.propagation_mask -eq $requiredRule.propagation_mask -and
+            $_.inherited -eq $requiredRule.inherited
+        })
+        if ($matchingRules.Count -ne 1) {
+            throw "ACL contract for $Path lacks exactly one canonical $($requiredRule.scope) Allow rule for $($requiredRule.sid)"
+        }
+    }
+}
+
 function Get-AclContract {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('Leaf', 'Container')][string]$PathType
+    )
 
     $acl = Get-Acl -LiteralPath $Path
     $rules = @(Get-NormalizedAcl -Path $Path)
     [pscustomobject]@{
         path = $Path
+        path_type = $PathType
         protected = [bool]$acl.AreAccessRulesProtected
         owner_sid = ConvertTo-SecurityIdentifier -IdentityReference $acl.Owner
         allowed_allow_sids = $canonicalAllowSids
-        required = @(
-            [pscustomobject]@{
-                sid = $SystemSid
-                type = 'Allow'
-                rights_mask = $canonicalRightsMask
-                inheritance_mask = $canonicalInheritanceMask
-                propagation_mask = $canonicalPropagationMask
-                inherited = $false
-            }
-            [pscustomobject]@{
-                sid = $AdministratorsSid
-                type = 'Allow'
-                rights_mask = $canonicalRightsMask
-                inheritance_mask = $canonicalInheritanceMask
-                propagation_mask = $canonicalPropagationMask
-                inherited = $false
-            }
-        )
+        required = @(Get-RequiredAclRule -PathType $PathType)
         rules = $rules
     }
 }
 
 function Assert-AclContract {
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('Leaf', 'Container')][string]$PathType
+    )
 
-    $contract = Get-AclContract -Path $Path
+    $contract = Get-AclContract -Path $Path -PathType $PathType
     if (-not $contract.protected) {
         throw "ACL contract for $Path is not protected from inherited broad access"
     }
-    $allowRules = @($contract.rules | Where-Object { $_.type -eq 'Allow' })
-    if ($allowRules.Count -ne $contract.allowed_allow_sids.Count) {
-        throw "ACL contract for $Path contains $($allowRules.Count) Allow rule(s); expected exactly $($contract.allowed_allow_sids.Count) canonical principals"
-    }
-    $unexpectedAllowSids = @($allowRules |
-        Where-Object { -not $contract.allowed_allow_sids.Contains($_.sid) } |
-        Select-Object -ExpandProperty sid -Unique |
-        Select-Object -First 8)
-    if ($unexpectedAllowSids.Count -gt 0) {
-        throw "ACL contract for $Path contains non-canonical Allow SID(s): $($unexpectedAllowSids -join ', ')"
-    }
-    foreach ($required in $contract.required) {
-        $matchingRules = @($allowRules | Where-Object {
-            $_.sid -eq $required.sid -and $_.type -eq $required.type -and
-            $_.rights_mask -eq $required.rights_mask -and
-            $_.inheritance_mask -eq $required.inheritance_mask -and
-            $_.propagation_mask -eq $required.propagation_mask -and
-            $_.inherited -eq $required.inherited
-        })
-        if ($matchingRules.Count -ne 1) {
-            throw "ACL contract for $Path lacks exactly one canonical Allow rule for $($required.sid)"
-        }
-    }
+    Assert-AclRulesContract -Path $Path -PathType $PathType -Rules $contract.rules
     return $contract
 }
 
 function Set-AclContract {
     [CmdletBinding(SupportsShouldProcess = $true)]
-    param([Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path)
+    param(
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Path,
+        [Parameter(Mandatory = $true)][ValidateSet('Leaf', 'Container')][string]$PathType
+    )
 
     $acl = Get-Acl -LiteralPath $Path
     $owner = ConvertTo-SecurityIdentifier -IdentityReference $acl.Owner
@@ -174,36 +213,27 @@ function Set-AclContract {
     $removedAllowSids = @()
     foreach ($rule in @($acl.Access)) {
         $sid = ConvertTo-SecurityIdentifier -IdentityReference $rule.IdentityReference
-        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-            -not $canonicalAllowSids.Contains($sid)) {
+        if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow) {
             $acl.RemoveAccessRule($rule) | Out-Null
             $removedAllowCount++
-            if ($removedAllowSids.Count -lt 8) {
+            if ($removedAllowSids.Count -lt 8 -and -not $removedAllowSids.Contains($sid)) {
                 $removedAllowSids += $sid
             }
         }
     }
-    foreach ($sid in $canonicalAllowSids) {
-        foreach ($rule in @($acl.Access)) {
-            $ruleSid = ConvertTo-SecurityIdentifier -IdentityReference $rule.IdentityReference
-            if ($rule.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-                $ruleSid -eq $sid) {
-                $acl.RemoveAccessRule($rule) | Out-Null
-            }
-        }
-        $identity = [Security.Principal.SecurityIdentifier]::new($sid)
+    foreach ($requiredRule in @(Get-RequiredAclRule -PathType $PathType)) {
+        $identity = [Security.Principal.SecurityIdentifier]::new($requiredRule.sid)
         $rule = [Security.AccessControl.FileSystemAccessRule]::new(
             $identity,
-            [Security.AccessControl.FileSystemRights]::FullControl,
-            [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
-                [Security.AccessControl.InheritanceFlags]::ObjectInherit,
-            [Security.AccessControl.PropagationFlags]::None,
+            [Security.AccessControl.FileSystemRights]$requiredRule.rights_mask,
+            [Security.AccessControl.InheritanceFlags]$requiredRule.inheritance_mask,
+            [Security.AccessControl.PropagationFlags]$requiredRule.propagation_mask,
             [Security.AccessControl.AccessControlType]::Allow
         )
-        $acl.SetAccessRule($rule)
+        $acl.AddAccessRule($rule)
     }
     if ($removedAllowCount -gt 0) {
-        Write-Verbose "removed $removedAllowCount non-canonical Allow ACL rule(s) for SID(s): $($removedAllowSids -join ', ')"
+        Write-Verbose "removed $removedAllowCount existing Allow ACL rule(s) for SID(s): $($removedAllowSids -join ', ')"
     }
     if ($PSCmdlet.ShouldProcess($Path, 'Set canonical ACL contract')) {
         Set-Acl -LiteralPath $Path -AclObject $acl
@@ -236,4 +266,4 @@ function Assert-AclPrincipal {
     return $match[0]
 }
 
-Export-ModuleMember -Function Get-NormalizedAcl, Get-AclDiagnostic, Write-AclDiagnostic, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclContract
+Export-ModuleMember -Function Get-NormalizedAcl, Get-AclDiagnostic, Write-AclDiagnostic, Assert-AclPrincipal, Get-AclContract, Set-AclContract, Assert-AclRulesContract, Assert-AclContract
