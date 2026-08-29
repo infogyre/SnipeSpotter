@@ -47,6 +47,7 @@ _CREDENTIAL_LAUNCH_DIAGNOSTIC_FIELDS = (
     "native_error_code",
     "hresult",
     "native_probe",
+    "native_probe_stage",
 )
 _CREDENTIAL_LAUNCH_DIAGNOSTIC_FORBIDDEN_FIELDS = (
     "username",
@@ -91,6 +92,20 @@ _CREDENTIAL_LAUNCH_PROBE_FORBIDDEN_FIELDS = (
     "handle",
 )
 _CREDENTIAL_LAUNCH_PROBE_UNAVAILABLE = "probe_unavailable"
+_CREDENTIAL_LAUNCH_PROBE_STAGES = (
+    "not_started",
+    "password_bstr",
+    "case_setup",
+    "pipe_create",
+    "handle_setup",
+    "process_create",
+    "wait",
+    "terminate",
+    "cleanup",
+    "serialize",
+    "parse",
+    "complete",
+)
 
 
 def read_module(name: str) -> str:
@@ -704,6 +719,7 @@ def test_credentialed_launch_diagnostic_schema_is_exact_and_bounded() -> None:
         "native_error_code": "$nativeErrorCode",
         "hresult": "$hresult",
         "native_probe": "$NativeProbe",
+        "native_probe_stage": "$NativeProbeStage",
     }
     assert "if ($bytes.Length -gt 8192)" in projection
     assert "ConvertTo-Json -Compress -Depth 3" in projection
@@ -712,8 +728,17 @@ def test_credentialed_launch_diagnostic_schema_is_exact_and_bounded() -> None:
     assert "Exception.Message" not in projection
     assert "InnerException" in projection
     assert "native_probe = $NativeProbe" in projection
+    assert "native_probe_stage = $NativeProbeStage" in projection
+    native_probe_stage_match = re.search(
+        r"\[ValidateSet\((?P<stages>'(?:[^']|'')+'(?:\s*,\s*'(?:[^']|'')+')*)\)\]\[string\]\$NativeProbeStage",
+        projection,
+    )
+    assert native_probe_stage_match is not None
+    assert tuple(re.findall(r"'([^']+)'", native_probe_stage_match.group("stages"))) == _CREDENTIAL_LAUNCH_PROBE_STAGES
+    assert "terminate_wait" not in projection
     assert "if ($LaunchStage -ne 'native_start')" in projection
     assert ".Remove('native_probe')" in projection
+    assert ".Remove('native_probe_stage')" in projection
 
 
 def test_credentialed_launch_diagnostic_schema_rejects_privacy_mutations() -> None:
@@ -738,6 +763,8 @@ def test_credentialed_launch_diagnostic_schema_rejects_privacy_mutations() -> No
         assert sensitive_value not in projection
     assert "native_probe = $User" not in projection
     assert "native_probe = @{" not in projection
+    assert "native_probe_stage = $User" not in projection
+    assert "native_probe_stage = @{" not in projection
     assert "ConvertTo-Json -Compress -Depth 3" in projection
 
 
@@ -856,8 +883,8 @@ def _assert_native_start_catch_saves_original_error(source: str) -> None:
     catch = source[catch_start:catch_end]
     assert re.search(
         r"catch\s*\{\s*\$nativeStartErrorRecord\s*=\s*\$_\s*"
-        r"(?:(?!\$nativeProbe).)*?\$nativeProbe\s*=\s*'probe_unavailable'\s*"
-        r"try\s*\{",
+        r"(?:(?!\$nativeProbe(?!Stage)).)*?\$nativeProbe\s*=\s*'probe_unavailable'\s*"
+        r"(?:(?!\bcatch\b).)*?try\s*\{",
         catch,
         re.DOTALL,
     )
@@ -965,9 +992,19 @@ def _assert_credential_launch_probe_evidence_parser_contract(source: str) -> Non
     end = source.index("if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type]))", start)
     helper = source[start:end]
     assert "[string]$ProbeJson" in helper
+    assert "[ref]$Stage" in helper
     assert "ConvertFrom-Json" in helper
     assert "[Text.Encoding]::UTF8.GetBytes($ProbeJson)" in helper
     assert "if ($bytes.Length -gt 4096)" in helper
+    allowed_match = re.search(r"\$allowedStages = @\((.*?)\n\s*\)", helper, re.DOTALL)
+    assert allowed_match is not None
+    assert tuple(re.findall(r"'([^']+)'", allowed_match.group(1))) == _CREDENTIAL_LAUNCH_PROBE_STAGES
+    assert "$Stage.Value = 'parse'" in helper
+    assert "records,stage" in helper
+    assert "$probe.stage" in helper
+    assert "$envelopeStage = [string]$probe.stage" in helper
+    assert "$Stage.Value = $envelopeStage" in helper
+    assert "$records = @($probe.records)" in helper
     for field in ("case", "success", "native_error", "length_bucket"):
         assert re.search(rf"(?m)^\s+{field}\s*=", helper)
     assert "-isnot [string]" in helper
@@ -1029,22 +1066,26 @@ foreach ($fixture in @(
 )) {
     $records[1].native_error = $fixture.native_error
     $records[1].success = $fixture.success
-    $json = $records | ConvertTo-Json -Compress
+    $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3
     $result = & $securityModule {
         param($probeJson)
-        ConvertTo-CredentialLaunchProbeEvidence -ProbeJson $probeJson
+        $stage = 'not_started'
+        $evidence = ConvertTo-CredentialLaunchProbeEvidence -ProbeJson $probeJson -Stage ([ref]$stage)
+        [pscustomobject]@{ evidence = $evidence; stage = $stage }
     } $json
     if ($null -ne $fixture.expected) {
-        if ($result -ne $fixture.expected) {
+        if ($result.evidence -ne $fixture.expected -or $result.stage -ne 'parse') {
             throw "native error range fixture was not rejected: $($fixture.name)"
         }
         continue
     }
-    if ($result.Count -ne 3) { throw "valid native error fixture changed record count: $($fixture.name)" }
-    if ([bool]$result[1].success -ne [bool]$fixture.success) {
+    if ($result.evidence.Count -ne 3 -or $result.stage -ne 'complete') {
+        throw "valid native error fixture changed evidence: $($fixture.name)"
+    }
+    if ([bool]$result.evidence[1].success -ne [bool]$fixture.success) {
         throw "valid native error fixture changed success semantics: $($fixture.name)"
     }
-    if ([int64]$result[1].native_error -ne [int64]$fixture.native_error) {
+    if ([int64]$result.evidence[1].native_error -ne [int64]$fixture.native_error) {
         throw "valid native error fixture changed native error: $($fixture.name)"
     }
 }
@@ -1059,6 +1100,273 @@ Write-Output 'native error range fixtures accepted'
     )
     assert result.returncode == 0, result.stderr or result.stdout
     assert "native error range fixtures accepted" in result.stdout
+
+
+def test_credential_launch_probe_stage_fixtures_are_exact() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for native probe stage fixtures"
+    module = ROOT / "Security.psm1"
+    fixture = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $env:SPOTTER_SECURITY_MODULE -Force
+$securityModule = Get-Module Security
+$records = @(
+    [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; length_bucket = 'short' },
+    [ordered]@{ case = 'long_null_application'; success = $true; native_error = 0; length_bucket = 'over_1024' },
+    [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; length_bucket = 'short' }
+)
+function Parse-Fixture([string]$json) {
+    $stage = 'not_started'
+    $evidence = & $securityModule {
+        param($inputJson, $outputStage)
+        ConvertTo-CredentialLaunchProbeEvidence -ProbeJson $inputJson -Stage $outputStage
+    } $json ([ref]$stage)
+    [pscustomobject]@{ evidence = $evidence; stage = $stage }
+}
+$valid = Parse-Fixture ([pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3)
+if ($valid.stage -ne 'complete' -or $valid.evidence.Count -ne 3) { throw 'valid probe fixture did not complete' }
+$wait = Parse-Fixture ([pscustomobject]@{ stage = 'wait'; records = $records } | ConvertTo-Json -Compress -Depth 3)
+if ($wait.stage -ne 'wait' -or $wait.evidence.Count -ne 3) { throw 'wait stage did not preserve valid probe evidence' }
+$terminate = Parse-Fixture ([pscustomobject]@{ stage = 'terminate'; records = $records } | ConvertTo-Json -Compress -Depth 3)
+if ($terminate.stage -ne 'terminate' -or $terminate.evidence.Count -ne 3) { throw 'termination stage did not preserve valid probe evidence' }
+$malformed = Parse-Fixture '{malformed'
+if ($malformed.stage -ne 'parse' -or $malformed.evidence -ne 'probe_unavailable') { throw 'malformed fixture was not parser-rejected' }
+Write-Output 'native probe stage fixtures accepted'
+'''
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", fixture],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"SPOTTER_SECURITY_MODULE": str(module.resolve())},
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "native probe stage fixtures accepted" in result.stdout
+
+
+def test_credential_launch_probe_rejects_malformed_complete_records_before_publishing_stage() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for malformed probe record fixtures"
+    module = ROOT / "Security.psm1"
+    fixture = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $env:SPOTTER_SECURITY_MODULE -Force
+$securityModule = Get-Module Security
+$fixtures = @('missing_field', 'semantic_mismatch')
+foreach ($fixture in $fixtures) {
+    $records = @(
+        [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; length_bucket = 'short' },
+        [ordered]@{ case = 'long_null_application'; success = $true; native_error = 0; length_bucket = 'over_1024' },
+        [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; length_bucket = 'short' }
+    )
+    if ($fixture -eq 'missing_field') {
+        [void]$records[1].Remove('length_bucket')
+    } else {
+        $records[1].success = $true
+        $records[1].native_error = 17
+    }
+    $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3
+    $result = & $securityModule {
+        param($probeJson)
+        $stage = 'not_started'
+        $evidence = ConvertTo-CredentialLaunchProbeEvidence -ProbeJson $probeJson -Stage ([ref]$stage)
+        [pscustomobject]@{ evidence = $evidence; stage = $stage }
+    } $json
+    if ($result.evidence -ne 'probe_unavailable' -or $result.stage -ne 'parse') {
+        throw "malformed complete fixture published an invalid stage: $fixture ($($result.stage))"
+    }
+}
+Write-Output 'malformed complete probe fixtures rejected'
+'''
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", fixture],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"SPOTTER_SECURITY_MODULE": str(module.resolve())},
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "malformed complete probe fixtures rejected" in result.stdout
+
+
+def _assert_credential_launch_probe_evidence_parser_stage_publication_contract(source: str) -> None:
+    start = source.index("function ConvertTo-CredentialLaunchProbeEvidence")
+    end = source.index("if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type]))", start)
+    helper = source[start:end]
+    parse_assignment = helper.index("$Stage.Value = 'parse'")
+    envelope_assignment = helper.index("$Stage.Value = $envelopeStage")
+    records_start = helper.index("$records = @($probe.records)")
+    final_normalization = helper.rindex("            $normalized += [ordered]@{")
+    return_statement = helper.index("        return (, $normalized)")
+    assert parse_assignment < records_start
+    assert final_normalization < envelope_assignment < return_statement
+
+
+def test_credential_launch_probe_evidence_parser_stage_publication_is_mutation_aware() -> None:
+    module = read_module("Security.psm1")
+    _assert_credential_launch_probe_evidence_parser_stage_publication_contract(module)
+    mutation = module.replace(
+        "        $records = @($probe.records)\n",
+        "        if ($null -ne $Stage) { $Stage.Value = $envelopeStage }\n        $records = @($probe.records)\n",
+        1,
+    )
+    try:
+        _assert_credential_launch_probe_evidence_parser_stage_publication_contract(mutation)
+    except AssertionError:
+        return
+    raise AssertionError("probe parser accepted an early envelope-stage ref assignment")
+
+
+def _assert_credential_launch_probe_stage_contract(probe: str) -> None:
+    for stage in _CREDENTIAL_LAUNCH_PROBE_STAGES:
+        if stage not in ('parse', 'complete'):
+            assert f"$probeStage = '{stage}'" in probe
+    required_order = (
+        "$probeStage = 'not_started'",
+        "$probeStage = 'password_bstr'",
+        "$probeStage = 'case_setup'",
+        "$probeStage = 'pipe_create'",
+        "$probeStage = 'handle_setup'",
+        "$probeStage = 'process_create'",
+        "$probeStage = 'wait'",
+        "$probeStage = 'terminate'",
+        "$probeStage = 'cleanup'",
+        "$probeStage = 'serialize'",
+    )
+    positions = tuple(probe.index(item) for item in required_order)
+    assert positions == tuple(sorted(positions))
+    assert "$probeFailureStage = $null" in probe
+    assert "$probeFailureStage = $probeStage" in probe
+    wait_timeout_start = probe.index("} elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT) {")
+    wait_timeout_end = probe.index("$probeStage = 'terminate'", wait_timeout_start)
+    assert "if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }" in probe[wait_timeout_start:wait_timeout_end]
+    termination_start = probe.index("$terminateSucceeded =")
+    termination_end = probe.index("$terminationWaitResult =", termination_start)
+    assert "$probeFailureStage = $probeStage" in probe[termination_start:termination_end]
+    assert "if ($null -eq $probeFailureStage)" not in probe[termination_start:termination_end]
+    assert "stage = $probeResultStage" in probe
+    assert "$probeResultStage = if ($null -ne $probeFailureStage)" in probe
+    process_failure_start = probe.index("if (-not $success) {")
+    process_failure_end = probe.index("} else {", process_failure_start)
+    assert "$probeFailureStage = $probeStage" in probe[process_failure_start:process_failure_end]
+    wait_timeout_start = probe.index("} elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT) {")
+    wait_timeout_end = probe.index("$probeStage = 'terminate'", wait_timeout_start)
+    assert "$probeFailureStage = $probeStage" in probe[wait_timeout_start:wait_timeout_end]
+    assert "records = $records" in probe
+    assert "ConvertTo-Json -Compress -Depth 3" in probe
+
+
+def test_credential_launch_probe_stage_contract_is_exact_and_mutation_aware() -> None:
+    module = read_module("Security.psm1")
+    probe_start = module.index("function Invoke-CredentialLaunchProbe")
+    probe_end = module.index("function Invoke-AsStandardUser", probe_start)
+    probe = module[probe_start:probe_end]
+    _assert_credential_launch_probe_stage_contract(probe)
+    for expected, replacement in (
+        ("$probeStage = 'password_bstr'", "$probeStage = 'case_setup'"),
+        ("$probeStage = 'pipe_create'", "$probeStage = 'handle_setup'"),
+        ("$probeStage = 'process_create'", "$probeStage = 'wait'"),
+        ("$probeStage = 'wait'", "$probeStage = 'cleanup'"),
+        ("$probeStage = 'serialize'", "$probeStage = 'complete'"),
+    ):
+        mutation = probe.replace(expected, replacement, 1)
+        try:
+            _assert_credential_launch_probe_stage_contract(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError(f"native probe stage mutation was accepted: {expected}")
+
+
+def _assert_native_probe_stage_capture_contract(invoke: str) -> None:
+    assert "$nativeProbeStage = 'not_started'" in invoke
+    assert "-Stage ([ref]$nativeProbeStage)" in invoke
+    assert "-NativeProbeStage $nativeProbeStage" in invoke
+    assert invoke.index("$nativeStartErrorRecord = $_") < invoke.index("$nativeProbeStage = 'not_started'")
+    assert invoke.index("Invoke-CredentialLaunchProbe -User $User") < invoke.index("-NativeProbeStage $nativeProbeStage")
+    assert "catch { $nativeProbe = 'probe_unavailable' }" in invoke
+
+
+def test_credential_launch_probe_stage_capture_preserves_probe_failure_boundary() -> None:
+    module = read_module("Security.psm1")
+    invoke_start = module.index("function Invoke-AsStandardUser")
+    invoke_end = module.index("function Assert-StandardUserCannotReadWrite", invoke_start)
+    invoke = module[invoke_start:invoke_end]
+    _assert_native_probe_stage_capture_contract(invoke)
+    for mutation in (
+        invoke.replace("-NativeProbeStage $nativeProbeStage", "-NativeProbeStage $discardedStage", 1),
+        invoke.replace("catch { $nativeProbe = 'probe_unavailable' }", "catch { $nativeProbe = $_.Exception.Message }", 1),
+    ):
+        try:
+            _assert_native_probe_stage_capture_contract(mutation)
+        except AssertionError:
+            continue
+        raise AssertionError("native probe stage capture mutation was accepted")
+
+
+def test_credential_launch_diagnostic_stage_schema_fixtures() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for diagnostic stage fixtures"
+    module = ROOT / "Security.psm1"
+    fixture = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $env:SPOTTER_SECURITY_MODULE -Force
+$startInfo = [Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = 'fixture.exe'
+$securityModule = Get-Module Security
+$configuration = & $securityModule {
+    param($info)
+    Get-CredentialLaunchDiagnostic -LaunchStage 'configuration' -FailureKind 'configuration' -FailedField 'file_name' -StartInfo $info -ArgumentCount 0 -ErrorRecord ([Exception]::new()) -NativeProbeStage 'not_started'
+} $startInfo | ConvertFrom-Json
+if ($configuration.PSObject.Properties.Name -contains 'native_probe' -or $configuration.PSObject.Properties.Name -contains 'native_probe_stage') { throw 'configuration schema changed' }
+$native = & $securityModule {
+    param($info)
+    Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField 'process_start' -StartInfo $info -ArgumentCount 0 -ErrorRecord ([Exception]::new()) -NativeProbe 'probe_unavailable' -NativeProbeStage 'wait'
+} $startInfo | ConvertFrom-Json
+if ($native.native_probe -ne 'probe_unavailable' -or $native.native_probe_stage -ne 'wait') { throw 'native stage schema missing' }
+Write-Output 'diagnostic stage schema fixtures accepted'
+'''
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", fixture],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"SPOTTER_SECURITY_MODULE": str(module.resolve())},
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "diagnostic stage schema fixtures accepted" in result.stdout
+
+
+def test_credential_launch_probe_stage_fixtures_cover_pre_native_exception() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for native probe exception fixtures"
+    module = ROOT / "Security.psm1"
+    fixture = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $env:SPOTTER_SECURITY_MODULE -Force
+$securityModule = Get-Module Security
+$stage = 'not_started'
+try {
+    & $securityModule {
+        param([ref]$outputStage)
+        Invoke-CredentialLaunchProbe -User ([pscustomobject]@{ Password = $null }) -Stage $outputStage
+    } ([ref]$stage)
+} catch { }
+if ($stage -ne 'password_bstr') { throw "probe exception stage was not preserved: $stage" }
+Write-Output 'native probe exception fixture accepted'
+'''
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", fixture],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"SPOTTER_SECURITY_MODULE": str(module.resolve())},
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "native probe exception fixture accepted" in result.stdout
 
 
 def test_credential_launch_probe_evidence_parser_rejects_range_bound_mutations() -> None:
@@ -1198,13 +1506,6 @@ def test_credential_launch_probe_wait_and_termination_mutations_are_rejected() -
         module.replace("WAIT_TIMEOUT", "WAIT_OBJECT_0", 1),
         module.replace("TerminateProcess", "CloseHandle", 1),
         module.replace("hProcess, 1", "hThread, 1", 1),
-        module.replace(
-            "} elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {\n"
-            "                        $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()",
-            "} elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {\n"
-            "                        $nativeError = 1",
-            1,
-        ),
         module.replace(
             "hProcess, 1000)",
             "hProcess, 0)",
@@ -1789,6 +2090,13 @@ def main() -> None:
     test_credentialed_native_start_capture_preserves_probe_and_original_error()
     test_credentialed_native_start_capture_mutations_are_rejected()
     test_credential_launch_probe_evidence_parser_is_exact_and_bounded()
+    test_credential_launch_probe_rejects_malformed_complete_records_before_publishing_stage()
+    test_credential_launch_probe_evidence_parser_stage_publication_is_mutation_aware()
+    test_credential_launch_probe_stage_fixtures_are_exact()
+    test_credential_launch_probe_stage_contract_is_exact_and_mutation_aware()
+    test_credential_launch_probe_stage_capture_preserves_probe_failure_boundary()
+    test_credential_launch_diagnostic_stage_schema_fixtures()
+    test_credential_launch_probe_stage_fixtures_cover_pre_native_exception()
     test_credential_launch_probe_evidence_parser_enforces_int32_native_error_range()
     test_credential_launch_probe_evidence_parser_rejects_range_bound_mutations()
     test_credential_launch_probe_evidence_parser_rejects_nested_mutations()

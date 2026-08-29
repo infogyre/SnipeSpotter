@@ -118,7 +118,8 @@ function Get-CredentialLaunchDiagnostic {
         [Parameter(Mandatory = $true)][Diagnostics.ProcessStartInfo]$StartInfo,
         [Parameter(Mandatory = $true)][ValidateRange(0, 4096)][int]$ArgumentCount,
         [Parameter(Mandatory = $true)][object]$ErrorRecord,
-        [Parameter(Mandatory = $false)][object]$NativeProbe = 'probe_unavailable'
+        [Parameter(Mandatory = $false)][object]$NativeProbe = 'probe_unavailable',
+        [Parameter(Mandatory = $false)][ValidateSet('not_started', 'password_bstr', 'case_setup', 'pipe_create', 'handle_setup', 'process_create', 'wait', 'terminate', 'cleanup', 'serialize', 'parse', 'complete')][string]$NativeProbeStage = 'not_started'
     )
 
     $nativeErrorCode = 0
@@ -171,8 +172,12 @@ function Get-CredentialLaunchDiagnostic {
         native_error_code = $nativeErrorCode
         hresult = $hresult
         native_probe = $NativeProbe
+        native_probe_stage = $NativeProbeStage
     }
-    if ($LaunchStage -ne 'native_start') { [void]$diagnostic.Remove('native_probe') }
+    if ($LaunchStage -ne 'native_start') {
+        [void]$diagnostic.Remove('native_probe')
+        [void]$diagnostic.Remove('native_probe_stage')
+    }
     $json = $diagnostic | ConvertTo-Json -Compress -Depth 3
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
     if ($bytes.Length -gt 8192) { throw 'credential launch diagnostics exceeded the bounded size' }
@@ -182,13 +187,34 @@ function Get-CredentialLaunchDiagnostic {
 function ConvertTo-CredentialLaunchProbeEvidence {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ProbeJson
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$ProbeJson,
+        [Parameter(Mandatory = $false)][ref]$Stage
     )
 
+    $allowedStages = @(
+        'not_started',
+        'password_bstr',
+        'case_setup',
+        'pipe_create',
+        'handle_setup',
+        'process_create',
+        'wait',
+        'terminate',
+        'cleanup',
+        'serialize',
+        'parse',
+        'complete'
+    )
+    if ($null -ne $Stage) { $Stage.Value = 'parse' }
     try {
         $bytes = [Text.Encoding]::UTF8.GetBytes($ProbeJson)
         if ($bytes.Length -gt 4096) { throw 'credential launch probe exceeded the bounded size' }
-        $records = @(ConvertFrom-Json -InputObject $ProbeJson -Depth 3 -ErrorAction Stop)
+        $probe = ConvertFrom-Json -InputObject $ProbeJson -Depth 3 -ErrorAction Stop
+        $probeProperties = @($probe.PSObject.Properties.Name | Sort-Object)
+        if (($probeProperties -join ',') -cne 'records,stage') { throw 'credential launch probe envelope schema was invalid' }
+        if ($probe.stage -isnot [string] -or $probe.stage -cnotin $allowedStages) { throw 'credential launch probe stage was invalid' }
+        $envelopeStage = [string]$probe.stage
+        $records = @($probe.records)
         $expectedCases = @(
             'short_null_application',
             'long_null_application',
@@ -230,6 +256,7 @@ function ConvertTo-CredentialLaunchProbeEvidence {
                 length_bucket = [string]$record.length_bucket
             }
         }
+        if ($null -ne $Stage) { $Stage.Value = $envelopeStage }
         return (, $normalized)
     } catch {
         return 'probe_unavailable'
@@ -339,7 +366,8 @@ namespace SnipeSpotter
 function Invoke-CredentialLaunchProbe {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][psobject]$User
+        [Parameter(Mandatory = $true)][psobject]$User,
+        [Parameter(Mandatory = $false)][ref]$Stage
     )
 
     $commandExecutable = Join-Path $PSHOME 'pwsh.exe'
@@ -359,9 +387,16 @@ function Invoke-CredentialLaunchProbe {
     $bInheritHandles = $true
     $passwordPointer = [IntPtr]::Zero
     $records = @()
+    $probeStage = 'not_started'
+    $probeFailureStage = $null
+    if ($null -ne $Stage) { $Stage.Value = $probeStage }
     try {
+        $probeStage = 'password_bstr'
+        if ($null -ne $Stage) { $Stage.Value = $probeStage }
         $passwordPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($User.Password)
         foreach ($case in $cases) {
+            $probeStage = 'case_setup'
+            if ($null -ne $Stage) { $Stage.Value = $probeStage }
             $command = $case.Command
             $commandPointer = [IntPtr]::Zero
             $hInputRead = [IntPtr]::Zero
@@ -377,6 +412,8 @@ function Invoke-CredentialLaunchProbe {
                 $securityAttributes = [SnipeSpotter.CredentialLaunchNative+SECURITY_ATTRIBUTES]::new()
                 $securityAttributes.nLength = [Runtime.InteropServices.Marshal]::SizeOf($securityAttributes)
                 $securityAttributes.bInheritHandle = $bInheritHandles
+                $probeStage = 'pipe_create'
+                if ($null -ne $Stage) { $Stage.Value = $probeStage }
                 if (-not [SnipeSpotter.CredentialLaunchNative]::CreatePipe(
                         [ref]$hInputRead,
                         [ref]$hInputWrite,
@@ -404,6 +441,8 @@ function Invoke-CredentialLaunchProbe {
                     $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                     throw 'credential probe error pipe creation failed'
                 }
+                $probeStage = 'handle_setup'
+                if ($null -ne $Stage) { $Stage.Value = $probeStage }
                 if (-not [SnipeSpotter.CredentialLaunchNative]::SetHandleInformation(
                         $hInputWrite,
                         [SnipeSpotter.CredentialLaunchNative]::HANDLE_FLAG_INHERIT,
@@ -436,6 +475,8 @@ function Invoke-CredentialLaunchProbe {
                 $startupInfo.hStdOutput = $hOutputWrite
                 $startupInfo.hStdError = $hErrorWrite
                 $commandPointer = [Runtime.InteropServices.Marshal]::StringToHGlobalUni($command)
+                $probeStage = 'process_create'
+                if ($null -ne $Stage) { $Stage.Value = $probeStage }
                 $success = [SnipeSpotter.CredentialLaunchNative]::CreateProcessWithLogonW(
                     $User.Name,
                     $User.Domain,
@@ -450,42 +491,59 @@ function Invoke-CredentialLaunchProbe {
                     [ref]$processInfo
                 )
                 if (-not $success) {
+                    if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
                     $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                 } else {
+                    $probeStage = 'wait'
+                    if ($null -ne $Stage) { $Stage.Value = $probeStage }
                     $waitResult = [SnipeSpotter.CredentialLaunchNative]::WaitForSingleObject($processInfo.hProcess, 5000)
                     if ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_OBJECT_0) {
                         # The credentialed probe child exited within the bounded wait.
                     } elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT) {
+                        if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
                         $nativeError = [int]$waitResult
+                        $probeStage = 'terminate'
+                        if ($null -ne $Stage) { $Stage.Value = $probeStage }
                         $terminateSucceeded = [SnipeSpotter.CredentialLaunchNative]::TerminateProcess($processInfo.hProcess, 1)
                         if (-not $terminateSucceeded) {
+                            $probeFailureStage = $probeStage
                             $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                             throw 'credential probe child termination failed'
                         }
+                        $probeStage = 'terminate'
+                        if ($null -ne $Stage) { $Stage.Value = $probeStage }
                         $terminationWaitResult = [SnipeSpotter.CredentialLaunchNative]::WaitForSingleObject($processInfo.hProcess, 1000)
                         if ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_OBJECT_0) {
                             # The timed-out credentialed probe child was terminated within the bounded wait.
                         } elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT) {
+                            $probeFailureStage = $probeStage
                             $nativeError = [int]$terminationWaitResult
                             throw 'credential probe child termination did not complete within the bounded wait'
                         } elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {
+                            $probeFailureStage = $probeStage
                             $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                             throw 'credential probe child termination wait failed'
                         } else {
+                            $probeFailureStage = $probeStage
                             $nativeError = [int]$terminationWaitResult
                             throw 'credential probe child termination returned an unexpected wait status'
                         }
                     } elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {
+                        if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
                         $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                         throw 'credential probe child wait failed'
                     } else {
+                        if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
                         $nativeError = [int]$waitResult
                         throw 'credential probe child returned an unexpected wait status'
                     }
                 }
             } catch {
+                if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
                 if ($nativeError -eq 0) { $nativeError = 1 }
             } finally {
+                $probeStage = 'cleanup'
+                if ($null -ne $Stage) { $Stage.Value = $probeStage }
                 if ($commandPointer -ne [IntPtr]::Zero) {
                     [Runtime.InteropServices.Marshal]::FreeHGlobal($commandPointer)
                 }
@@ -514,12 +572,20 @@ function Invoke-CredentialLaunchProbe {
         }
     } finally {
         if ($passwordPointer -ne [IntPtr]::Zero) {
+            $probeStage = 'cleanup'
+            if ($null -ne $Stage) { $Stage.Value = $probeStage }
             [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordPointer)
         }
     }
-    $json = $records | ConvertTo-Json -Compress -Depth 3
+    $probeStage = 'serialize'
+    if ($null -ne $Stage) { $Stage.Value = $probeStage }
+    $probeResultStage = if ($null -ne $probeFailureStage) { $probeFailureStage } else { 'complete' }
+    $json = [pscustomobject]@{ stage = $probeResultStage; records = $records } | ConvertTo-Json -Compress -Depth 3
     $bytes = [Text.Encoding]::UTF8.GetBytes($json)
     if ($bytes.Length -gt 4096) { throw 'credential launch probe exceeded the bounded size' }
+    if ($null -ne $Stage) {
+        $Stage.Value = $probeResultStage
+    }
     return $json
 }
 
@@ -580,11 +646,12 @@ function Invoke-AsStandardUser {
         } catch {
             $nativeStartErrorRecord = $_
             $nativeProbe = 'probe_unavailable'
+            $nativeProbeStage = 'not_started'
             try {
-                $probeJson = Invoke-CredentialLaunchProbe -User $User
-                $nativeProbe = ConvertTo-CredentialLaunchProbeEvidence -ProbeJson ([string]$probeJson)
+                $probeJson = Invoke-CredentialLaunchProbe -User $User -Stage ([ref]$nativeProbeStage)
+                $nativeProbe = ConvertTo-CredentialLaunchProbeEvidence -ProbeJson ([string]$probeJson) -Stage ([ref]$nativeProbeStage)
             } catch { $nativeProbe = 'probe_unavailable' }
-            $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $nativeStartErrorRecord -NativeProbe $nativeProbe
+            $diagnostic = Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField $failedField -StartInfo $startInfo -ArgumentCount $argumentCount -ErrorRecord $nativeStartErrorRecord -NativeProbe $nativeProbe -NativeProbeStage $nativeProbeStage
             throw "credentialed launch failed: $diagnostic"
         }
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
