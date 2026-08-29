@@ -46,12 +46,204 @@ function Assert-True {
 
 Assert-True ($ProcessTimeoutSeconds -ge $MinimumProcessTimeoutSeconds) "ProcessTimeoutSeconds must be at least $MinimumProcessTimeoutSeconds seconds"
 
+function Initialize-BoundedProcessCaptureType {
+    if ($null -eq ('SnipeSpotter.Ac4BoundedProcessCapture' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Diagnostics;
+using System.Text;
+
+namespace SnipeSpotter
+{
+    public sealed class Ac4BoundedProcessCapture : IDisposable
+    {
+        private readonly object gate = new object();
+        private readonly string sentinel;
+        private readonly int maxCharacters;
+        private readonly StringBuilder stdout = new StringBuilder();
+        private readonly StringBuilder stderr = new StringBuilder();
+        private string stdoutTail = string.Empty;
+        private string stderrTail = string.Empty;
+        private bool stdoutSentinelFound;
+        private bool stderrSentinelFound;
+        private bool stdoutRetainedTruncated;
+        private bool stderrRetainedTruncated;
+        private bool stdoutScanComplete;
+        private bool stderrScanComplete;
+        private bool scanError;
+        private bool disposed;
+
+        public Ac4BoundedProcessCapture(string sentinel, int maxCharacters)
+        {
+            if (string.IsNullOrEmpty(sentinel))
+            {
+                throw new ArgumentException("sentinel must not be empty", nameof(sentinel));
+            }
+            if (maxCharacters < 0)
+            {
+                throw new ArgumentOutOfRangeException(nameof(maxCharacters));
+            }
+            this.sentinel = sentinel;
+            this.maxCharacters = maxCharacters;
+            StdoutHandler = new DataReceivedEventHandler(OnStdout);
+            StderrHandler = new DataReceivedEventHandler(OnStderr);
+        }
+
+        public DataReceivedEventHandler StdoutHandler { get; }
+        public DataReceivedEventHandler StderrHandler { get; }
+
+        public string Stdout
+        {
+            get { lock (gate) { return stdout.ToString(); } }
+        }
+
+        public string Stderr
+        {
+            get { lock (gate) { return stderr.ToString(); } }
+        }
+
+        public bool StdoutSentinelFound { get { lock (gate) { return stdoutSentinelFound; } } }
+        public bool StderrSentinelFound { get { lock (gate) { return stderrSentinelFound; } } }
+        public bool StdoutRetainedTruncated { get { lock (gate) { return stdoutRetainedTruncated; } } }
+        public bool StderrRetainedTruncated { get { lock (gate) { return stderrRetainedTruncated; } } }
+        public bool StdoutScanComplete { get { lock (gate) { return stdoutScanComplete; } } }
+        public bool StderrScanComplete { get { lock (gate) { return stderrScanComplete; } } }
+        public bool ScanError { get { lock (gate) { return scanError; } } }
+
+        public void Append(string streamName, string chunk)
+        {
+            if (streamName != "Stdout" && streamName != "Stderr")
+            {
+                throw new ArgumentException("unknown stream", nameof(streamName));
+            }
+            if (chunk == null)
+            {
+                return;
+            }
+            lock (gate)
+            {
+                if (disposed)
+                {
+                    throw new ObjectDisposedException(nameof(Ac4BoundedProcessCapture));
+                }
+                if (streamName == "Stdout")
+                {
+                    AppendStream(chunk, stdout, ref stdoutTail, ref stdoutSentinelFound, ref stdoutRetainedTruncated);
+                }
+                else
+                {
+                    AppendStream(chunk, stderr, ref stderrTail, ref stderrSentinelFound, ref stderrRetainedTruncated);
+                }
+            }
+        }
+
+        public void CompleteStdout()
+        {
+            lock (gate) { stdoutScanComplete = true; }
+        }
+
+        public void CompleteStderr()
+        {
+            lock (gate) { stderrScanComplete = true; }
+        }
+
+        private void OnStdout(object sender, DataReceivedEventArgs args)
+        {
+            try
+            {
+                if (args == null || args.Data == null)
+                {
+                    lock (gate) { stdoutScanComplete = true; }
+                    return;
+                }
+                Append("Stdout", args.Data);
+            }
+            catch { lock (gate) { scanError = true; } }
+        }
+
+        private void OnStderr(object sender, DataReceivedEventArgs args)
+        {
+            try
+            {
+                if (args == null || args.Data == null)
+                {
+                    lock (gate) { stderrScanComplete = true; }
+                    return;
+                }
+                Append("Stderr", args.Data);
+            }
+            catch { lock (gate) { scanError = true; } }
+        }
+
+        private void AppendStream(
+            string chunk,
+            StringBuilder retained,
+            ref string scanTail,
+            ref bool sentinelFound,
+            ref bool retainedTruncated)
+        {
+            string combined = scanTail + chunk;
+            if (combined.IndexOf(sentinel, StringComparison.Ordinal) >= 0)
+            {
+                sentinelFound = true;
+            }
+
+            int remaining = maxCharacters - retained.Length;
+            if (chunk.Length > Math.Max(0, remaining))
+            {
+                retainedTruncated = true;
+            }
+            if (remaining > 0)
+            {
+                retained.Append(chunk, 0, Math.Min(remaining, chunk.Length));
+            }
+
+            int tailLength = Math.Min(Math.Max(0, sentinel.Length - 1), combined.Length);
+            scanTail = tailLength == 0
+                ? string.Empty
+                : combined.Substring(combined.Length - tailLength, tailLength);
+        }
+
+        public void Dispose()
+        {
+            lock (gate) { disposed = true; }
+        }
+    }
+}
+'@
+    }
+}
+
+function Sync-BoundedProcessCaptureState {
+    param([Parameter(Mandatory = $true)][hashtable]$Capture)
+    if (-not $Capture.ContainsKey('NativeCapture') -or $null -eq $Capture['NativeCapture']) { return }
+    $native = $Capture['NativeCapture']
+    $Capture.Stdout = [Text.StringBuilder]::new($native.Stdout)
+    $Capture.Stderr = [Text.StringBuilder]::new($native.Stderr)
+    $Capture.StdoutSentinelFound = $native.StdoutSentinelFound
+    $Capture.StderrSentinelFound = $native.StderrSentinelFound
+    $Capture.StdoutRetainedTruncated = $native.StdoutRetainedTruncated
+    $Capture.StderrRetainedTruncated = $native.StderrRetainedTruncated
+    $Capture.StdoutScanComplete = $native.StdoutScanComplete
+    $Capture.StderrScanComplete = $native.StderrScanComplete
+    $Capture.ScanError = $native.ScanError
+}
+
 function Write-BoundedProcessCaptureStream {
     param(
         [Parameter(Mandatory = $true)][hashtable]$Capture,
         [Parameter(Mandatory = $true)][ValidateSet('Stdout', 'Stderr')][string]$StreamName,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Chunk
     )
+
+    if ($Capture.ContainsKey('NativeCapture') -and $null -ne $Capture['NativeCapture']) {
+        try {
+            $Capture['NativeCapture'].Append($StreamName, $Chunk)
+        } catch {
+            $Capture.ScanError = $true
+        }
+        return
+    }
 
     $builder = $Capture[$StreamName]
     $tailName = "${StreamName}ScanTail"
@@ -87,11 +279,23 @@ function Complete-BoundedProcessCaptureStream {
         [Parameter(Mandatory = $true)][hashtable]$Capture,
         [Parameter(Mandatory = $true)][ValidateSet('Stdout', 'Stderr')][string]$StreamName
     )
+    if ($Capture.ContainsKey('NativeCapture') -and $null -ne $Capture['NativeCapture']) {
+        if ($StreamName -eq 'Stdout') {
+            $Capture['NativeCapture'].CompleteStdout()
+        } else {
+            $Capture['NativeCapture'].CompleteStderr()
+        }
+        Sync-BoundedProcessCaptureState -Capture $Capture
+        return
+    }
     $Capture["${StreamName}ScanComplete"] = $true
 }
 
 function Assert-BoundedProcessCaptureSafe {
     param([Parameter(Mandatory = $true)][hashtable]$Capture)
+    if ($null -ne (Get-Command Sync-BoundedProcessCaptureState -ErrorAction SilentlyContinue)) {
+        Sync-BoundedProcessCaptureState -Capture $Capture
+    }
     foreach ($streamName in @('Stdout', 'Stderr')) {
         if ([bool]$Capture["${StreamName}SentinelFound"]) {
             throw 'bounded process output contains the token sentinel'
@@ -108,31 +312,17 @@ function Assert-BoundedProcessCaptureSafe {
 function Get-BoundedProcessCapture {
     param([Parameter(Mandatory = $true)][hashtable]$Capture)
     Assert-True ($null -ne $Capture) 'bounded process capture state must not be null'
-    $stdoutHandler = [Diagnostics.DataReceivedEventHandler]{
-        param($sourceProcess, $outputRecord)
-        [void]$sourceProcess
-        try {
-            if ($null -ne $outputRecord.Data) {
-                Write-BoundedProcessCaptureStream -Capture $Capture -StreamName 'Stdout' -Chunk $outputRecord.Data
-            }
-        } catch {
-            $Capture.ScanError = $true
-        }
-    }
-    $stderrHandler = [Diagnostics.DataReceivedEventHandler]{
-        param($sourceProcess, $errorRecord)
-        [void]$sourceProcess
-        try {
-            if ($null -ne $errorRecord.Data) {
-                Write-BoundedProcessCaptureStream -Capture $Capture -StreamName 'Stderr' -Chunk $errorRecord.Data
-            }
-        } catch {
-            $Capture.ScanError = $true
-        }
+    Initialize-BoundedProcessCaptureType
+    if (-not $Capture.ContainsKey('NativeCapture') -or $null -eq $Capture['NativeCapture']) {
+        $Capture.NativeCapture = [SnipeSpotter.Ac4BoundedProcessCapture]::new(
+            [string]$Capture.Sentinel,
+            [int]$Capture.MaxCharacters
+        )
     }
     [pscustomobject]@{
-        StdoutHandler = $stdoutHandler
-        StderrHandler = $stderrHandler
+        StdoutHandler = $Capture.NativeCapture.StdoutHandler
+        StderrHandler = $Capture.NativeCapture.StderrHandler
+        NativeCapture = $Capture.NativeCapture
     }
 }
 
@@ -216,6 +406,25 @@ function Invoke-BoundedStandardInput {
         if ($stdinError -and $stdinCleanupError) { throw 'child stdin operation failed and cleanup failed' }
         if ($stdinError) { throw $stdinError }
         throw 'child process cleanup failed'
+    }
+}
+
+function Invoke-BoundedProcessCaptureCleanup {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][object]$Handlers
+    )
+    $cleanupFailed = $false
+    try { $Process.remove_OutputDataReceived($Handlers.StdoutHandler) } catch { $cleanupFailed = $true }
+    try { $Process.remove_ErrorDataReceived($Handlers.StderrHandler) } catch { $cleanupFailed = $true }
+    try {
+        $nativeProperty = $Handlers.PSObject.Properties['NativeCapture']
+        if ($null -ne $nativeProperty -and $null -ne $nativeProperty.Value) {
+            $nativeProperty.Value.Dispose()
+        }
+    } catch { $cleanupFailed = $true }
+    if ($cleanupFailed) {
+        throw 'child process capture cleanup failed'
     }
 }
 
@@ -330,9 +539,14 @@ function Invoke-DirectCli {
         }
     } finally {
         try {
-            Invoke-BoundedProcessCleanup -Process $process -Started $started
+            Invoke-BoundedProcessCaptureCleanup -Process $process -Handlers $handlers
         } catch {
             $cleanupError = $_
+        }
+        try {
+            Invoke-BoundedProcessCleanup -Process $process -Started $started
+        } catch {
+            if ($null -eq $cleanupError) { $cleanupError = $_ }
         }
     }
     if ($primaryError -and $cleanupError) { throw 'child process operation failed and cleanup failed' }
@@ -424,9 +638,14 @@ function Invoke-TokenCli {
         }
     } finally {
         try {
-            Invoke-BoundedProcessCleanup -Process $process -Started $started
+            Invoke-BoundedProcessCaptureCleanup -Process $process -Handlers $handlers
         } catch {
             $cleanupError = $_
+        }
+        try {
+            Invoke-BoundedProcessCleanup -Process $process -Started $started
+        } catch {
+            if ($null -eq $cleanupError) { $cleanupError = $_ }
         }
     }
     if ($primaryError -and $cleanupError) { throw 'child process operation failed and cleanup failed' }

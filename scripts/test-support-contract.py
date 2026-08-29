@@ -272,6 +272,120 @@ Write-Output 'stream capture fixture accepted'
 """
 
 
+def _real_process_capture_fixture(helpers: str, child_command: str, assertions: str, post_process: str = "", skip_explicit_completion: bool = False) -> str:
+    escaped_child_command = child_command.replace("'", "''")
+    skip_completion_literal = "$true" if skip_explicit_completion else "$false"
+    return f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helpers}
+$sentinel = 'real-handler-sentinel'
+$capture = [hashtable]::Synchronized(@{{
+    Sentinel = $sentinel
+    MaxCharacters = 65536
+    Stdout = [Text.StringBuilder]::new()
+    Stderr = [Text.StringBuilder]::new()
+    StdoutScanTail = ''
+    StderrScanTail = ''
+    StdoutSentinelFound = $false
+    StderrSentinelFound = $false
+    StdoutRetainedTruncated = $false
+    StderrRetainedTruncated = $false
+    StdoutScanComplete = $false
+    StderrScanComplete = $false
+    ScanError = $false
+}})
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = (Get-Command pwsh).Source
+$info.UseShellExecute = $false
+$info.CreateNoWindow = $true
+$info.RedirectStandardOutput = $true
+$info.RedirectStandardError = $true
+[void]$info.ArgumentList.Add('-NoLogo')
+[void]$info.ArgumentList.Add('-NoProfile')
+[void]$info.ArgumentList.Add('-NonInteractive')
+[void]$info.ArgumentList.Add('-Command')
+[void]$info.ArgumentList.Add('{escaped_child_command}')
+$process = [Diagnostics.Process]::new()
+$process.StartInfo = $info
+$handlers = Get-BoundedProcessCapture -Capture $capture
+$skip_explicit_completion = {skip_completion_literal}
+$process.add_OutputDataReceived($handlers.StdoutHandler)
+$process.add_ErrorDataReceived($handlers.StderrHandler)
+try {{
+    if (-not $process.Start()) {{ throw 'child did not start' }}
+    $process.BeginOutputReadLine()
+    $process.BeginErrorReadLine()
+    if (-not $process.WaitForExit(10000)) {{ throw 'child did not exit' }}
+    if (-not $process.WaitForExit(10000)) {{ throw 'child output did not drain' }}
+    if (-not $skip_explicit_completion) {{
+        Complete-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stdout'
+        Complete-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stderr'
+    }}
+    {post_process}
+    {assertions}
+    Write-Output 'real handler fixture accepted'
+}} finally {{
+    try {{ $process.remove_OutputDataReceived($handlers.StdoutHandler) }} catch {{ }}
+    try {{ $process.remove_ErrorDataReceived($handlers.StderrHandler) }} catch {{ }}
+    if (-not $process.HasExited) {{ try {{ $process.Kill($true); $process.WaitForExit(1000) }} catch {{ }} }}
+    $process.Dispose()
+}}
+"""
+
+
+def test_ac4_real_capture_handlers_are_runspace_independent() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helpers = "\n".join(
+        _powershell_function(source, name)
+        for name in (
+            "Assert-True",
+            "Initialize-BoundedProcessCaptureType",
+            "Sync-BoundedProcessCaptureState",
+            "Write-BoundedProcessCaptureStream",
+            "Complete-BoundedProcessCaptureStream",
+            "Get-BoundedProcessCapture",
+        )
+    )
+    child_command = (
+        "[Console]::Out.WriteLine(\"clean-stdout\"); "
+        "[Console]::Out.WriteLine((\"x\" * 65536) + \"real-handler-\"); "
+        "[Console]::Out.WriteLine(\"sentinel\"); "
+        "[Console]::Error.WriteLine(\"clean-stderr\")"
+    )
+    post_process = (
+        "$capture.NativeCapture.Dispose(); "
+        "$disposedArgs = [Activator]::CreateInstance([Diagnostics.DataReceivedEventArgs], [Reflection.BindingFlags]::Instance -bor [Reflection.BindingFlags]::NonPublic, $null, @(\"after-dispose\"), $null); "
+        "$capture.NativeCapture.StdoutHandler.Invoke($null, $disposedArgs); "
+        "Sync-BoundedProcessCaptureState -Capture $capture; "
+        "$handlerErrorRejected = $false; "
+        "try { Assert-BoundedProcessCaptureSafe -Capture $capture } catch { $handlerErrorRejected = $true }; "
+        "if (-not $capture.ScanError -or -not $handlerErrorRejected) { throw \"handler error was accepted\" }"
+    )
+    assertions = (
+        "if ($capture.Stdout.ToString().Length -gt 65536) { throw \"stdout retention exceeded the bound\" }; "
+        "if ($capture.Stderr.ToString() -cne \"clean-stderr\") { throw \"clean stderr was not retained\" }; "
+        "if (-not $capture.StdoutSentinelFound) { throw \"stdout cross-boundary sentinel was missed\" }; "
+        "if ($capture.StderrSentinelFound) { throw \"clean stderr was reported as a sentinel\" }; "
+        "if (-not $capture.StdoutRetainedTruncated) { throw \"stdout truncation was not tracked\" }; "
+        "if ($capture.StderrRetainedTruncated) { throw \"clean stderr was reported as truncated\" }; "
+        "if (-not $capture.StdoutScanComplete -or -not $capture.StderrScanComplete) { throw \"EOF completion was missed\" }; "
+        "$rejected = $false; "
+        "try { Assert-BoundedProcessCaptureSafe -Capture $capture } catch { $rejected = $true }; "
+        "if (-not $rejected) { throw \"sentinel-bearing output was accepted\" }"
+    )
+    fixture = _real_process_capture_fixture(
+        helpers,
+        child_command,
+        assertions,
+        post_process,
+        skip_explicit_completion=True,
+    )
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "real handler fixture accepted" in result.stdout
+
+
 def test_ac4_stream_capture_is_incremental_bounded_and_fail_closed() -> None:
     source = DIRECT_SCM.read_text(encoding="utf-8")
     required = (
@@ -717,6 +831,8 @@ def test_ac4_caller_successfully_closes_stdin_without_strict_mode_cleanup_failur
     source = DIRECT_SCM.read_text(encoding="utf-8")
     helper_names = (
         "Assert-True",
+        "Initialize-BoundedProcessCaptureType",
+        "Sync-BoundedProcessCaptureState",
         "Write-BoundedProcessCaptureStream",
         "Complete-BoundedProcessCaptureStream",
         "Assert-BoundedProcessCaptureSafe",
@@ -725,6 +841,7 @@ def test_ac4_caller_successfully_closes_stdin_without_strict_mode_cleanup_failur
         "Invoke-BoundedProcessStop",
         "Wait-BoundedTask",
         "Invoke-BoundedStandardInput",
+        "Invoke-BoundedProcessCaptureCleanup",
         "Invoke-BoundedProcessCleanup",
         "Wait-BoundedProcessOutput",
         "Invoke-TokenCli",
@@ -736,20 +853,6 @@ def test_ac4_caller_successfully_closes_stdin_without_strict_mode_cleanup_failur
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 {helpers}
-Add-Type @'
-using System;
-using System.Diagnostics;
-public static class Ac4CallerFixtureHandlers
-{{
-    public static void OnData(object sender, DataReceivedEventArgs args) {{ }}
-}}
-'@
-function Get-BoundedProcessCapture {{
-    [pscustomobject]@{{
-        StdoutHandler = [Diagnostics.DataReceivedEventHandler][Ac4CallerFixtureHandlers]::OnData
-        StderrHandler = [Diagnostics.DataReceivedEventHandler][Ac4CallerFixtureHandlers]::OnData
-    }}
-}}
 $CliPath = (Get-Command pwsh).Source
 $ProcessTimeoutSeconds = 10
 $result = @(Invoke-TokenCli -Arguments @(
@@ -770,6 +873,8 @@ def test_ac4_caller_lifecycle_fixtures_cover_failures_and_descendants() -> None:
     source = DIRECT_SCM.read_text(encoding="utf-8")
     helper_names = (
         "Assert-True",
+        "Initialize-BoundedProcessCaptureType",
+        "Sync-BoundedProcessCaptureState",
         "Write-BoundedProcessCaptureStream",
         "Complete-BoundedProcessCaptureStream",
         "Assert-BoundedProcessCaptureSafe",
@@ -790,20 +895,6 @@ def test_ac4_caller_lifecycle_fixtures_cover_failures_and_descendants() -> None:
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 {helpers}
-Add-Type @'
-using System;
-using System.Diagnostics;
-public static class Ac4LifecycleFixtureHandlers
-{{
-    public static void OnData(object sender, DataReceivedEventArgs args) {{ }}
-}}
-'@
-function Get-BoundedProcessCapture {{
-    [pscustomobject]@{{
-        StdoutHandler = [Diagnostics.DataReceivedEventHandler][Ac4LifecycleFixtureHandlers]::OnData
-        StderrHandler = [Diagnostics.DataReceivedEventHandler][Ac4LifecycleFixtureHandlers]::OnData
-    }}
-}}
 $CliPath = (Get-Command pwsh).Source
 $ProcessTimeoutSeconds = 1
 $token = 'lifecycle-fixture-token'
@@ -853,6 +944,8 @@ def test_ac4_caller_stdin_failure_fixtures_are_bounded_and_cleanup_processes() -
     source = DIRECT_SCM.read_text(encoding="utf-8")
     helper_names = (
         "Assert-True",
+        "Initialize-BoundedProcessCaptureType",
+        "Sync-BoundedProcessCaptureState",
         "Write-BoundedProcessCaptureStream",
         "Complete-BoundedProcessCaptureStream",
         "Assert-BoundedProcessCaptureSafe",
@@ -861,6 +954,7 @@ def test_ac4_caller_stdin_failure_fixtures_are_bounded_and_cleanup_processes() -
         "Invoke-BoundedProcessStop",
         "Wait-BoundedTask",
         "Invoke-BoundedStandardInput",
+        "Invoke-BoundedProcessCaptureCleanup",
         "Invoke-BoundedProcessCleanup",
         "Wait-BoundedProcessOutput",
         "Invoke-TokenCli",
@@ -882,20 +976,6 @@ def test_ac4_caller_stdin_failure_fixtures_are_bounded_and_cleanup_processes() -
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 {helpers}
-Add-Type @'
-using System;
-using System.Diagnostics;
-public static class Ac4StdinFixtureHandlers
-{{
-    public static void OnData(object sender, DataReceivedEventArgs args) {{ }}
-}}
-'@
-function Get-BoundedProcessCapture {{
-    [pscustomobject]@{{
-        StdoutHandler = [Diagnostics.DataReceivedEventHandler][Ac4StdinFixtureHandlers]::OnData
-        StderrHandler = [Diagnostics.DataReceivedEventHandler][Ac4StdinFixtureHandlers]::OnData
-    }}
-}}
 $CliPath = (Get-Command pwsh).Source
 $ProcessTimeoutSeconds = 5
 $marker = Join-Path ([IO.Path]::GetTempPath()) ('ac4-stdin-' + [Guid]::NewGuid().ToString('N'))
@@ -1010,6 +1090,8 @@ def _caller_lifecycle_fixture(
 ) -> str:
     helper_names = (
         "Assert-True",
+        "Initialize-BoundedProcessCaptureType",
+        "Sync-BoundedProcessCaptureState",
         "Write-BoundedProcessCaptureStream",
         "Complete-BoundedProcessCaptureStream",
         "Assert-BoundedProcessCaptureSafe",
@@ -1018,6 +1100,7 @@ def _caller_lifecycle_fixture(
         "Invoke-BoundedProcessStop",
         "Wait-BoundedTask",
         "Invoke-BoundedStandardInput",
+        "Invoke-BoundedProcessCaptureCleanup",
         "Invoke-BoundedProcessCleanup",
         "Wait-BoundedProcessOutput",
     )
@@ -1036,21 +1119,6 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 {helpers}
 {caller}
-Add-Type @'
-using System;
-using System.Diagnostics;
-public static class Ac4CallerMutationHandlers
-{{
-    public static void OnData(object sender, DataReceivedEventArgs args) {{ }}
-}}
-'@
-function Get-BoundedProcessCapture {{
-    param([Parameter(Mandatory = $true)][hashtable]$Capture)
-    [pscustomobject]@{{
-        StdoutHandler = [Diagnostics.DataReceivedEventHandler][Ac4CallerMutationHandlers]::OnData
-        StderrHandler = [Diagnostics.DataReceivedEventHandler][Ac4CallerMutationHandlers]::OnData
-    }}
-}}
 $CliPath = (Get-Command pwsh).Source
 $ProcessTimeoutSeconds = 1
 $token = 'fixture-token'
@@ -1061,7 +1129,7 @@ $marker = Join-Path ([IO.Path]::GetTempPath()) ('ac4-caller-' + [Guid]::NewGuid(
 $escapedMarker = $marker.Replace("'", "''")
 $childTail = if ($Scenario -eq 'timeout') {{ '[Threading.Thread]::Sleep(10000)' }} elseif ($Scenario -eq 'primary_failure') {{ 'exit 7' }} else {{ "Write-Output 'fixture-child'" }}
 $childCommand = if ($TokenMode) {{
-    "[Console]::In.ReadToEnd(); [IO.File]::WriteAllText('$escapedMarker', `$PID.ToString()); $childTail"
+    "`$null = [Console]::In.ReadToEnd(); [IO.File]::WriteAllText('$escapedMarker', `$PID.ToString()); $childTail"
 }} else {{
     "[IO.File]::WriteAllText('$escapedMarker', `$PID.ToString()); $childTail"
 }}
@@ -1109,7 +1177,7 @@ try {{
     }} elseif ($Scenario -eq 'primary_failure') {{
         if ($null -eq $caught) {{ throw 'primary failure was not reported safely' }}
     }} elseif ($Scenario -eq 'cleanup_failure') {{
-        if ($null -eq $caught -or $caught.Exception.Message -cne 'child process cleanup failed') {{ throw 'cleanup failure was not reported safely' }}
+        if ($null -eq $caught -or $caught.Exception.Message -notmatch '^child process (cleanup failed|operation failed and cleanup failed)$') {{ throw 'cleanup failure was not reported safely' }}
     }}
     Write-Output 'caller lifecycle mutation fixture accepted'
 }} finally {{
@@ -1186,7 +1254,7 @@ def test_ac4_caller_lifecycle_mutations_are_rejected() -> None:
         ("moved started publication", "$started = $true", "$started = $false", "timeout"),
         (
             "bypassed cleanup",
-            "Invoke-BoundedProcessCleanup -Process $process -Started $started",
+            "Invoke-BoundedProcessCaptureCleanup -Process $process -Handlers $handlers\n        } catch {\n            $cleanupError = $_\n        }\n        try {\n            Invoke-BoundedProcessCleanup -Process $process -Started $started",
             "",
             "timeout",
         ),
@@ -3946,6 +4014,7 @@ def main() -> None:
     test_required_modules_exist()
     test_snipeit_loopback_fixture_is_private_and_evidence_only()
     test_direct_scm_exercises_installed_cli_to_service_sync_flow()
+    test_ac4_real_capture_handlers_are_runspace_independent()
     test_ac4_stream_capture_is_incremental_bounded_and_fail_closed()
     test_ac4_stream_capture_mutations_are_rejected()
     test_ac4_stream_capture_mutation_fixtures_are_registered_and_executable()
