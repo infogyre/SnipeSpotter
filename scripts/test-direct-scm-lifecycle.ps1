@@ -35,6 +35,7 @@ Import-Module (Join-Path $testSupportRoot 'Scm.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Acl.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Security.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Diagnostics.psm1') -Force
+Import-Module (Join-Path $testSupportRoot 'SnipeItLoopback.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Cleanup.psm1') -Force
 Import-Module (Join-Path $testSupportRoot 'Wait.psm1') -Force
 
@@ -44,6 +45,230 @@ function Assert-True {
 }
 
 Assert-True ($ProcessTimeoutSeconds -ge $MinimumProcessTimeoutSeconds) "ProcessTimeoutSeconds must be at least $MinimumProcessTimeoutSeconds seconds"
+
+function Write-BoundedProcessCaptureStream {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Capture,
+        [Parameter(Mandatory = $true)][ValidateSet('Stdout', 'Stderr')][string]$StreamName,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Chunk
+    )
+
+    $builder = $Capture[$StreamName]
+    $tailName = "${StreamName}ScanTail"
+    $foundName = "${StreamName}SentinelFound"
+    $truncatedName = "${StreamName}RetainedTruncated"
+    $previousTail = [string]$Capture[$tailName]
+    $combined = $previousTail + $Chunk
+    if ($combined.Contains([string]$Capture.Sentinel, [StringComparison]::Ordinal)) {
+        $Capture[$foundName] = $true
+    }
+
+    # Retained output is diagnostic-only. Sentinel scanning always consumes the full chunk.
+    $remaining = [int]$Capture.MaxCharacters - $builder.Length
+    if ($Chunk.Length -gt [Math]::Max(0, $remaining)) {
+        $Capture[$truncatedName] = $true
+    }
+    if ($remaining -gt 0) {
+        $appendLength = [Math]::Min($remaining, $Chunk.Length)
+        if ($appendLength -gt 0) {
+            [void]$builder.Append($Chunk, 0, $appendLength)
+        }
+    }
+    $tailLength = [Math]::Min([Math]::Max(0, ([string]$Capture.Sentinel).Length - 1), $combined.Length)
+    $Capture[$tailName] = if ($tailLength -gt 0) {
+        $combined.Substring($combined.Length - $tailLength)
+    } else {
+        ''
+    }
+}
+
+function Complete-BoundedProcessCaptureStream {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Capture,
+        [Parameter(Mandatory = $true)][ValidateSet('Stdout', 'Stderr')][string]$StreamName
+    )
+    $Capture["${StreamName}ScanComplete"] = $true
+}
+
+function Assert-BoundedProcessCaptureSafe {
+    param([Parameter(Mandatory = $true)][hashtable]$Capture)
+    foreach ($streamName in @('Stdout', 'Stderr')) {
+        if ([bool]$Capture["${StreamName}SentinelFound"]) {
+            throw 'bounded process output contains the token sentinel'
+        }
+        if (-not [bool]$Capture["${StreamName}ScanComplete"]) {
+            throw 'bounded process output leak scan was incomplete'
+        }
+    }
+    if ([bool]$Capture.ScanError) {
+        throw 'bounded process output leak scan failed'
+    }
+}
+
+function Get-BoundedProcessCapture {
+    param([Parameter(Mandatory = $true)][hashtable]$Capture)
+    Assert-True ($null -ne $Capture) 'bounded process capture state must not be null'
+    $stdoutHandler = [Diagnostics.DataReceivedEventHandler]{
+        param($sourceProcess, $outputRecord)
+        [void]$sourceProcess
+        try {
+            if ($null -ne $outputRecord.Data) {
+                Write-BoundedProcessCaptureStream -Capture $Capture -StreamName 'Stdout' -Chunk $outputRecord.Data
+            }
+        } catch {
+            $Capture.ScanError = $true
+        }
+    }
+    $stderrHandler = [Diagnostics.DataReceivedEventHandler]{
+        param($sourceProcess, $errorRecord)
+        [void]$sourceProcess
+        try {
+            if ($null -ne $errorRecord.Data) {
+                Write-BoundedProcessCaptureStream -Capture $Capture -StreamName 'Stderr' -Chunk $errorRecord.Data
+            }
+        } catch {
+            $Capture.ScanError = $true
+        }
+    }
+    [pscustomobject]@{
+        StdoutHandler = $stdoutHandler
+        StderrHandler = $stderrHandler
+    }
+}
+
+function Get-BoundedRemainingMillisecond {
+    param([Parameter(Mandatory = $true)][DateTime]$Deadline)
+    $remaining = ($Deadline - [DateTime]::UtcNow).TotalMilliseconds
+    if ($remaining -le 0) { return 0 }
+    return [Math]::Max(1, [int][Math]::Floor($remaining))
+}
+
+function Invoke-BoundedProcessStop {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 30000)][int]$WaitMilliseconds
+    )
+    if ($Process.HasExited) { return }
+    try {
+        $Process.Kill($true)
+    } catch {
+        throw 'child process termination failed'
+    }
+    try {
+        if (-not $Process.WaitForExit($WaitMilliseconds)) {
+            throw 'child process did not exit after termination'
+        }
+    } catch {
+        throw 'child process termination wait failed'
+    }
+    if (-not $Process.HasExited) {
+        throw 'child process remained alive after termination'
+    }
+}
+
+function Wait-BoundedTask {
+    param(
+        [Parameter(Mandatory = $true)][Threading.Tasks.Task]$Task,
+        [Parameter(Mandatory = $true)][DateTime]$Deadline,
+        [Parameter(Mandatory = $true)][string]$FailureMessage
+    )
+    try {
+        $remainingMilliseconds = Get-BoundedRemainingMillisecond -Deadline $Deadline
+        if ($remainingMilliseconds -le 0 -or -not $Task.Wait($remainingMilliseconds)) {
+            throw $FailureMessage
+        }
+        $Task.GetAwaiter().GetResult()
+    } catch {
+        throw $FailureMessage
+    }
+}
+
+function Invoke-BoundedStandardInput {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][DateTime]$Deadline
+    )
+    $stdinError = $null
+    $stdinCleanupError = $null
+    try {
+        $writeTask = $Process.StandardInput.WriteAsync($Text)
+        Wait-BoundedTask -Task $writeTask -Deadline $Deadline -FailureMessage 'child stdin write failed or exceeded the process deadline'
+
+        $flushTask = $Process.StandardInput.FlushAsync()
+        Wait-BoundedTask -Task $flushTask -Deadline $Deadline -FailureMessage 'child stdin flush failed or exceeded the process deadline'
+
+        $closeValueTask = $Process.StandardInput.DisposeAsync()
+        $closeTask = $closeValueTask.AsTask()
+        Wait-BoundedTask -Task $closeTask -Deadline $Deadline -FailureMessage 'child stdin close failed or exceeded the process deadline'
+    } catch {
+        $stdinError = $_
+        try {
+            if (-not $Process.HasExited) {
+                Invoke-BoundedProcessStop -Process $Process -WaitMilliseconds 5000
+            }
+            if (-not $Process.HasExited) {
+                throw 'child process remained alive after termination'
+            }
+        } catch {
+            $stdinCleanupError = $_
+        }
+        if ($stdinError -and $stdinCleanupError) { throw 'child stdin operation failed and cleanup failed' }
+        if ($stdinError) { throw $stdinError }
+        throw 'child process cleanup failed'
+    }
+}
+
+function Invoke-BoundedProcessCleanup {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][bool]$Started
+    )
+    $cleanupFailed = $false
+    try {
+        if ($Started) {
+            if (-not $Process.HasExited) {
+                Invoke-BoundedProcessStop -Process $Process -WaitMilliseconds 5000
+            }
+            if (-not $Process.HasExited) {
+                throw 'child process remained alive after termination'
+            }
+        }
+    } catch {
+        $cleanupFailed = $true
+    } finally {
+        try {
+            $Process.Dispose()
+        } catch {
+            $cleanupFailed = $true
+        }
+    }
+    if ($cleanupFailed) {
+        throw 'child process cleanup failed'
+    }
+}
+
+function Wait-BoundedProcessOutput {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][DateTime]$Deadline
+    )
+    $remainingMilliseconds = Get-BoundedRemainingMillisecond -Deadline $Deadline
+    if ($remainingMilliseconds -le 0 -or -not $Process.WaitForExit($remainingMilliseconds)) {
+        throw 'child process did not exit within the process deadline'
+    }
+    if (-not $Process.HasExited) {
+        throw 'child process exit state was unavailable'
+    }
+    # A second bounded wait drains asynchronous output handlers without exceeding the deadline.
+    $remainingMilliseconds = Get-BoundedRemainingMillisecond -Deadline $Deadline
+    if ($remainingMilliseconds -le 0 -or -not $Process.WaitForExit($remainingMilliseconds)) {
+        throw 'child process output did not drain within the process deadline'
+    }
+    if (-not $Process.HasExited) {
+        throw 'child process remained alive after bounded wait'
+    }
+}
 
 function Invoke-DirectCli {
     param(
@@ -61,19 +286,60 @@ function Invoke-DirectCli {
         [void]$startInfo.ArgumentList.Add($argument)
     }
 
+    $capture = [hashtable]::Synchronized(@{
+        Sentinel = $tokenSentinel
+        MaxCharacters = 65536
+        Stdout = [Text.StringBuilder]::new()
+        Stderr = [Text.StringBuilder]::new()
+        StdoutScanTail = ''
+        StderrScanTail = ''
+        StdoutSentinelFound = $false
+        StderrSentinelFound = $false
+        StdoutRetainedTruncated = $false
+        StderrRetainedTruncated = $false
+        StdoutScanComplete = $false
+        StderrScanComplete = $false
+        ScanError = $false
+    })
+    $handlers = Get-BoundedProcessCapture -Capture $capture
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $startInfo
-    if (-not $process.Start()) { throw "$Description could not start" }
-    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-    $stderrTask = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit($ProcessTimeoutSeconds * 1000)) {
-        try { $process.Kill($true) } catch { Write-Warning "could not terminate ${Description}: $($_.Exception.Message)" }
-        throw "$Description did not exit within $ProcessTimeoutSeconds seconds"
+    $process.add_OutputDataReceived($handlers.StdoutHandler)
+    $process.add_ErrorDataReceived($handlers.StderrHandler)
+    $deadline = [DateTime]::UtcNow.AddSeconds($ProcessTimeoutSeconds)
+    $started = $false
+    $primaryError = $null
+    $cleanupError = $null
+    try {
+        try {
+            if (-not $process.Start()) { throw "$Description could not start" }
+            $started = $true
+            $process.BeginOutputReadLine()
+            $process.BeginErrorReadLine()
+            try {
+                Wait-BoundedProcessOutput -Process $process -Deadline $deadline
+            } catch {
+                throw "$Description did not exit within $ProcessTimeoutSeconds seconds"
+            }
+            Complete-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stdout'
+            Complete-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stderr'
+            $exitCode = $process.ExitCode
+            Assert-BoundedProcessCaptureSafe -Capture $capture
+        } catch {
+            $primaryError = $_
+        }
+    } finally {
+        try {
+            Invoke-BoundedProcessCleanup -Process $process -Started $started
+        } catch {
+            $cleanupError = $_
+        }
     }
-    $exitCode = $process.ExitCode
-    $stdout = $stdoutTask.GetAwaiter().GetResult()
-    $stderr = $stderrTask.GetAwaiter().GetResult()
-    $process.Dispose()
+    if ($primaryError -and $cleanupError) { throw 'child process operation failed and cleanup failed' }
+    if ($primaryError) { throw $primaryError }
+    if ($cleanupError) { throw 'child process cleanup failed' }
+    $stdout = $capture.Stdout.ToString()
+    $stderr = $capture.Stderr.ToString()
     [pscustomobject]@{
         ExitCode = $exitCode
         Stdout = $stdout
@@ -90,6 +356,264 @@ function Get-CommonCliArgument {
         '--test-mutex-name', $mutexName,
         '--test-service-executable', $ServicePath
     )
+}
+
+function Invoke-TokenCli {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$Token,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+
+    Assert-True (-not [string]::IsNullOrEmpty($Token)) "$Description token must not be empty"
+    Assert-True (-not ($Arguments -contains $Token)) "$Description token must not be an argument"
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $CliPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    foreach ($argument in $Arguments) {
+        [void]$startInfo.ArgumentList.Add($argument)
+    }
+
+    $capture = [hashtable]::Synchronized(@{
+        Sentinel = $Token
+        MaxCharacters = 65536
+        Stdout = [Text.StringBuilder]::new()
+        Stderr = [Text.StringBuilder]::new()
+        StdoutScanTail = ''
+        StderrScanTail = ''
+        StdoutSentinelFound = $false
+        StderrSentinelFound = $false
+        StdoutRetainedTruncated = $false
+        StderrRetainedTruncated = $false
+        StdoutScanComplete = $false
+        StderrScanComplete = $false
+        ScanError = $false
+    })
+    $handlers = Get-BoundedProcessCapture -Capture $capture
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $process.add_OutputDataReceived($handlers.StdoutHandler)
+    $process.add_ErrorDataReceived($handlers.StderrHandler)
+    $exitCode = $null
+    $deadline = [DateTime]::UtcNow.AddSeconds($ProcessTimeoutSeconds)
+    $started = $false
+    $primaryError = $null
+    $cleanupError = $null
+    try {
+        try {
+            if (-not $process.Start()) { throw "$Description could not start" }
+            $started = $true
+            $process.BeginOutputReadLine()
+            $process.BeginErrorReadLine()
+            Invoke-BoundedStandardInput -Process $process -Text $Token -Deadline $deadline
+            try {
+                Wait-BoundedProcessOutput -Process $process -Deadline $deadline
+            } catch {
+                throw "$Description did not exit within $ProcessTimeoutSeconds seconds"
+            }
+            Complete-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stdout'
+            Complete-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stderr'
+            $exitCode = $process.ExitCode
+            Assert-BoundedProcessCaptureSafe -Capture $capture
+        } catch {
+            $primaryError = $_
+        }
+    } finally {
+        try {
+            Invoke-BoundedProcessCleanup -Process $process -Started $started
+        } catch {
+            $cleanupError = $_
+        }
+    }
+    if ($primaryError -and $cleanupError) { throw 'child process operation failed and cleanup failed' }
+    if ($primaryError) { throw $primaryError }
+    if ($cleanupError) { throw 'child process cleanup failed' }
+    $stdout = $capture.Stdout.ToString()
+    $stderr = $capture.Stderr.ToString()
+    [pscustomobject]@{
+        ExitCode = $exitCode
+        Stdout = $stdout
+        Stderr = $stderr
+        Description = $Description
+    }
+}
+
+function Assert-NoSentinelInText {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory = $true)][string]$Sentinel,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    Assert-True (-not $Text.Contains($Sentinel, [StringComparison]::Ordinal)) "$Description contains the token sentinel"
+}
+
+function Test-BytePatternInWindow {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Window,
+        [Parameter(Mandatory = $true)][byte[]]$Pattern
+    )
+    if ($Pattern.Length -eq 0 -or $Window.Length -lt $Pattern.Length) { return $false }
+    for ($start = 0; $start -le $Window.Length - $Pattern.Length; $start++) {
+        $match = $true
+        for ($index = 0; $index -lt $Pattern.Length; $index++) {
+            if ($Window[$start + $index] -ne $Pattern[$index]) {
+                $match = $false
+                break
+            }
+        }
+        if ($match) { return $true }
+    }
+    return $false
+}
+
+function Write-ByteSentinelScan {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Scan,
+        [Parameter(Mandatory = $true)][byte[]]$Chunk
+    )
+    $window = [byte[]]::new($Scan.Tail.Length + $Chunk.Length)
+    if ($Scan.Tail.Length -gt 0) { [Array]::Copy($Scan.Tail, 0, $window, 0, $Scan.Tail.Length) }
+    if ($Chunk.Length -gt 0) { [Array]::Copy($Chunk, 0, $window, $Scan.Tail.Length, $Chunk.Length) }
+    foreach ($pattern in @($Scan.Patterns)) {
+        if (Test-BytePatternInWindow -Window $window -Pattern $pattern) {
+            $Scan.Found = $true
+        }
+    }
+    $tailLength = [Math]::Min([int]$Scan.MaxTailLength, $window.Length)
+    $Scan.Tail = if ($tailLength -gt 0) {
+        $tail = [byte[]]::new($tailLength)
+        [Array]::Copy($window, $window.Length - $tailLength, $tail, 0, $tailLength)
+        $tail
+    } else {
+        [byte[]]::new(0)
+    }
+}
+
+function Invoke-BoundedArtifactStreamScan {
+    param(
+        [Parameter(Mandatory = $true)][IO.Stream]$Stream,
+        [Parameter(Mandatory = $true)][int64]$ExpectedLength,
+        [Parameter(Mandatory = $true)][hashtable]$Scan
+    )
+    if ($ExpectedLength -lt 0) { throw 'artifact leak scan failed' }
+    $buffer = [byte[]]::new(65536)
+    try {
+        while ($true) {
+            $read = $Stream.Read($buffer, 0, $buffer.Length)
+            if ($read -le 0) { break }
+            if ($read -eq $buffer.Length) {
+                Write-ByteSentinelScan -Scan $Scan -Chunk $buffer
+            } else {
+                $chunk = [byte[]]::new($read)
+                [Array]::Copy($buffer, $chunk, $read)
+                Write-ByteSentinelScan -Scan $Scan -Chunk $chunk
+            }
+        }
+        if ($Stream.Position -ne $ExpectedLength) {
+            throw 'artifact leak scan did not reach the complete file'
+        }
+        $Scan.Complete = $true
+    } catch {
+        throw 'artifact leak scan failed'
+    }
+}
+
+function Assert-NoSentinelInArtifact {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Sentinel,
+        [Parameter(Mandatory = $false)][ValidateRange(1, 1073741824)][int64]$MaxArtifactBytes = 67108864
+    )
+    if (-not (Test-Path -LiteralPath $Root -PathType Container -ErrorAction SilentlyContinue)) {
+        throw 'artifact leak scan failed'
+    }
+    $patterns = @(
+        [Text.Encoding]::ASCII.GetBytes($Sentinel),
+        [Text.Encoding]::UTF8.GetBytes($Sentinel),
+        [Text.Encoding]::Unicode.GetBytes($Sentinel),
+        [Text.Encoding]::BigEndianUnicode.GetBytes($Sentinel)
+    )
+    $maxTailLength = [Math]::Max(0, (($patterns | Measure-Object -Property Length -Maximum).Maximum - 1))
+    try {
+        $artifacts = @(Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction Stop)
+    } catch {
+        throw 'artifact leak scan failed'
+    }
+    foreach ($artifact in $artifacts) {
+        if ($artifact.Length -gt $MaxArtifactBytes) {
+            throw 'artifact leak scan failed'
+        }
+        $scan = @{
+            Patterns = $patterns
+            MaxTailLength = $maxTailLength
+            Tail = [byte[]]::new(0)
+            Found = $false
+            Complete = $false
+        }
+        $stream = $null
+        try {
+            $stream = [IO.File]::OpenRead($artifact.FullName)
+            Invoke-BoundedArtifactStreamScan -Stream $stream -ExpectedLength ([int64]$artifact.Length) -Scan $scan
+        } catch {
+            throw 'artifact leak scan failed'
+        } finally {
+            if ($null -ne $stream) {
+                try { $stream.Dispose() } catch { throw 'artifact leak scan failed' }
+            }
+        }
+        if (-not [bool]$scan.Complete) {
+            throw 'artifact leak scan failed'
+        }
+        if ($scan.Found) {
+            throw 'artifact leak scan found the token sentinel'
+        }
+    }
+}
+
+function Assert-EncryptedTokenSetting {
+    param([Parameter(Mandatory = $true)][string]$SettingsText)
+    $section = $null
+    $encoded = $null
+    foreach ($line in ($SettingsText -split "`r?`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -match '^\[(?<name>[A-Za-z0-9_-]+)\]$') {
+            $section = $Matches['name']
+            continue
+        }
+        if ($section -cne 'snipeit' -or $trimmed.StartsWith('#') -or $trimmed.Length -eq 0) {
+            continue
+        }
+        $match = [Text.RegularExpressions.Regex]::Match(
+            $trimmed,
+            '^api_token_encrypted\s*=\s*"(?<encoded>[A-Za-z0-9+/]+={0,2})"$'
+        )
+        if ($match.Success) {
+            $encoded = $match.Groups['encoded'].Value
+            break
+        }
+    }
+    if ($null -eq $encoded -or $encoded.Length -eq 0) { throw 'encrypted token setting was missing or malformed' }
+    try {
+        $bytes = [Convert]::FromBase64String($encoded)
+    } catch {
+        throw 'encrypted token setting was not canonical base64'
+    }
+    $canonical = [Convert]::ToBase64String($bytes)
+    if ($canonical -cne $encoded) { throw 'encrypted token setting was not canonical base64' }
+    if ($bytes.Length -lt 32) { throw 'encrypted token ciphertext was too short' }
+    $expectedHeader = [byte[]](
+        0x01, 0x00, 0x00, 0x00, 0xd0, 0x8c, 0x9d, 0xdf, 0x01, 0x15,
+        0xd1, 0x11, 0x8c, 0x7a, 0x00, 0xc0, 0x4f, 0xc2, 0x97, 0xeb
+    )
+    for ($index = 0; $index -lt $expectedHeader.Length; $index++) {
+        if ($bytes[$index] -ne $expectedHeader[$index]) {
+            throw 'encrypted token ciphertext had an invalid DPAPI structure'
+        }
+    }
 }
 
 function Invoke-DirectUninstall {
@@ -142,6 +666,8 @@ $mutexName = "Global\SnipeSpotterDirect-$RunIdentity"
 $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'" -ErrorAction SilentlyContinue
 Assert-True ($null -eq $service) "refusing to mutate pre-existing unique service $serviceName"
 
+$tokenSentinel = "AC4-" + [Guid]::NewGuid().ToString('N')
+$fixture = $null
 $primaryError = $null
 $cleanupError = $null
 try {
@@ -173,6 +699,61 @@ try {
         $status = Get-DirectStatus
         $null -ne $status -and $status.data.state -eq 'Unconfigured'
     } | Out-Null
+
+    $fixture = Start-SnipeItLoopbackFixture -AuthorizationSentinel $tokenSentinel
+    Assert-True $fixture.Prefix.StartsWith('http://127.0.0.1:') 'loopback fixture did not bind only to 127.0.0.1'
+    Wait-Condition -Description 'Snipe-IT loopback fixture readiness' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        $fixture.State.Ready -and $fixture.Listener.IsListening
+    } | Out-Null
+
+    foreach ($update in @(
+        @('snipeit.url', $fixture.Prefix.TrimEnd('/')),
+        @('snipeit.checkout_status_id', '1'),
+        @('snipeit.checkin_status_id', '2')
+    )) {
+        $result = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('config', 'set', $update[0], $update[1])) -Description "SetConfig-$($update[0])"
+        Assert-True ($result.ExitCode -eq 0) "configuration update $($update[0]) failed"
+        Assert-NoSentinelInText -Text $result.Stdout -Sentinel $tokenSentinel -Description "configuration update $($update[0]) stdout"
+        Assert-NoSentinelInText -Text $result.Stderr -Sentinel $tokenSentinel -Description "configuration update $($update[0]) stderr"
+    }
+
+    $tokenResult = Invoke-TokenCli -Arguments (@(Get-CommonCliArgument) + @('config', 'set-token')) -Token $tokenSentinel -Description 'SetToken'
+    Assert-True ($tokenResult.ExitCode -eq 0) 'token submission failed'
+    Assert-NoSentinelInText -Text $tokenResult.Stdout -Sentinel $tokenSentinel -Description 'token submission stdout'
+    Assert-NoSentinelInText -Text $tokenResult.Stderr -Sentinel $tokenSentinel -Description 'token submission stderr'
+
+    Stop-Service -Name $serviceName -ErrorAction Stop
+    Wait-ServiceState -Name $serviceName -State 'Stopped' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
+    Restart-Service -Name $serviceName -Force -ErrorAction Stop
+    Wait-ServiceState -Name $serviceName -State 'Running' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
+    Assert-ServiceRunsAsSystem -Name $serviceName
+    Wait-Condition -Description "configured service $serviceName status response" -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        $status = Get-DirectStatus
+        $null -ne $status -and $status.data.state -eq 'Idle'
+    } | Out-Null
+
+    $sync = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('sync')) -Description 'TriggerSync'
+    Assert-True ($sync.ExitCode -eq 0) 'explicit sync trigger failed'
+    Assert-NoSentinelInText -Text $sync.Stdout -Sentinel $tokenSentinel -Description 'sync stdout'
+    Assert-NoSentinelInText -Text $sync.Stderr -Sentinel $tokenSentinel -Description 'sync stderr'
+    Wait-Condition -Description 'authenticated Snipe-IT reads' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
+        $evidence = Get-SnipeItLoopbackEvidence -Fixture $fixture
+        @($evidence.Requests | Where-Object { $_.accepted -and $_.authorized }).Count -ge 3
+    } | Out-Null
+    $evidence = Get-SnipeItLoopbackEvidence -Fixture $fixture
+    Assert-True ($null -eq $evidence.WorkerError) 'loopback fixture worker failed'
+    Assert-True ($evidence.DroppedRequests -eq 0) 'loopback fixture dropped request evidence'
+    Assert-True (@($evidence.Requests | Where-Object { $_.accepted -and -not $_.authorized }).Count -eq 0) 'unauthorized request was accepted'
+    Assert-True (@($evidence.Requests | Where-Object { $_.method_class -eq 'mutation' }).Count -eq 0) 'fixture observed a mutation request'
+    Assert-True (@($evidence.Requests | Where-Object { $_.route -eq 'unexpected' }).Count -eq 0) 'fixture observed an unexpected route'
+    Assert-True (@($evidence.Requests | Where-Object { $_.route -eq 'hardware_byserial' -and $_.response_class -eq 'not_found' }).Count -gt 0) 'fixture did not serve a hardware not-found read'
+    Assert-True (@($evidence.Requests | Where-Object { $_.route -in @('manufacturers', 'models') -and $_.response_class -eq 'rows_empty' }).Count -ge 2) 'fixture did not serve empty taxonomy reads'
+
+    $settingsText = [IO.File]::ReadAllText((Join-Path $DataRoot 'settings.toml'))
+    Assert-EncryptedTokenSetting -SettingsText $settingsText
+    Assert-NoSentinelInText -Text $settingsText -Sentinel $tokenSentinel -Description 'settings.toml'
+    Assert-NoSentinelInArtifact -Root $DataRoot -Sentinel $tokenSentinel
+    Assert-NoSentinelInArtifact -Root $LogDirectory -Sentinel $tokenSentinel
 
     $runtimeArtifacts = @(
         [pscustomobject]@{ Path = $DataRoot; Type = 'Container' },
@@ -232,6 +813,27 @@ try {
 } finally {
     try {
         Invoke-FailureSafeCleanup -Actions @(
+            {
+                if ($null -ne $fixture) {
+                    Stop-SnipeItLoopbackFixture -Fixture $fixture -TimeoutSeconds $WaitTimeoutSeconds
+                }
+            },
+            {
+                $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+                if ($null -ne $existing -and $existing.Status -ne 'Stopped') {
+                    Stop-Service -Name $serviceName -Force -ErrorAction Stop
+                }
+            },
+            {
+                $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+                if ($null -ne $existing) {
+                    Wait-ServiceState -Name $serviceName -State 'Stopped' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
+                }
+            },
+            {
+                Assert-NoSentinelInArtifact -Root $DataRoot -Sentinel $tokenSentinel
+                Assert-NoSentinelInArtifact -Root $LogDirectory -Sentinel $tokenSentinel
+            },
             {
                 $existing = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
                 if ($null -ne $existing) {

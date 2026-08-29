@@ -5,12 +5,14 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).parent / "TestSupport"
 LIFECYCLE = ROOT.parent / "test-msi-lifecycle.ps1"
 DIRECT_SCM = ROOT.parent / "test-direct-scm-lifecycle.ps1"
+LOOPBACK = ROOT / "SnipeItLoopback.psm1"
 WORKFLOW = ROOT.parent.parent / ".github" / "workflows" / "elevated-windows.yml"
 _ACL_DIAGNOSTIC_FIELDS = (
     "path_class",
@@ -140,6 +142,1199 @@ def read_module(name: str) -> str:
     path = ROOT / name
     assert path.is_file(), f"missing test-support module: {path}"
     return path.read_text(encoding="utf-8")
+
+
+def test_snipeit_loopback_fixture_is_private_and_evidence_only() -> None:
+    source = read_module("SnipeItLoopback.psm1")
+    assert "# pattern: Imperative Shell" in source
+    assert "HttpListener" in source
+    assert "127.0.0.1" in source
+    assert "TcpListener" in source
+    assert ", 0)" in source
+    assert "GetContextAsync" in source
+    assert "byserial" in source
+    assert "manufacturers" in source
+    assert "models" in source
+    assert "if ($statusCode -eq 404 -and $route -eq 'hardware_byserial')" in source
+    assert "elseif ($statusCode -eq 200)" in source
+    assert "'{\"message\":\"not found\"}'" in source
+    assert 'rows = @()' in source
+    assert "Authorization" in source
+    assert "Bearer " in source
+    assert "authorized =" in source
+    assert "token" not in source.lower().replace("authorization", "") or "sentinel" in source.lower()
+    assert "mutation" in source.lower()
+    assert "unexpected" in source.lower()
+    assert "Stop" in source
+    assert "Dispose" in source
+    assert "Stop-SnipeItLoopbackFixture" in source
+
+
+def test_direct_scm_exercises_installed_cli_to_service_sync_flow() -> None:
+    assert DIRECT_SCM.is_file(), "missing direct SCM lifecycle script"
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    for required in (
+        "SnipeItLoopback.psm1",
+        "Start-SnipeItLoopbackFixture",
+        "Stop-SnipeItLoopbackFixture",
+        "Invoke-TokenCli",
+        "RedirectStandardInput",
+        "WriteAsync($Text)",
+        "DisposeAsync()",
+        "config', 'set",
+        "snipeit.url",
+        "snipeit.checkout_status_id",
+        "snipeit.checkin_status_id",
+        "config', 'set-token",
+        "Restart-Service",
+        "TriggerSync",
+        "Assert-ServiceRunsAsSystem -Name $serviceName",
+        "api_token_encrypted",
+        "sentinel",
+        "Get-ChildItem",
+        "finally",
+    ):
+        assert required in source, f"direct AC.4 flow missing {required!r}"
+    assert "Bearer $" not in source
+    assert "Arguments @('-Token'" not in source
+    assert "Arguments @('--token'" not in source
+    assert "-Environment" not in source
+    assert "Start-Sleep -Seconds 5" not in source
+
+
+def _run_powershell_fixture(
+    script: str,
+    env: dict[str, str] | None = None,
+    timeout_seconds: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for executable AC.4 fixtures"
+    return subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=timeout_seconds,
+    )
+
+
+def _powershell_function(source: str, name: str) -> str:
+    marker = f"function {name}"
+    start = source.index(marker)
+    opening = source.index("{", start)
+    return source[start : _powershell_braced_block_end(source, opening)]
+
+
+def _stream_capture_fixture(helpers: str) -> str:
+    return f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helpers}
+$sentinel = 'cross-chunk-sentinel'
+$capture = [hashtable]::Synchronized(@{{
+    Sentinel = $sentinel
+    MaxCharacters = 65536
+    Stdout = [Text.StringBuilder]::new()
+    Stderr = [Text.StringBuilder]::new()
+    StdoutScanTail = ''
+    StderrScanTail = ''
+    StdoutSentinelFound = $false
+    StderrSentinelFound = $false
+    StdoutRetainedTruncated = $false
+    StderrRetainedTruncated = $false
+    StdoutScanComplete = $false
+    StderrScanComplete = $false
+    ScanError = $false
+}})
+Write-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stdout' -Chunk (('x' * 65530) + 'cross-chunk-')
+Write-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stdout' -Chunk ('sentinel' + ('y' * 100))
+Write-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stderr' -Chunk ('z' * 65536)
+Write-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stderr' -Chunk $sentinel
+Complete-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stdout'
+Complete-BoundedProcessCaptureStream -Capture $capture -StreamName 'Stderr'
+if (-not $capture.StdoutSentinelFound -or -not $capture.StderrSentinelFound) {{ throw 'cross-chunk or post-retention sentinel was missed' }}
+if (-not $capture.StdoutRetainedTruncated -or -not $capture.StderrRetainedTruncated) {{ throw 'retained diagnostic truncation was not tracked' }}
+try {{ Assert-BoundedProcessCaptureSafe -Capture $capture }} catch {{ $leakRejected = $true }}
+if (-not $leakRejected) {{ throw 'sentinel-bearing output was accepted' }}
+$capture.StdoutSentinelFound = $false
+$capture.StderrSentinelFound = $false
+Assert-BoundedProcessCaptureSafe -Capture $capture
+$capture.StdoutScanComplete = $false
+try {{ Assert-BoundedProcessCaptureSafe -Capture $capture }} catch {{ $incompleteRejected = $true }}
+if (-not $incompleteRejected) {{ throw 'incompletely scanned output was accepted' }}
+$capture.StdoutScanComplete = $true
+$capture.StderrScanComplete = $true
+$capture.ScanError = $true
+try {{ Assert-BoundedProcessCaptureSafe -Capture $capture }} catch {{ $errorRejected = $true }}
+if (-not $errorRejected) {{ throw 'scan error was accepted' }}
+Write-Output 'stream capture fixture accepted'
+"""
+
+
+def test_ac4_stream_capture_is_incremental_bounded_and_fail_closed() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    required = (
+        "Write-BoundedProcessCaptureStream",
+        "Complete-BoundedProcessCaptureStream",
+        "Assert-BoundedProcessCaptureSafe",
+    )
+    assert all(name in source for name in required)
+    fixture = _stream_capture_fixture(
+        "\n".join(_powershell_function(source, name) for name in required)
+    )
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "stream capture fixture accepted" in result.stdout
+
+
+def test_ac4_stream_capture_mutations_are_rejected() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    update = _powershell_function(source, "Write-BoundedProcessCaptureStream")
+    complete = _powershell_function(source, "Complete-BoundedProcessCaptureStream")
+    assert_helper = _powershell_function(source, "Assert-BoundedProcessCaptureSafe")
+    mutations = (
+        update.replace("$combined.Contains([string]$Capture.Sentinel, [StringComparison]::Ordinal)", "$Chunk.Contains([string]$Capture.Sentinel, [StringComparison]::Ordinal)", 1),
+        update.replace("$Capture[$foundName] = $true", "$Capture[$foundName] = $false", 1),
+        update.replace("$Capture[$truncatedName] = $true", "$Capture[$truncatedName] = $false", 1),
+        complete.replace("$Capture[\"${StreamName}ScanComplete\"] = $true", "$Capture[\"${StreamName}ScanComplete\"] = $false", 1),
+    )
+    for index, mutation in enumerate(mutations):
+        assert mutation != (update if index < 3 else complete)
+        helper_set = (mutation, complete, assert_helper) if index < 3 else (update, mutation, assert_helper)
+        fixture = _stream_capture_fixture("\n".join(helper_set))
+        result = _run_powershell_fixture(fixture)
+        assert result.returncode != 0, f"stream mutation {index} was accepted"
+
+
+def test_ac4_stream_capture_mutation_fixtures_are_registered_and_executable() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    assert "Invoke-BoundedStandardInput" in source
+    helper = _powershell_function(source, "Invoke-BoundedStandardInput")
+    remaining_helper = _powershell_function(source, "Get-BoundedRemainingMillisecond")
+    stop_helper = _powershell_function(source, "Invoke-BoundedProcessStop")
+    fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{remaining_helper}
+{stop_helper}
+{helper}
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = (Get-Command pwsh).Source
+$info.UseShellExecute = $false
+$info.RedirectStandardInput = $true
+[void]$info.ArgumentList.Add('-NoLogo')
+[void]$info.ArgumentList.Add('-NoProfile')
+[void]$info.ArgumentList.Add('-Command')
+[void]$info.ArgumentList.Add('[Threading.Thread]::Sleep(10000)')
+$p = [Diagnostics.Process]::new()
+$p.StartInfo = $info
+try {{
+    if (-not $p.Start()) {{ throw 'child did not start' }}
+    try {{ Invoke-BoundedStandardInput -Process $p -Text 'sentinel' -Deadline ([DateTime]::UtcNow.AddMilliseconds(-1)) }} catch {{ $rejected = $true }}
+    if (-not $rejected -or -not $p.HasExited) {{ throw 'stdin deadline mutation was accepted' }}
+    Write-Output 'stdin deadline fixture accepted'
+}} finally {{
+    if (-not $p.HasExited) {{ try {{ $p.Kill($true) }} catch {{ }} }}
+    $p.Dispose()
+}}
+"""
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "stdin deadline fixture accepted" in result.stdout
+
+
+def test_ac4_artifact_scanner_handles_bytes_encodings_boundaries_and_fail_closed() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    required = (
+        "Test-BytePatternInWindow",
+        "Write-ByteSentinelScan",
+        "Invoke-BoundedArtifactStreamScan",
+        "Assert-NoSentinelInArtifact",
+    )
+    assert all(name in source for name in required)
+    helpers = "\n".join(_powershell_function(source, name) for name in required)
+    fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helpers}
+$root = Join-Path ([IO.Path]::GetTempPath()) ('ac4-artifact-' + [Guid]::NewGuid().ToString('N'))
+$sentinel = 'boundary-π-sentinel'
+try {{
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    $encodings = @([Text.Encoding]::ASCII, [Text.Encoding]::UTF8, [Text.Encoding]::Unicode, [Text.Encoding]::BigEndianUnicode)
+    for ($i = 0; $i -lt $encodings.Count; $i++) {{
+        $encoded = $encodings[$i].GetBytes($sentinel)
+        $bytes = [byte[]]::new(65530 + $encoded.Length + 5)
+        [Array]::Clear($bytes, 0, $bytes.Length)
+        [Array]::Copy($encoded, 0, $bytes, 65530, $encoded.Length)
+        [IO.File]::WriteAllBytes((Join-Path $root ('hit-' + $i)), $bytes)
+    }}
+    $clean = [Text.Encoding]::UTF8.GetBytes(('q' * 65537))
+    [IO.File]::WriteAllBytes((Join-Path $root 'clean'), $clean)
+    try {{ Assert-NoSentinelInArtifact -Root $root -Sentinel $sentinel }} catch {{ $hitRejected = $true }}
+    if (-not $hitRejected) {{ throw 'encoded sentinel was missed' }}
+    Remove-Item -LiteralPath (Join-Path $root 'hit-0') -Force
+    Remove-Item -LiteralPath (Join-Path $root 'hit-1') -Force
+    Remove-Item -LiteralPath (Join-Path $root 'hit-2') -Force
+    Remove-Item -LiteralPath (Join-Path $root 'hit-3') -Force
+    Assert-NoSentinelInArtifact -Root $root -Sentinel $sentinel
+    $oversized = Join-Path $root 'oversized'
+    [IO.File]::WriteAllBytes($oversized, [byte[]]::new(8))
+    try {{ Assert-NoSentinelInArtifact -Root $root -Sentinel $sentinel -MaxArtifactBytes 4 }} catch {{ $oversizeRejected = $true }}
+    if (-not $oversizeRejected) {{ throw 'oversized artifact was accepted' }}
+    $missingRoot = Join-Path $root 'missing'
+    try {{ Assert-NoSentinelInArtifact -Root $missingRoot -Sentinel $sentinel }} catch {{ $unreadableRejected = $true }}
+    if (-not $unreadableRejected) {{ throw 'unreadable artifact root was accepted' }}
+    $failedScan = @{{ Patterns = @([Text.Encoding]::ASCII.GetBytes($sentinel)); MaxTailLength = 32; Tail = [byte[]]::new(0); Found = $false; Complete = $false }}
+    $failedStream = [IO.MemoryStream]::new([byte[]](1, 2, 3))
+    $failedStream.Dispose()
+    try {{ Invoke-BoundedArtifactStreamScan -Stream $failedStream -ExpectedLength 3 -Scan $failedScan }} catch {{ $readFailureRejected = $true }}
+    if (-not $readFailureRejected) {{ throw 'artifact read failure was accepted' }}
+    Write-Output 'artifact byte fixture accepted'
+}} finally {{
+    if (Test-Path -LiteralPath $root) {{ Remove-Item -LiteralPath $root -Recurse -Force }}
+}}
+"""
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "artifact byte fixture accepted" in result.stdout
+
+
+def test_ac4_artifact_scanner_mutations_are_rejected() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    scanner = source[source.index("function Test-BytePatternInWindow") : source.index("function Invoke-DirectUninstall")]
+    assert "$artifact.Length -gt $MaxArtifactBytes" in scanner
+    assert "if (-not (Test-Path -LiteralPath $Root -PathType Container -ErrorAction SilentlyContinue))" in scanner
+    assert "$Scan.Complete = $true" in scanner
+    assert "[Text.Encoding]::ASCII.GetBytes($Sentinel)" in scanner
+    assert "[Text.Encoding]::Unicode.GetBytes($Sentinel)" in scanner
+    assert "[Text.Encoding]::BigEndianUnicode.GetBytes($Sentinel)" in scanner
+    mutations = (
+        scanner.replace("[Text.Encoding]::ASCII.GetBytes($Sentinel)", "[Text.Encoding]::Unicode.GetBytes($Sentinel)", 1),
+        scanner.replace("[Text.Encoding]::Unicode.GetBytes($Sentinel)", "[Text.Encoding]::UTF8.GetBytes($Sentinel)", 1),
+        scanner.replace("[Text.Encoding]::BigEndianUnicode.GetBytes($Sentinel)", "[Text.Encoding]::UTF8.GetBytes($Sentinel)", 1),
+        scanner.replace("$Scan.Complete = $true", "$Scan.Complete = $false", 1),
+        scanner.replace("if (-not [bool]$scan.Complete)", "if ($false)", 1),
+        scanner.replace("if ($scan.Found)", "if ($false)", 1),
+    )
+    required = ("Test-BytePatternInWindow", "Write-ByteSentinelScan", "Invoke-BoundedArtifactStreamScan", "Assert-NoSentinelInArtifact")
+    mutation_cases = (
+        ("ascii", "byte-boundary-sentinel", "[Text.Encoding]::ASCII.GetBytes($sentinel)", 65537),
+        ("utf16le", "byte-boundary-π-sentinel", "[Text.Encoding]::Unicode.GetBytes($sentinel)", 65537),
+        ("utf16be", "byte-boundary-π-sentinel", "[Text.Encoding]::BigEndianUnicode.GetBytes($sentinel)", 65537),
+        ("complete", "byte-boundary-sentinel", "[Text.Encoding]::ASCII.GetBytes($sentinel)", 65537),
+        ("complete-guard", "byte-boundary-sentinel", "[Text.Encoding]::ASCII.GetBytes($sentinel)", 65537),
+        ("hit-guard", "byte-boundary-sentinel", "[Text.Encoding]::ASCII.GetBytes($sentinel)", 65537),
+    )
+    for index, (_label, sentinel, encoded_expression, max_bytes) in enumerate(mutation_cases):
+        mutation = mutations[index]
+        assert mutation != scanner or index == 0
+        helpers = "\n".join(
+            _powershell_function(mutation, name) for name in required
+        )
+        artifact_setup = (
+            "$bytes = [byte[]]::new(65530 + $encoded.Length + 5)\n"
+            "[Array]::Copy($encoded, 0, $bytes, 65530, $encoded.Length)"
+            if index < 3
+            else "$bytes = [Text.Encoding]::UTF8.GetBytes(('q' * 65537))"
+        )
+        root_setup = "" if index != 4 else "$root = Join-Path $root 'missing'"
+        artifact_write = "[IO.File]::WriteAllBytes((Join-Path $root 'artifact'), $bytes)" if index != 4 else ""
+        scan_call = "" if index != 5 else "\n    $scan = @{ Patterns = @([Text.Encoding]::ASCII.GetBytes($sentinel)); MaxTailLength = 32; Tail = [byte[]]::new(0); Found = $false; Complete = $false }\n    $stream = [IO.MemoryStream]::new([Text.Encoding]::ASCII.GetBytes($sentinel))\n    Invoke-BoundedArtifactStreamScan -Stream $stream -ExpectedLength $stream.Length -Scan $scan\n    $stream.Dispose()\n    if (-not $scan.Found) { throw 'artifact mutation accepted' }\n    Write-Output 'mutation rejected'\n    return\n"
+        fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helpers}
+$root = Join-Path ([IO.Path]::GetTempPath()) ('ac4-artifact-mutation-' + [Guid]::NewGuid().ToString('N'))
+try {{
+    [IO.Directory]::CreateDirectory($root) | Out-Null
+    {root_setup}
+    $sentinel = '{sentinel}'
+    $encoded = {encoded_expression}
+    {artifact_setup}
+    {artifact_write}
+    {scan_call}
+    $rejected = $false
+    try {{ Assert-NoSentinelInArtifact -Root $root -Sentinel $sentinel -MaxArtifactBytes {max_bytes} }} catch {{ $rejected = $true }}
+    if (-not $rejected) {{ throw 'artifact mutation accepted' }}
+    Write-Output 'mutation rejected'
+}} finally {{ if (Test-Path -LiteralPath $root) {{ Remove-Item -LiteralPath $root -Recurse -Force }} }}
+"""
+        result = _run_powershell_fixture(fixture)
+        assert result.returncode == 0, f"artifact mutation {index} was accepted: {result.stdout} {result.stderr}"
+        assert "mutation rejected" in result.stdout
+
+
+def _loopback_behavioral_fixture() -> str:
+    return r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $env:SPOTTER_LOOPBACK_MODULE -Force
+$sentinel = 'fixture-only-sentinel'
+$fixture = $null
+try {
+    $fixture = Start-SnipeItLoopbackFixture -AuthorizationSentinel $sentinel
+    if ($fixture.State.Ready) { throw 'fixture published readiness before listener setup' }
+    $fixture.State.TestReadyGate = $true
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    while (-not $fixture.State.Ready -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
+    if (-not $fixture.State.Ready -or $null -eq $fixture.State.Listener -or -not $fixture.State.Listener.IsListening) { throw 'fixture did not become ready after receive capability' }
+    $client = [Net.Http.HttpClient]::new()
+    try {
+        $authorized = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $sentinel)
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, ([string]$fixture.Prefix) + 'api/v1/manufacturers?search=Maker&limit=100&offset=0')
+        $request.Headers.Authorization = $authorized
+        $response = $client.Send($request)
+        if ($response.StatusCode -ne 200) { throw 'valid taxonomy query was rejected' }
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, ([string]$fixture.Prefix) + 'api/v1/models?search=Model&limit=100&offset=100&offset=101')
+        $request.Headers.Authorization = $authorized
+        $response = $client.Send($request)
+        if ([int]$response.StatusCode -ne 404) { throw 'duplicate query key was accepted' }
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, ([string]$fixture.Prefix) + 'api/v1/hardware/byserial/SERIAL/extra')
+        $request.Headers.Authorization = $authorized
+        $response = $client.Send($request)
+        if ([int]$response.StatusCode -ne 404) { throw 'malformed route was accepted' }
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, ([string]$fixture.Prefix) + 'api/v1/unknown?search=Maker&limit=100&offset=0')
+        $request.Headers.Authorization = $authorized
+        $response = $client.Send($request)
+        if ([int]$response.StatusCode -ne 404) { throw 'unexpected route was accepted' }
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Post, ([string]$fixture.Prefix) + 'api/v1/manufacturers?search=Maker&limit=100&offset=0')
+        $request.Headers.Authorization = $authorized
+        $response = $client.Send($request)
+        if ([int]$response.StatusCode -ne 405) { throw 'mutation request was accepted' }
+        $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, ([string]$fixture.Prefix) + 'api/v1/hardware/byserial/SERIAL')
+        $response = $client.Send($request)
+        if ([int]$response.StatusCode -ne 401) { throw 'unauthorized request was accepted' }
+    } finally { $client.Dispose() }
+    $evidence = Get-SnipeItLoopbackEvidence -Fixture $fixture
+    if (@($evidence.Requests | Where-Object { $_.route -eq 'unexpected' }).Count -lt 3) { throw 'unexpected route evidence was not recorded' }
+    if (@($evidence.Requests | Where-Object { $_.query_valid -eq $false }).Count -lt 1) { throw 'invalid query evidence was not recorded' }
+    if (@($evidence.Requests | Where-Object { $_.accepted -and -not $_.authorized }).Count -ne 0) { throw 'unauthorized evidence was accepted' }
+    Write-Output 'loopback behavioral fixture accepted'
+} finally {
+    if ($null -ne $fixture) { Stop-SnipeItLoopbackFixture -Fixture $fixture -TimeoutSeconds 5 }
+}
+'''
+
+
+def _test_gated_loopback_module(source: str) -> str:
+    state_marker = "        BindAttempts = 0\n"
+    publication_marker = "            $state.Ready = $true\n"
+    assert state_marker in source
+    gated_source = source.replace(
+        state_marker,
+        state_marker + "        TestReadyGate = $false\n",
+        1,
+    )
+    if publication_marker in gated_source:
+        gated_source = gated_source.replace(
+            publication_marker,
+            "            while (-not $state.TestReadyGate -and -not $state.StopRequested) { Start-Sleep -Milliseconds 10 }\n"
+            + publication_marker,
+            1,
+        )
+    return gated_source
+
+
+def _run_loopback_fixture(module_source: str, fixture: str) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="ac4-loopback-") as module_directory:
+        module_path = Path(module_directory) / "SnipeItLoopback.psm1"
+        module_path.write_text(_test_gated_loopback_module(module_source), encoding="utf-8")
+        return _run_powershell_fixture(
+            fixture,
+            os.environ | {"SPOTTER_LOOPBACK_MODULE": str(module_path)},
+            timeout_seconds=20,
+        )
+
+
+def test_ac4_loopback_fixture_behaviorally_validates_routes_queries_and_readiness() -> None:
+    result = _run_loopback_fixture(LOOPBACK.read_text(encoding="utf-8"), _loopback_behavioral_fixture())
+    assert result.returncode == 0
+    assert "loopback behavioral fixture accepted" in result.stdout
+
+
+def test_ac4_loopback_mutations_remove_required_safety_contracts() -> None:
+    source = LOOPBACK.read_text(encoding="utf-8")
+    for expected, replacement in (
+        ("Ready = $false", "Ready = $true"),
+        ("$state.Ready = $true", "$state.Ready = $false"),
+        ("query_valid = [bool]$queryValid", "query_valid = $true"),
+        ("route = 'unexpected'", "route = 'manufacturers'"),
+        ("$method -ne 'GET'", "$false"),
+    ):
+        assert expected in source
+        mutation = source.replace(expected, replacement, 1)
+        assert mutation != source
+        result = _run_loopback_fixture(mutation, _loopback_behavioral_fixture())
+        assert result.returncode != 0
+
+
+def test_ac4_ciphertext_validation_is_structural_canonical_and_private() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    assert "function Assert-EncryptedTokenSetting" in source
+    helper = _powershell_function(source, "Assert-EncryptedTokenSetting")
+    assert "Write-Output $encoded" not in helper
+    assert "Write-Output $SettingsText" not in helper
+    assert "Write-Host" not in helper
+    fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helper}
+$prefix = [byte[]](1, 0, 0, 0, 0xd0, 0x8c, 0x9d, 0xdf, 1, 0x15, 0xd1, 0x11, 0x8c, 0x7a, 0, 0xc0, 0x4f, 0xc2, 0x97, 0xeb)
+$blob = [byte[]]::new(48)
+[Array]::Copy($prefix, $blob, $prefix.Length)
+$canonical = [Convert]::ToBase64String($blob)
+$valid = "[snipeit]`napi_token_encrypted = `"$canonical`"`n"
+Assert-EncryptedTokenSetting -SettingsText $valid
+$headerMutationOffsets = @(0, 1, 2, 3, 4, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19)
+foreach ($offset in $headerMutationOffsets) {{
+    $mutatedBlob = [byte[]]::new($blob.Length)
+    [Array]::Copy($blob, $mutatedBlob, $blob.Length)
+    $mutatedBlob[$offset] = [byte](($mutatedBlob[$offset] + 1) % 256)
+    $mutatedEncoded = [Convert]::ToBase64String($mutatedBlob)
+    $mutatedText = "[snipeit]`napi_token_encrypted = `"$mutatedEncoded`"`n"
+    $accepted = $false
+    try {{ Assert-EncryptedTokenSetting -SettingsText $mutatedText; $accepted = $true }} catch {{ }}
+    if ($accepted) {{ throw "DPAPI header mutation at offset $offset was accepted" }}
+}}
+$noncanonicalBlob = [byte[]]::new(47)
+[Array]::Copy($prefix, $noncanonicalBlob, $prefix.Length)
+$noncanonicalCanonical = [Convert]::ToBase64String($noncanonicalBlob)
+$alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+$noncanonicalIndex = $noncanonicalCanonical.Length - 2
+$noncanonicalValue = $alphabet.IndexOf([string]$noncanonicalCanonical[$noncanonicalIndex])
+$noncanonical = $noncanonicalCanonical.Substring(0, $noncanonicalIndex) + $alphabet[($noncanonicalValue + 1)] + $noncanonicalCanonical.Substring($noncanonicalIndex + 1)
+$empty = "[snipeit]`napi_token_encrypted = `"`"`n"
+$invalidBase64 = "[snipeit]`napi_token_encrypted = `"not-base64`"`n"
+$noncanonicalText = "[snipeit]`napi_token_encrypted = `"$noncanonical`"`n"
+$tooShort = "[snipeit]`napi_token_encrypted = `"$([Convert]::ToBase64String([byte[]]::new(31)))`"`n"
+$wrongKey = "[snipeit]`napi_token = `"$canonical`"`n"
+$wrongSection = "[other]`napi_token_encrypted = `"$canonical`"`n"
+$plaintext = "[snipeit]`napi_token_encrypted = `"plaintext-token-sentinel`"`n"
+function Assert-InvalidCiphertextFixture {{
+    param([Parameter(Mandatory = $true)][string]$Text)
+    $accepted = $false
+    try {{ Assert-EncryptedTokenSetting -SettingsText $Text; $accepted = $true }} catch {{ }}
+    if ($accepted) {{ throw 'invalid ciphertext fixture was accepted' }}
+}}
+Assert-InvalidCiphertextFixture -Text $empty
+Assert-InvalidCiphertextFixture -Text $invalidBase64
+Assert-InvalidCiphertextFixture -Text $noncanonicalText
+Assert-InvalidCiphertextFixture -Text $tooShort
+Assert-InvalidCiphertextFixture -Text $wrongKey
+Assert-InvalidCiphertextFixture -Text $wrongSection
+Assert-InvalidCiphertextFixture -Text $plaintext
+Write-Output 'ciphertext fixture accepted'
+"""
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "ciphertext fixture accepted" in result.stdout
+
+
+def test_ac4_ciphertext_mutations_are_rejected() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper = _powershell_function(source, "Assert-EncryptedTokenSetting")
+    prefix_setup = """
+$prefix = [byte[]](1, 0, 0, 0, 0xd0, 0x8c, 0x9d, 0xdf, 1, 0x15, 0xd1, 0x11, 0x8c, 0x7a, 0, 0xc0, 0x4f, 0xc2, 0x97, 0xeb)
+$blob = [byte[]]::new(48)
+[Array]::Copy($prefix, $blob, $prefix.Length)
+"""
+    cases = (
+        (
+            "canonical",
+            helper.replace("$canonical -cne $encoded", "$false", 1),
+            prefix_setup
+            + """
+$shortBlob = [byte[]]::new(47)
+[Array]::Copy($prefix, $shortBlob, $prefix.Length)
+$canonical = [Convert]::ToBase64String($shortBlob)
+$alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+$index = $canonical.Length - 2
+$value = $alphabet.IndexOf([string]$canonical[$index])
+$encoded = $canonical.Substring(0, $index) + $alphabet[($value + 1)] + $canonical.Substring($index + 1)
+$text = "[snipeit]`napi_token_encrypted = `"$encoded`"`n"
+""",
+        ),
+        (
+            "length",
+            helper.replace("$bytes.Length -lt 32", "$bytes.Length -lt 1", 1),
+            prefix_setup
+            + """
+$shortBlob = [byte[]]::new(31)
+[Array]::Copy($prefix, $shortBlob, $prefix.Length)
+$encoded = [Convert]::ToBase64String($shortBlob)
+$text = "[snipeit]`napi_token_encrypted = `"$encoded`"`n"
+""",
+        ),
+    )
+    for label, mutation, setup in cases:
+        assert mutation != helper
+        fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{mutation}
+{setup}
+$accepted = $false
+try {{ Assert-EncryptedTokenSetting -SettingsText $text; $accepted = $true }} catch {{ }}
+if ($accepted) {{ throw 'ciphertext validation mutation was accepted' }}
+Write-Output 'ciphertext mutation rejected'
+"""
+        result = _run_powershell_fixture(fixture)
+        assert result.returncode != 0, f"ciphertext mutation {label} was accepted"
+        assert "ciphertext validation mutation was accepted" in result.stderr
+
+    header_mutation_target = "if ($bytes[$index] -ne $expectedHeader[$index]) {"
+    assert header_mutation_target in helper
+    for offset in range(20):
+        mutation = helper.replace(
+            header_mutation_target,
+            f"if ($index -ne {offset} -and $bytes[$index] -ne $expectedHeader[$index]) {{",
+            1,
+        )
+        assert mutation != helper
+        setup = prefix_setup + f"""
+$blob[{offset}] = [byte](($blob[{offset}] + 1) % 256)
+$encoded = [Convert]::ToBase64String($blob)
+$text = "[snipeit]`napi_token_encrypted = `"$encoded`"`n"
+"""
+        fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{mutation}
+{setup}
+$accepted = $false
+try {{ Assert-EncryptedTokenSetting -SettingsText $text; $accepted = $true }} catch {{ }}
+if ($accepted) {{ throw 'ciphertext validation mutation was accepted' }}
+Write-Output 'ciphertext mutation rejected'
+"""
+        result = _run_powershell_fixture(fixture)
+        assert result.returncode != 0, f"ciphertext header mutation {offset} was accepted"
+        assert "ciphertext validation mutation was accepted" in result.stderr
+
+
+def test_ac4_caller_successfully_closes_stdin_without_strict_mode_cleanup_failure() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper_names = (
+        "Assert-True",
+        "Write-BoundedProcessCaptureStream",
+        "Complete-BoundedProcessCaptureStream",
+        "Assert-BoundedProcessCaptureSafe",
+        "Get-BoundedProcessCapture",
+        "Get-BoundedRemainingMillisecond",
+        "Invoke-BoundedProcessStop",
+        "Wait-BoundedTask",
+        "Invoke-BoundedStandardInput",
+        "Invoke-BoundedProcessCleanup",
+        "Wait-BoundedProcessOutput",
+        "Invoke-TokenCli",
+    )
+    helpers = "\n".join(
+        _powershell_function(source, name) for name in helper_names
+    )
+    fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helpers}
+Add-Type @'
+using System;
+using System.Diagnostics;
+public static class Ac4CallerFixtureHandlers
+{{
+    public static void OnData(object sender, DataReceivedEventArgs args) {{ }}
+}}
+'@
+function Get-BoundedProcessCapture {{
+    [pscustomobject]@{{
+        StdoutHandler = [Diagnostics.DataReceivedEventHandler][Ac4CallerFixtureHandlers]::OnData
+        StderrHandler = [Diagnostics.DataReceivedEventHandler][Ac4CallerFixtureHandlers]::OnData
+    }}
+}}
+$CliPath = (Get-Command pwsh).Source
+$ProcessTimeoutSeconds = 10
+$result = @(Invoke-TokenCli -Arguments @(
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
+    '$inputText = [Console]::In.ReadToEnd(); if ($inputText -cne ''caller-fixture-token'') {{ exit 17 }}; Write-Output ''caller fixture accepted'''
+) -Token 'caller-fixture-token' -Description 'caller-success')[-1]
+if ($result.ExitCode -ne 0) {{
+    throw 'caller success fixture returned an invalid result'
+}}
+Write-Output 'caller stdin success fixture accepted'
+"""
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "caller stdin success fixture accepted" in result.stdout
+
+
+def test_ac4_caller_lifecycle_fixtures_cover_failures_and_descendants() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper_names = (
+        "Assert-True",
+        "Write-BoundedProcessCaptureStream",
+        "Complete-BoundedProcessCaptureStream",
+        "Assert-BoundedProcessCaptureSafe",
+        "Get-BoundedProcessCapture",
+        "Get-BoundedRemainingMillisecond",
+        "Invoke-BoundedProcessStop",
+        "Wait-BoundedTask",
+        "Invoke-BoundedStandardInput",
+        "Invoke-BoundedProcessCleanup",
+        "Wait-BoundedProcessOutput",
+        "Invoke-DirectCli",
+        "Invoke-TokenCli",
+    )
+    helpers = "\n".join(
+        _powershell_function(source, name) for name in helper_names
+    )
+    fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helpers}
+Add-Type @'
+using System;
+using System.Diagnostics;
+public static class Ac4LifecycleFixtureHandlers
+{{
+    public static void OnData(object sender, DataReceivedEventArgs args) {{ }}
+}}
+'@
+function Get-BoundedProcessCapture {{
+    [pscustomobject]@{{
+        StdoutHandler = [Diagnostics.DataReceivedEventHandler][Ac4LifecycleFixtureHandlers]::OnData
+        StderrHandler = [Diagnostics.DataReceivedEventHandler][Ac4LifecycleFixtureHandlers]::OnData
+    }}
+}}
+$CliPath = (Get-Command pwsh).Source
+$ProcessTimeoutSeconds = 1
+$token = 'lifecycle-fixture-token'
+$tokenSentinel = 'direct-fixture-sentinel'
+function Invoke-CallerFixture {{
+    param([bool]$TokenMode, [string[]]$ChildArguments)
+    $caught = $null
+    try {{
+        if ($TokenMode) {{
+            [void](Invoke-TokenCli -Arguments $ChildArguments -Token $token -Description 'fixture-token')
+        }} else {{
+            [void](Invoke-DirectCli -Arguments $ChildArguments -Description 'fixture-direct')
+        }}
+    }} catch {{ $caught = $_ }}
+    if ($null -eq $caught) {{ throw 'caller fixture accepted a failure' }}
+    if ($caught.Exception.Message -notmatch 'did not exit|cleanup failed|operation failed') {{ throw 'caller fixture returned an unsafe diagnostic' }}
+}}
+$expired = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', '[Threading.Thread]::Sleep(10000)')
+Invoke-CallerFixture -TokenMode $false -ChildArguments $expired
+Invoke-CallerFixture -TokenMode $true -ChildArguments $expired
+$root = Join-Path ([IO.Path]::GetTempPath()) ('ac4-descendant-' + [Guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($root) | Out-Null
+$marker = Join-Path $root 'descendant.pid'
+$descendantCommand = '$grandchild = Start-Process -FilePath (Get-Command pwsh).Source -ArgumentList @(''-NoLogo'', ''-NoProfile'', ''-NonInteractive'', ''-Command'', ''[Threading.Thread]::Sleep(10000)'') -PassThru; [IO.File]::WriteAllText(''' + $marker.Replace('''', '''''') + ''', $grandchild.Id.ToString()); [Threading.Thread]::Sleep(10000)'
+$descendant = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $descendantCommand)
+Invoke-CallerFixture -TokenMode $false -ChildArguments $descendant
+$markerDeadline = [DateTime]::UtcNow.AddSeconds(5)
+while (-not (Test-Path -LiteralPath $marker) -and [DateTime]::UtcNow -lt $markerDeadline) {{ Start-Sleep -Milliseconds 20 }}
+if (-not (Test-Path -LiteralPath $marker)) {{ throw 'descendant fixture did not publish its marker' }}
+$grandchildId = [int][IO.File]::ReadAllText($marker)
+$gone = $false
+$goneDeadline = [DateTime]::UtcNow.AddSeconds(5)
+while (-not $gone -and [DateTime]::UtcNow -lt $goneDeadline) {{
+    try {{ $candidate = [Diagnostics.Process]::GetProcessById($grandchildId); $candidate.Dispose() }} catch [ArgumentException] {{ $gone = $true }} catch [InvalidOperationException] {{ $gone = $true }}
+    if (-not $gone) {{ Start-Sleep -Milliseconds 20 }}
+}}
+if (-not $gone) {{ throw 'descendant process survived caller cleanup' }}
+if (Test-Path -LiteralPath $root) {{ Remove-Item -LiteralPath $root -Recurse -Force }}
+Write-Output 'caller failure and descendant fixtures accepted'
+"""
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "caller failure and descendant fixtures accepted" in result.stdout
+
+
+def test_ac4_caller_stdin_failure_fixtures_are_bounded_and_cleanup_processes() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper_names = (
+        "Assert-True",
+        "Write-BoundedProcessCaptureStream",
+        "Complete-BoundedProcessCaptureStream",
+        "Assert-BoundedProcessCaptureSafe",
+        "Get-BoundedProcessCapture",
+        "Get-BoundedRemainingMillisecond",
+        "Invoke-BoundedProcessStop",
+        "Wait-BoundedTask",
+        "Invoke-BoundedStandardInput",
+        "Invoke-BoundedProcessCleanup",
+        "Wait-BoundedProcessOutput",
+        "Invoke-TokenCli",
+    )
+    helper = _powershell_function(source, "Invoke-BoundedStandardInput")
+    mutations = (
+        ("write", "$writeTask = $Process.StandardInput.WriteAsync($Text)", "$writeTask = [Threading.Tasks.Task]::FromException([Exception]::new('fixture'))"),
+        ("flush", "$flushTask = $Process.StandardInput.FlushAsync()", "$flushTask = [Threading.Tasks.Task]::FromException([Exception]::new('fixture'))"),
+        ("close", "$closeTask = $closeValueTask.AsTask()", "$closeTask = [Threading.Tasks.Task]::FromException([Exception]::new('fixture'))"),
+    )
+    for label, expected, replacement in mutations:
+        mutated_helper = helper.replace(expected, replacement, 1)
+        assert mutated_helper != helper
+        helpers = "\n".join(
+            mutated_helper if name == "Invoke-BoundedStandardInput" else _powershell_function(source, name)
+            for name in helper_names
+        )
+        fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helpers}
+Add-Type @'
+using System;
+using System.Diagnostics;
+public static class Ac4StdinFixtureHandlers
+{{
+    public static void OnData(object sender, DataReceivedEventArgs args) {{ }}
+}}
+'@
+function Get-BoundedProcessCapture {{
+    [pscustomobject]@{{
+        StdoutHandler = [Diagnostics.DataReceivedEventHandler][Ac4StdinFixtureHandlers]::OnData
+        StderrHandler = [Diagnostics.DataReceivedEventHandler][Ac4StdinFixtureHandlers]::OnData
+    }}
+}}
+$CliPath = (Get-Command pwsh).Source
+$ProcessTimeoutSeconds = 5
+$marker = Join-Path ([IO.Path]::GetTempPath()) ('ac4-stdin-' + [Guid]::NewGuid().ToString('N'))
+$childCommand = '[IO.File]::WriteAllText(''' + $marker.Replace('''', '''''') + ''', $PID.ToString()); [Threading.Thread]::Sleep(10000)'
+$arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $childCommand)
+try {{
+    $startedAt = [DateTime]::UtcNow
+    $caught = $null
+    try {{ [void](Invoke-TokenCli -Arguments $arguments -Token 'stdin-fixture-token' -Description 'stdin-fixture') }} catch {{ $caught = $_ }}
+    $elapsedMilliseconds = ([DateTime]::UtcNow - $startedAt).TotalMilliseconds
+    if ($null -eq $caught -or $caught.Exception.Message -notmatch 'child stdin (write|flush|close) failed or exceeded') {{ throw 'stdin failure was not rejected with a fixed diagnostic' }}
+    if ($elapsedMilliseconds -gt 5000) {{ throw 'stdin failure was not deadline bounded' }}
+    if (Test-Path -LiteralPath $marker) {{
+        $childId = [int][IO.File]::ReadAllText($marker)
+        $gone = $false
+        $goneDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        while (-not $gone -and [DateTime]::UtcNow -lt $goneDeadline) {{
+            try {{ $candidate = [Diagnostics.Process]::GetProcessById($childId); $candidate.Dispose() }} catch [ArgumentException] {{ $gone = $true }} catch [InvalidOperationException] {{ $gone = $true }}
+            if (-not $gone) {{ Start-Sleep -Milliseconds 20 }}
+        }}
+        if (-not $gone) {{ throw 'stdin failure left the child alive' }}
+    }}
+    Write-Output 'stdin {label} failure fixture accepted'
+}} finally {{ if (Test-Path -LiteralPath $marker) {{ Remove-Item -LiteralPath $marker -Force }} }}
+"""
+        result = _run_powershell_fixture(fixture)
+        assert result.returncode == 0, f"stdin {label} fixture failed: {result.stdout} {result.stderr}"
+        assert f"stdin {label} failure fixture accepted" in result.stdout
+
+
+def test_ac4_stdin_operation_and_cleanup_failures_are_combined_without_leaks() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper_names = (
+        "Get-BoundedRemainingMillisecond",
+        "Invoke-BoundedProcessStop",
+        "Wait-BoundedTask",
+        "Invoke-BoundedStandardInput",
+    )
+    helper = _powershell_function(source, "Invoke-BoundedStandardInput")
+    helpers = "\n".join(
+        _powershell_function(source, name) for name in helper_names
+    )
+    mutations = (
+        ("primary capture", "$stdinError = $_", "$stdinError = $null"),
+        ("cleanup capture", "$stdinCleanupError = $_", "$stdinCleanupError = $null"),
+        (
+            "combined branch",
+            "if ($stdinError -and $stdinCleanupError) { throw 'child stdin operation failed and cleanup failed' }",
+            "if ($stdinError -and $stdinCleanupError) { throw 'child stdin operation failed' }",
+        ),
+    )
+
+    def fixture_for(helper_set: str) -> str:
+        return f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helper_set}
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = (Get-Command pwsh).Source
+$info.UseShellExecute = $false
+$info.RedirectStandardInput = $true
+[void]$info.ArgumentList.Add('-NoLogo')
+[void]$info.ArgumentList.Add('-NoProfile')
+[void]$info.ArgumentList.Add('-NonInteractive')
+[void]$info.ArgumentList.Add('-Command')
+[void]$info.ArgumentList.Add('[Threading.Thread]::Sleep(10000)')
+$p = [Diagnostics.Process]::new()
+$p.StartInfo = $info
+$token = 'stdin-combined-token-secret'
+$operationSecret = 'stdin-operation-secret'
+$cleanupSecret = 'stdin-cleanup-secret'
+try {{
+    if (-not $p.Start()) {{ throw 'child did not start' }}
+    function Wait-BoundedTask {{ throw $operationSecret }}
+    function Invoke-BoundedProcessStop {{ throw $cleanupSecret }}
+    $caught = $null
+    try {{
+        Invoke-BoundedStandardInput -Process $p -Text $token -Deadline ([DateTime]::UtcNow.AddMilliseconds(-1))
+    }} catch {{ $caught = $_ }}
+    if ($null -eq $caught) {{ throw 'combined stdin failure was accepted' }}
+    if ($caught.Exception.Message -cne 'child stdin operation failed and cleanup failed') {{ throw 'combined stdin diagnostic mismatch' }}
+    foreach ($secret in @($token, $operationSecret, $cleanupSecret)) {{
+        if ($caught.Exception.ToString().Contains($secret, [StringComparison]::Ordinal)) {{ throw 'combined stdin diagnostic leaked a secret' }}
+    }}
+    Write-Output 'combined stdin failure fixture accepted'
+}} finally {{
+    if (-not $p.HasExited) {{ try {{ $p.Kill($true); $p.WaitForExit(1000) }} catch {{ }} }}
+    $p.Dispose()
+}}
+"""
+
+    result = _run_powershell_fixture(fixture_for(helpers))
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "combined stdin failure fixture accepted" in result.stdout
+
+    for label, expected, replacement in mutations:
+        mutated_helper = helper.replace(expected, replacement, 1)
+        assert mutated_helper != helper, f"missing stdin {label} mutation target"
+        mutated_helpers = "\n".join(
+            mutated_helper if name == "Invoke-BoundedStandardInput" else _powershell_function(source, name)
+            for name in helper_names
+        )
+        mutated_result = _run_powershell_fixture(fixture_for(mutated_helpers))
+        assert mutated_result.returncode != 0, f"stdin {label} mutation was accepted"
+
+
+def _caller_lifecycle_fixture(
+    caller: str,
+    caller_name: str,
+    token_mode: bool,
+    scenario: str,
+) -> str:
+    helper_names = (
+        "Assert-True",
+        "Write-BoundedProcessCaptureStream",
+        "Complete-BoundedProcessCaptureStream",
+        "Assert-BoundedProcessCaptureSafe",
+        "Get-BoundedProcessCapture",
+        "Get-BoundedRemainingMillisecond",
+        "Invoke-BoundedProcessStop",
+        "Wait-BoundedTask",
+        "Invoke-BoundedStandardInput",
+        "Invoke-BoundedProcessCleanup",
+        "Wait-BoundedProcessOutput",
+    )
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helpers = "\n".join(
+        _powershell_function(source, name) for name in helper_names
+    )
+    mode = "$true" if token_mode else "$false"
+    caller_invocation = (
+        "[void](Invoke-TokenCli -Arguments $arguments -Token $token -Description 'fixture-token')"
+        if token_mode
+        else "[void](Invoke-DirectCli -Arguments $arguments -Description 'fixture-direct')"
+    )
+    return f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helpers}
+{caller}
+Add-Type @'
+using System;
+using System.Diagnostics;
+public static class Ac4CallerMutationHandlers
+{{
+    public static void OnData(object sender, DataReceivedEventArgs args) {{ }}
+}}
+'@
+function Get-BoundedProcessCapture {{
+    param([Parameter(Mandatory = $true)][hashtable]$Capture)
+    [pscustomobject]@{{
+        StdoutHandler = [Diagnostics.DataReceivedEventHandler][Ac4CallerMutationHandlers]::OnData
+        StderrHandler = [Diagnostics.DataReceivedEventHandler][Ac4CallerMutationHandlers]::OnData
+    }}
+}}
+$CliPath = (Get-Command pwsh).Source
+$ProcessTimeoutSeconds = 1
+$token = 'fixture-token'
+$tokenSentinel = 'fixture-token-sentinel'
+$TokenMode = {mode}
+$Scenario = '{scenario}'
+$marker = Join-Path ([IO.Path]::GetTempPath()) ('ac4-caller-' + [Guid]::NewGuid().ToString('N'))
+$escapedMarker = $marker.Replace("'", "''")
+$childTail = if ($Scenario -eq 'timeout') {{ '[Threading.Thread]::Sleep(10000)' }} elseif ($Scenario -eq 'primary_failure') {{ 'exit 7' }} else {{ "Write-Output 'fixture-child'" }}
+$childCommand = if ($TokenMode) {{
+    "[Console]::In.ReadToEnd(); [IO.File]::WriteAllText('$escapedMarker', `$PID.ToString()); $childTail"
+}} else {{
+    "[IO.File]::WriteAllText('$escapedMarker', `$PID.ToString()); $childTail"
+}}
+$arguments = @('-NoLogo', '-NoProfile', '-NonInteractive', '-Command', $childCommand)
+
+function Wait-FixtureMarker {{
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    while (-not (Test-Path -LiteralPath $marker) -and [DateTime]::UtcNow -lt $deadline) {{
+        Start-Sleep -Milliseconds 20
+    }}
+    return (Test-Path -LiteralPath $marker)
+}}
+
+function Test-FixtureProcessGone {{
+    if (-not (Test-Path -LiteralPath $marker)) {{ return $false }}
+    $childId = [int][IO.File]::ReadAllText($marker)
+    $deadline = [DateTime]::UtcNow.AddSeconds(3)
+    while ([DateTime]::UtcNow -lt $deadline) {{
+        try {{
+            $candidate = [Diagnostics.Process]::GetProcessById($childId)
+            $candidate.Dispose()
+        }} catch [ArgumentException] {{ return $true }} catch [InvalidOperationException] {{ return $true }}
+        Start-Sleep -Milliseconds 20
+    }}
+    return $false
+}}
+
+if ($Scenario -eq 'cleanup_failure') {{
+    function Invoke-BoundedProcessCleanup {{ throw 'fixture cleanup failure' }}
+}}
+if ($Scenario -eq 'start_failure') {{
+    $CliPath = Join-Path ([IO.Path]::GetTempPath()) ('ac4-missing-' + [Guid]::NewGuid().ToString('N'))
+}}
+
+$caught = $null
+try {{
+    try {{ {caller_invocation} }} catch {{ $caught = $_ }}
+    if ($Scenario -eq 'start_failure') {{
+        if ($null -eq $caught) {{ throw 'start failure was accepted' }}
+        if ($caught.Exception.Message -match 'cleanup failed|operation failed') {{ throw 'start failure cleanup state was not preserved' }}
+    }} elseif ($Scenario -eq 'timeout') {{
+        if ($null -eq $caught) {{ throw 'timeout failure was not reported safely' }}
+        if (-not (Wait-FixtureMarker)) {{ throw 'timeout child did not publish its marker' }}
+        if (-not (Test-FixtureProcessGone)) {{ throw 'caller did not clean the timeout child' }}
+    }} elseif ($Scenario -eq 'primary_failure') {{
+        if ($null -eq $caught) {{ throw 'primary failure was not reported safely' }}
+    }} elseif ($Scenario -eq 'cleanup_failure') {{
+        if ($null -eq $caught -or $caught.Exception.Message -cne 'child process cleanup failed') {{ throw 'cleanup failure was not reported safely' }}
+    }}
+    Write-Output 'caller lifecycle mutation fixture accepted'
+}} finally {{
+    if (Test-Path -LiteralPath $marker) {{
+        try {{
+            $childId = [int][IO.File]::ReadAllText($marker)
+            $candidate = [Diagnostics.Process]::GetProcessById($childId)
+            if (-not $candidate.HasExited) {{ $candidate.Kill($true); $candidate.WaitForExit(1000) }}
+            $candidate.Dispose()
+        }} catch {{ }}
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+    }}
+}}
+"""
+
+
+def _process_stop_fixture(stop_helper: str) -> str:
+    return f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{stop_helper}
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = (Get-Command pwsh).Source
+$info.UseShellExecute = $false
+[void]$info.ArgumentList.Add('-NoLogo')
+[void]$info.ArgumentList.Add('-NoProfile')
+[void]$info.ArgumentList.Add('-NonInteractive')
+[void]$info.ArgumentList.Add('-Command')
+[void]$info.ArgumentList.Add('[Threading.Thread]::Sleep(10000)')
+$p = [Diagnostics.Process]::new()
+$p.StartInfo = $info
+try {{
+    if (-not $p.Start()) {{ throw 'child did not start' }}
+    $caught = $null
+    try {{ Invoke-BoundedProcessStop -Process $p -WaitMilliseconds 1000 }} catch {{ $caught = $_ }}
+    if ($null -ne $caught -or -not $p.HasExited) {{ throw 'process stop contract was not satisfied' }}
+    Write-Output 'process stop fixture accepted'
+}} finally {{
+    try {{ if (-not $p.HasExited) {{ $p.Kill($true); $p.WaitForExit(1000) }} }} catch {{ }}
+    $p.Dispose()
+}}
+"""
+
+
+def _process_cleanup_disposal_fixture(cleanup_helper: str) -> str:
+    return f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Add-Type -TypeDefinition @'
+using System.Diagnostics;
+public sealed class Ac4TrackingProcess : Process {{
+    public static int DisposeCount;
+    protected override void Dispose(bool disposing) {{ DisposeCount++; base.Dispose(disposing); }}
+}}
+'@
+{cleanup_helper}
+$p = [Ac4TrackingProcess]::new()
+try {{
+    Invoke-BoundedProcessCleanup -Process $p -Started $false
+    if ([Ac4TrackingProcess]::DisposeCount -ne 1) {{ throw 'process disposal was skipped' }}
+    Write-Output 'process disposal fixture accepted'
+}} finally {{ try {{ $p.Dispose() }} catch {{ }} }}
+"""
+
+
+def test_ac4_caller_lifecycle_mutations_are_rejected() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    caller_specs = (
+        ("Invoke-DirectCli", "Get-CommonCliArgument", False),
+        ("Invoke-TokenCli", "Assert-NoSentinelInText", True),
+    )
+    caller_mutations = (
+        ("missing started initialization", "$started = $false", "", "start_failure"),
+        ("moved started publication", "$started = $true", "$started = $false", "timeout"),
+        (
+            "bypassed cleanup",
+            "Invoke-BoundedProcessCleanup -Process $process -Started $started",
+            "",
+            "timeout",
+        ),
+        ("primary branch bypass", "if ($primaryError) { throw $primaryError }", "", "primary_failure"),
+        (
+            "cleanup branch bypass",
+            "if ($cleanupError) { throw 'child process cleanup failed' }",
+            "",
+            "cleanup_failure",
+        ),
+    )
+
+    for caller_name, next_name, token_mode in caller_specs:
+        caller = source[source.index(f"function {caller_name}") : source.index(f"function {next_name}")]
+        for _scenario in ("start_failure", "timeout", "cleanup_failure"):
+            baseline = _run_powershell_fixture(
+                _caller_lifecycle_fixture(caller, caller_name, token_mode, _scenario),
+                timeout_seconds=15,
+            )
+            assert baseline.returncode == 0
+            assert "caller lifecycle mutation fixture accepted" in baseline.stdout
+        for label, expected, replacement, scenario in caller_mutations:
+            assert expected in caller, f"missing caller mutation target: {caller_name} {label}"
+            mutation = caller.replace(expected, replacement, 1)
+            assert mutation != caller
+            result = _run_powershell_fixture(
+                _caller_lifecycle_fixture(mutation, caller_name, token_mode, scenario),
+                timeout_seconds=15,
+            )
+            assert result.returncode != 0, f"caller mutation was accepted: {caller_name} {label}"
+
+    stop = _powershell_function(source, "Invoke-BoundedProcessStop")
+    for label, expected, replacement in (
+        ("Kill", "$Process.Kill($true)", "$null = $Process.HasExited"),
+        ("WaitForExit", "$Process.WaitForExit($WaitMilliseconds)", "$false"),
+        ("final HasExited", "if (-not $Process.HasExited)", "if ($true)"),
+    ):
+        assert expected in stop, f"missing process stop mutation target: {label}"
+        mutation = stop.replace(expected, replacement, 1)
+        result = _run_powershell_fixture(_process_stop_fixture(mutation), timeout_seconds=15)
+        assert result.returncode != 0, f"process stop mutation was accepted: {label}"
+
+    cleanup = _powershell_function(source, "Invoke-BoundedProcessCleanup")
+    expected = "$Process.Dispose()"
+    assert expected in cleanup
+    mutation = cleanup.replace(expected, "$null = $Process.HasExited", 1)
+    result = _run_powershell_fixture(
+        _process_cleanup_disposal_fixture(mutation),
+        timeout_seconds=15,
+    )
+    assert result.returncode != 0, "process disposal mutation was accepted"
+
+
+
+def test_ac4_timeout_cleanup_kills_child_and_requires_exit() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    assert "function Invoke-BoundedProcessStop" in source
+    helper = _powershell_function(source, "Invoke-BoundedProcessStop")
+    fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{helper}
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = (Get-Command pwsh).Source
+$info.UseShellExecute = $false
+$info.CreateNoWindow = $true
+$info.RedirectStandardOutput = $true
+[void]$info.ArgumentList.Add('-NoLogo')
+[void]$info.ArgumentList.Add('-NoProfile')
+[void]$info.ArgumentList.Add('-Command')
+[void]$info.ArgumentList.Add("Write-Output 'ready'; [Console]::Out.Flush(); [Threading.Thread]::Sleep(10000)")
+$p = [Diagnostics.Process]::new()
+$p.StartInfo = $info
+try {{
+    if (-not $p.Start()) {{ throw 'child did not start' }}
+    if ($p.StandardOutput.ReadLine() -ne 'ready') {{ throw 'child was not ready' }}
+    $started = [DateTime]::UtcNow
+    Invoke-BoundedProcessStop -Process $p -WaitMilliseconds 1000
+    $elapsed = ([DateTime]::UtcNow - $started).TotalMilliseconds
+    if (-not $p.HasExited) {{ throw 'child remained alive after bounded cleanup' }}
+    if ($elapsed -gt 3000) {{ throw 'termination wait was not bounded' }}
+    Write-Output 'timeout cleanup fixture accepted'
+}} finally {{
+    if (-not $p.HasExited) {{ try {{ $p.Kill($true) }} catch {{ }} }}
+    $p.Dispose()
+}}
+"""
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "timeout cleanup fixture accepted" in result.stdout
+
+
+def test_ac4_timeout_contract_is_deadline_bounded_and_mutation_aware() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    invoke = source[source.index("function Invoke-DirectCli") : source.index("function Get-CommonCliArgument")]
+    token_invoke = source[source.index("function Invoke-TokenCli") : source.index("function Assert-NoSentinelInText")]
+    for text in (invoke, token_invoke):
+        assert "$deadline = [DateTime]::UtcNow.AddSeconds($ProcessTimeoutSeconds)" in text
+        assert "Wait-BoundedProcessOutput -Process $process -Deadline $deadline" in text
+        assert "Invoke-BoundedProcessCleanup -Process $process -Started $started" in text
+    assert "Invoke-BoundedStandardInput -Process $process -Text $Token -Deadline $deadline" in token_invoke
+    cleanup = _powershell_function(source, "Invoke-BoundedProcessCleanup")
+    for required in ("Invoke-BoundedProcessStop -Process $Process -WaitMilliseconds 5000", "$Process.Dispose()"):
+        assert required in cleanup
+    stop = _powershell_function(source, "Invoke-BoundedProcessStop")
+    for required in ("$Process.Kill($true)", "$Process.WaitForExit($WaitMilliseconds)", "if (-not $Process.HasExited)"):
+        assert required in stop
+    assert "WriteAsync($Text)" in source
+    assert "FlushAsync()" in source
+    assert "DisposeAsync()" in source
+    assert "StandardInput.Close()" not in source
+    assert "$closeTask.Wait($remainingMilliseconds)" not in source
+    stop = _powershell_function(source, "Invoke-BoundedProcessStop")
+    for expected, replacement in (
+        ("$Process.Kill($true)", "$null = $Process.HasExited"),
+        ("$Process.WaitForExit($WaitMilliseconds)", "$false"),
+    ):
+        mutation = stop.replace(expected, replacement, 1)
+        assert mutation != stop
+        remaining = _powershell_function(source, "Get-BoundedRemainingMillisecond")
+        fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+{remaining}
+{mutation}
+$info = [Diagnostics.ProcessStartInfo]::new()
+$info.FileName = (Get-Command pwsh).Source
+$info.UseShellExecute = $false
+$info.RedirectStandardOutput = $true
+[void]$info.ArgumentList.Add('-NoLogo')
+[void]$info.ArgumentList.Add('-NoProfile')
+[void]$info.ArgumentList.Add('-Command')
+[void]$info.ArgumentList.Add("Write-Output 'ready'; [Console]::Out.Flush(); [Threading.Thread]::Sleep(10000)")
+$p = [Diagnostics.Process]::new(); $p.StartInfo = $info
+try {{
+    if (-not $p.Start()) {{ throw 'child did not start' }}
+    $ready = $p.StandardOutput.ReadLine()
+    if ($ready -ne 'ready') {{ throw 'child was not ready' }}
+    $rejected = $false
+    try {{ Invoke-BoundedProcessStop -Process $p -WaitMilliseconds 100 }} catch {{ $rejected = $true }}
+    $survived = -not $p.HasExited
+    if (-not $rejected -and -not $survived) {{ throw 'timeout mutation was accepted' }}
+    Write-Output 'timeout mutation rejected'
+}} finally {{ if (-not $p.HasExited) {{ try {{ $p.Kill($true); $p.WaitForExit(1000) }} catch {{ }} }}; $p.Dispose() }}
+"""
+        result = _run_powershell_fixture(fixture)
+        assert result.returncode == 0, f"timeout mutation accepted: {result.stdout} {result.stderr}"
+        assert "timeout mutation rejected" in result.stdout
 
 
 def _ordered_projection(source: str, function_name: str) -> tuple[tuple[str, ...], dict[str, str]]:
@@ -347,6 +1542,7 @@ def test_required_modules_exist() -> None:
         "Acl.psm1",
         "Security.psm1",
         "Diagnostics.psm1",
+        "SnipeItLoopback.psm1",
         "Cleanup.psm1",
     ):
         read_module(name)
@@ -2748,6 +3944,24 @@ def test_wix_authors_protected_data_acl_or_calls_the_production_acl_path() -> No
 
 def main() -> None:
     test_required_modules_exist()
+    test_snipeit_loopback_fixture_is_private_and_evidence_only()
+    test_direct_scm_exercises_installed_cli_to_service_sync_flow()
+    test_ac4_stream_capture_is_incremental_bounded_and_fail_closed()
+    test_ac4_stream_capture_mutations_are_rejected()
+    test_ac4_stream_capture_mutation_fixtures_are_registered_and_executable()
+    test_ac4_artifact_scanner_handles_bytes_encodings_boundaries_and_fail_closed()
+    test_ac4_artifact_scanner_mutations_are_rejected()
+    test_ac4_loopback_fixture_behaviorally_validates_routes_queries_and_readiness()
+    test_ac4_loopback_mutations_remove_required_safety_contracts()
+    test_ac4_ciphertext_validation_is_structural_canonical_and_private()
+    test_ac4_ciphertext_mutations_are_rejected()
+    test_ac4_caller_successfully_closes_stdin_without_strict_mode_cleanup_failure()
+    test_ac4_caller_lifecycle_fixtures_cover_failures_and_descendants()
+    test_ac4_caller_stdin_failure_fixtures_are_bounded_and_cleanup_processes()
+    test_ac4_stdin_operation_and_cleanup_failures_are_combined_without_leaks()
+    test_ac4_caller_lifecycle_mutations_are_rejected()
+    test_ac4_timeout_cleanup_kills_child_and_requires_exit()
+    test_ac4_timeout_contract_is_deadline_bounded_and_mutation_aware()
     test_wait_module_is_deadline_and_condition_based()
     test_scm_module_proves_runtime_owner_and_bounded_state_waits()
     test_acl_module_normalizes_identity_and_inheritance_metadata()
