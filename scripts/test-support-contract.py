@@ -48,6 +48,22 @@ _CREDENTIAL_LAUNCH_DIAGNOSTIC_FIELDS = (
     "hresult",
     "native_probe",
     "native_probe_stage",
+    "native_probe_rejection",
+)
+_CREDENTIAL_LAUNCH_PROBE_REJECTIONS = (
+    "none",
+    "size",
+    "json",
+    "envelope_schema",
+    "stage",
+    "record_count",
+    "record_schema",
+    "field_type",
+    "native_error_range",
+    "case",
+    "success_error_relation",
+    "length_bucket",
+    "normalization",
 )
 _CREDENTIAL_LAUNCH_DIAGNOSTIC_FORBIDDEN_FIELDS = (
     "username",
@@ -720,6 +736,7 @@ def test_credentialed_launch_diagnostic_schema_is_exact_and_bounded() -> None:
         "hresult": "$hresult",
         "native_probe": "$NativeProbe",
         "native_probe_stage": "$NativeProbeStage",
+        "native_probe_rejection": "$NativeProbeRejection",
     }
     assert "if ($bytes.Length -gt 8192)" in projection
     assert "ConvertTo-Json -Compress -Depth 3" in projection
@@ -729,6 +746,7 @@ def test_credentialed_launch_diagnostic_schema_is_exact_and_bounded() -> None:
     assert "InnerException" in projection
     assert "native_probe = $NativeProbe" in projection
     assert "native_probe_stage = $NativeProbeStage" in projection
+    assert "native_probe_rejection = $NativeProbeRejection" in projection
     native_probe_stage_match = re.search(
         r"\[ValidateSet\((?P<stages>'(?:[^']|'')+'(?:\s*,\s*'(?:[^']|'')+')*)\)\]\[string\]\$NativeProbeStage",
         projection,
@@ -739,6 +757,13 @@ def test_credentialed_launch_diagnostic_schema_is_exact_and_bounded() -> None:
     assert "if ($LaunchStage -ne 'native_start')" in projection
     assert ".Remove('native_probe')" in projection
     assert ".Remove('native_probe_stage')" in projection
+    assert ".Remove('native_probe_rejection')" in projection
+    native_probe_rejection_match = re.search(
+        r"\[ValidateSet\((?P<rejections>'(?:[^']|'')+'(?:\s*,\s*'(?:[^']|'')+')*)\)\]\[string\]\$NativeProbeRejection",
+        projection,
+    )
+    assert native_probe_rejection_match is not None
+    assert tuple(re.findall(r"'([^']+)'", native_probe_rejection_match.group("rejections"))) == _CREDENTIAL_LAUNCH_PROBE_REJECTIONS
 
 
 def test_credentialed_launch_diagnostic_schema_rejects_privacy_mutations() -> None:
@@ -765,6 +790,8 @@ def test_credentialed_launch_diagnostic_schema_rejects_privacy_mutations() -> No
     assert "native_probe = @{" not in projection
     assert "native_probe_stage = $User" not in projection
     assert "native_probe_stage = @{" not in projection
+    assert "native_probe_rejection = $User" not in projection
+    assert "native_probe_rejection = @{" not in projection
     assert "ConvertTo-Json -Compress -Depth 3" in projection
 
 
@@ -891,6 +918,36 @@ def _assert_native_start_catch_saves_original_error(source: str) -> None:
     assert catch.count("$nativeStartErrorRecord = $_") == 1
     assert catch.count("-ErrorRecord $nativeStartErrorRecord") == 1
     assert "-ErrorRecord $_" not in catch
+
+
+def _assert_native_probe_rejection_capture_contract(source: str) -> None:
+    catch_start, catch_end = _credential_launch_catch_spans(source)[2]
+    catch = source[catch_start:catch_end]
+    assert "$nativeProbeRejection = 'none'" in catch
+    assert "-Rejection ([ref]$nativeProbeRejection)" in catch
+    assert "-NativeProbeRejection $nativeProbeRejection" in catch
+    assert catch.index("$nativeProbeRejection = 'none'") < catch.index("ConvertTo-CredentialLaunchProbeEvidence")
+    assert catch.index("ConvertTo-CredentialLaunchProbeEvidence") < catch.index("-NativeProbeRejection $nativeProbeRejection")
+    assert "catch { $nativeProbe = 'probe_unavailable' }" in catch
+    assert "catch { $nativeProbeRejection = $_.Exception.Message }" not in catch
+
+
+def test_credentialed_native_start_capture_preserves_rejection_discriminator() -> None:
+    module = read_module("Security.psm1")
+    _assert_native_probe_rejection_capture_contract(module)
+    invoke_start = module.index("function Invoke-AsStandardUser")
+    invoke_end = module.index("function Assert-StandardUserCannotReadWrite", invoke_start)
+    invoke = module[invoke_start:invoke_end]
+    for mutation in (
+        invoke.replace("$nativeProbeRejection = 'none'", "$discardedRejection = 'none'", 1),
+        invoke.replace("-Rejection ([ref]$nativeProbeRejection)", "-Rejection ([ref]$discardedRejection)", 1),
+        invoke.replace("-NativeProbeRejection $nativeProbeRejection", "-NativeProbeRejection $discardedRejection", 1),
+    ):
+        try:
+            _assert_native_probe_rejection_capture_contract(module[:invoke_start] + mutation + module[invoke_end:])
+        except (AssertionError, ValueError):
+            continue
+        raise AssertionError("native-start rejection capture mutation was accepted")
 
 
 def test_credentialed_native_start_catch_saves_original_error_record() -> None:
@@ -1026,6 +1083,220 @@ def _assert_credential_launch_probe_evidence_parser_contract(source: str) -> Non
 def test_credential_launch_probe_evidence_parser_is_exact_and_bounded() -> None:
     module = read_module("Security.psm1")
     _assert_credential_launch_probe_evidence_parser_contract(module)
+
+
+def _assert_credential_launch_probe_rejection_contract(source: str) -> None:
+    start = source.index("function ConvertTo-CredentialLaunchProbeEvidence")
+    end = source.index("if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type]))", start)
+    helper = source[start:end]
+    assert "[ref]$Rejection" in helper
+    assert "$Rejection.Value = 'none'" in helper
+    rejection_assignment_counts = {
+        rejection: helper.count(f"$Rejection.Value = '{rejection}'")
+        for rejection in _CREDENTIAL_LAUNCH_PROBE_REJECTIONS[1:]
+    }
+    assert rejection_assignment_counts == {
+        **{rejection: 1 for rejection in _CREDENTIAL_LAUNCH_PROBE_REJECTIONS[1:] if rejection not in ("field_type", "success_error_relation")},
+        "field_type": 2,
+        "success_error_relation": 2,
+    }
+    assert "if ($null -ne $Rejection -and $Rejection.Value -eq 'none')" in helper
+    assert "$Rejection.Value = 'normalization'" in helper
+    guard_bindings = (
+        ("if ($bytes.Length -gt 4096)", "size", "credential launch probe exceeded the bounded size"),
+        ("if (($probeProperties -join ',') -cne 'records,stage')", "envelope_schema", "credential launch probe envelope schema was invalid"),
+        ("if ($probe.stage -isnot [string] -or $probe.stage -cnotin $allowedStages)", "stage", "credential launch probe stage was invalid"),
+        ("if ($records.Count -ne $expectedCases.Count)", "record_count", "credential launch probe record count was invalid"),
+        ("if (($recordProperties -join ',') -cne 'case,length_bucket,native_error,success')", "record_schema", "credential launch probe record schema was invalid"),
+        ("if ($record.case -isnot [string] -or $record.length_bucket -isnot [string])", "field_type", "credential launch probe string fields were invalid"),
+        ("if ($record.success -isnot [bool] -or $record.native_error -isnot [long])", "field_type", "credential launch probe numeric fields were invalid"),
+        ("if ($nativeError -lt 0 -or $nativeError -gt [int]::MaxValue)", "native_error_range", "credential launch probe native error was outside the Int32 range"),
+        ("if ([string]$record.case -cne $expectedCases[$index])", "case", "credential launch probe case was invalid"),
+        ("if ([bool]$record.success -and $nativeError -ne 0)", "success_error_relation", "credential launch probe success record had an error"),
+        ("if (-not [bool]$record.success -and $nativeError -eq 0)", "success_error_relation", "credential launch probe failure record lacked an error"),
+        ("if ([string]$record.length_bucket -cne $expectedLengthBucket)", "length_bucket", "credential launch probe length bucket was invalid"),
+    )
+    for guard, rejection, message in guard_bindings:
+        guard_index = helper.index(guard)
+        assignment_index = helper.index(f"$Rejection.Value = '{rejection}'", guard_index)
+        throw_index = helper.index(f"throw '{message}'", guard_index)
+        assert guard_index < assignment_index < throw_index
+        assert not any(
+            assignment_index < helper.index(f"$Rejection.Value = '{other}'", guard_index)
+            < throw_index
+            for other in _CREDENTIAL_LAUNCH_PROBE_REJECTIONS[1:]
+            if other != rejection and f"$Rejection.Value = '{other}'" in helper[guard_index:throw_index]
+        )
+    json_catch = helper[helper.index("$probe = ConvertFrom-Json") : helper.index("$probeProperties", helper.index("$probe = ConvertFrom-Json"))]
+    assert "$Rejection.Value = 'json'" in json_catch
+    assert "throw" in json_catch
+    assert "-Rejection ([ref]$nativeProbeRejection)" not in helper
+
+
+def test_credential_launch_probe_rejection_contract_is_exact_and_mutation_aware() -> None:
+    module = read_module("Security.psm1")
+    _assert_credential_launch_probe_rejection_contract(module)
+    helper_start = module.index("function ConvertTo-CredentialLaunchProbeEvidence")
+    helper_end = module.index("if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type]))", helper_start)
+    helper = module[helper_start:helper_end]
+    for rejection, assignment in (
+        ("size", "$Rejection.Value = 'record_count'"),
+        ("json", "$Rejection.Value = 'stage'"),
+        ("envelope_schema", "$Rejection.Value = 'record_schema'"),
+        ("stage", "$Rejection.Value = 'field_type'"),
+        ("record_count", "$Rejection.Value = 'native_error_range'"),
+        ("record_schema", "$Rejection.Value = 'case'"),
+        ("field_type", "$Rejection.Value = 'success_error_relation'"),
+        ("native_error_range", "$Rejection.Value = 'length_bucket'"),
+        ("case", "$Rejection.Value = 'normalization'"),
+        ("success_error_relation", "$Rejection.Value = 'size'"),
+        ("length_bucket", "$Rejection.Value = 'json'"),
+        ("normalization", "$Rejection.Value = 'none'"),
+    ):
+        mutation = helper.replace(
+            f"$Rejection.Value = '{rejection}'",
+            assignment,
+            1,
+        )
+        mutated_module = module[:helper_start] + mutation + module[helper_end:]
+        try:
+            _assert_credential_launch_probe_rejection_contract(mutated_module)
+        except AssertionError:
+            continue
+        raise AssertionError(f"native probe rejection mutation was accepted: {rejection}")
+
+
+def test_credential_launch_probe_rejection_fixtures_are_exact() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for native probe rejection fixtures"
+    module = ROOT / "Security.psm1"
+    fixture = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $env:SPOTTER_SECURITY_MODULE -Force
+$securityModule = Get-Module Security
+$baseRecords = @(
+    [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; length_bucket = 'short' },
+    [ordered]@{ case = 'long_null_application'; success = $false; native_error = 1; length_bucket = 'over_1024' },
+    [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; length_bucket = 'short' }
+)
+function Parse-Fixture([string]$json) {
+    $stage = 'not_started'
+    $rejection = 'none'
+    $evidence = & $securityModule {
+        param($inputJson, $outputStage, $outputRejection)
+        ConvertTo-CredentialLaunchProbeEvidence -ProbeJson $inputJson -Stage $outputStage -Rejection $outputRejection
+    } $json ([ref]$stage) ([ref]$rejection)
+    [pscustomobject]@{ evidence = $evidence; stage = $stage; rejection = $rejection }
+}
+$fixtures = @(
+    @{ name = 'valid'; expected = 'none' },
+    @{ name = 'size'; expected = 'size' },
+    @{ name = 'json'; expected = 'json' },
+    @{ name = 'envelope_schema'; expected = 'envelope_schema' },
+    @{ name = 'stage'; expected = 'stage' },
+    @{ name = 'record_count'; expected = 'record_count' },
+    @{ name = 'record_schema'; expected = 'record_schema' },
+    @{ name = 'field_type'; expected = 'field_type' },
+    @{ name = 'native_error_range'; expected = 'native_error_range' },
+    @{ name = 'case'; expected = 'case' },
+    @{ name = 'success_error_relation'; expected = 'success_error_relation' },
+    @{ name = 'length_bucket'; expected = 'length_bucket' }
+)
+foreach ($fixture in $fixtures) {
+    $records = @(
+        [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; length_bucket = 'short' },
+        [ordered]@{ case = 'long_null_application'; success = $false; native_error = 1; length_bucket = 'over_1024' },
+        [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; length_bucket = 'short' }
+    )
+    switch ($fixture.name) {
+        'valid' { $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'size' { $json = 'x' * 4097 }
+        'json' { $json = '{malformed' }
+        'envelope_schema' { $json = '{"stage":"complete","records":[],"extra":0}' }
+        'stage' { $json = [pscustomobject]@{ stage = 'invalid'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'record_count' { $json = [pscustomobject]@{ stage = 'complete'; records = @($records[0], $records[1]) } | ConvertTo-Json -Compress -Depth 3 }
+        'record_schema' { [void]$records[1].Remove('length_bucket'); $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'field_type' { $records[1].success = 'false'; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'native_error_range' { $records[1].native_error = -1; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'case' { $records[1].case = 'wrong_case'; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'success_error_relation' { $records[1].success = $true; $records[1].native_error = 258; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'length_bucket' { $records[1].length_bucket = 'short'; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+    }
+    $result = Parse-Fixture $json
+    if ($fixture.expected -eq 'none') {
+        if ($result.rejection -ne 'none' -or $result.stage -ne 'complete' -or $result.evidence.Count -ne 3) {
+            throw "valid probe fixture changed evidence: $($fixture.name)"
+        }
+        continue
+    }
+    if ($result.rejection -ne $fixture.expected -or $result.stage -ne 'parse' -or $result.evidence -ne 'probe_unavailable') {
+        throw "native probe rejection fixture was misclassified: $($fixture.name) ($($result.rejection), $($result.stage))"
+    }
+}
+Write-Output 'native probe rejection fixtures accepted'
+'''
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", fixture],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"SPOTTER_SECURITY_MODULE": str(module.resolve())},
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "native probe rejection fixtures accepted" in result.stdout
+
+
+def test_credential_launch_probe_evidence_parser_handles_unclassified_exception() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for normalization fallback fixtures"
+    module = ROOT / "Security.psm1"
+    fixture = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $env:SPOTTER_SECURITY_MODULE -Force
+$securityModule = Get-Module Security
+$stage = 'not_started'
+$rejection = 'none'
+$evidence = & $securityModule {
+    param($inputJson, $outputStage, $outputRejection)
+    function Sort-Object {
+        throw [InvalidOperationException]::new('fixture normalization failure')
+    }
+    ConvertTo-CredentialLaunchProbeEvidence -ProbeJson $inputJson -Stage $outputStage -Rejection $outputRejection
+} '{"stage":"complete","records":[]}' ([ref]$stage) ([ref]$rejection)
+if ($evidence -ne 'probe_unavailable' -or $stage -ne 'parse' -or $rejection -ne 'normalization') {
+    throw "normalization fallback was misclassified: evidence=$evidence, stage=$stage, rejection=$rejection"
+}
+Write-Output 'normalization fallback fixture accepted'
+'''
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", fixture],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"SPOTTER_SECURITY_MODULE": str(module.resolve())},
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "normalization fallback fixture accepted" in result.stdout
+
+
+def test_credential_launch_probe_evidence_parser_rejects_fallback_rejection_mutation() -> None:
+    module = read_module("Security.psm1")
+    helper_start = module.index("function ConvertTo-CredentialLaunchProbeEvidence")
+    helper_end = module.index("if (-not ('SnipeSpotter.CredentialLaunchNative' -as [type]))", helper_start)
+    helper = module[helper_start:helper_end]
+    mutation = helper.replace(
+        "$Rejection.Value = 'normalization'",
+        "$Rejection.Value = 'none'",
+        1,
+    )
+    mutated_module = module[:helper_start] + mutation + module[helper_end:]
+    try:
+        _assert_credential_launch_probe_rejection_contract(mutated_module)
+    except AssertionError:
+        return
+    raise AssertionError("normalization fallback rejection mutation was accepted")
 
 
 def test_credential_launch_probe_evidence_parser_enforces_int32_native_error_range() -> None:
@@ -1320,12 +1591,12 @@ $configuration = & $securityModule {
     param($info)
     Get-CredentialLaunchDiagnostic -LaunchStage 'configuration' -FailureKind 'configuration' -FailedField 'file_name' -StartInfo $info -ArgumentCount 0 -ErrorRecord ([Exception]::new()) -NativeProbeStage 'not_started'
 } $startInfo | ConvertFrom-Json
-if ($configuration.PSObject.Properties.Name -contains 'native_probe' -or $configuration.PSObject.Properties.Name -contains 'native_probe_stage') { throw 'configuration schema changed' }
+if ($configuration.PSObject.Properties.Name -contains 'native_probe' -or $configuration.PSObject.Properties.Name -contains 'native_probe_stage' -or $configuration.PSObject.Properties.Name -contains 'native_probe_rejection') { throw 'configuration schema changed' }
 $native = & $securityModule {
     param($info)
-    Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField 'process_start' -StartInfo $info -ArgumentCount 0 -ErrorRecord ([Exception]::new()) -NativeProbe 'probe_unavailable' -NativeProbeStage 'wait'
+    Get-CredentialLaunchDiagnostic -LaunchStage 'native_start' -FailureKind 'native' -FailedField 'process_start' -StartInfo $info -ArgumentCount 0 -ErrorRecord ([Exception]::new()) -NativeProbe 'probe_unavailable' -NativeProbeStage 'parse' -NativeProbeRejection 'json'
 } $startInfo | ConvertFrom-Json
-if ($native.native_probe -ne 'probe_unavailable' -or $native.native_probe_stage -ne 'wait') { throw 'native stage schema missing' }
+if ($native.native_probe -ne 'probe_unavailable' -or $native.native_probe_stage -ne 'parse' -or $native.native_probe_rejection -ne 'json') { throw 'native stage schema missing' }
 Write-Output 'diagnostic stage schema fixtures accepted'
 '''
     result = subprocess.run(
@@ -2089,7 +2360,12 @@ def main() -> None:
     test_credentialed_native_start_error_mutations_are_rejected()
     test_credentialed_native_start_capture_preserves_probe_and_original_error()
     test_credentialed_native_start_capture_mutations_are_rejected()
+    test_credentialed_native_start_capture_preserves_rejection_discriminator()
     test_credential_launch_probe_evidence_parser_is_exact_and_bounded()
+    test_credential_launch_probe_rejection_contract_is_exact_and_mutation_aware()
+    test_credential_launch_probe_rejection_fixtures_are_exact()
+    test_credential_launch_probe_evidence_parser_handles_unclassified_exception()
+    test_credential_launch_probe_evidence_parser_rejects_fallback_rejection_mutation()
     test_credential_launch_probe_rejects_malformed_complete_records_before_publishing_stage()
     test_credential_launch_probe_evidence_parser_stage_publication_is_mutation_aware()
     test_credential_launch_probe_stage_fixtures_are_exact()
