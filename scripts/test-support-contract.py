@@ -60,6 +60,7 @@ _CREDENTIAL_LAUNCH_PROBE_REJECTIONS = (
     "record_schema",
     "field_type",
     "native_error_range",
+    "wait_outcome",
     "case",
     "success_error_relation",
     "length_bucket",
@@ -82,7 +83,17 @@ _CREDENTIAL_LAUNCH_PROBE_FIELDS = (
     "case",
     "success",
     "native_error",
+    "wait_outcome",
     "length_bucket",
+)
+_CREDENTIAL_LAUNCH_PROBE_WAIT_OUTCOMES = (
+    "none",
+    "timeout",
+    "wait_failed",
+    "unexpected",
+    "termination_timeout",
+    "termination_wait_failed",
+    "termination_unexpected",
 )
 _CREDENTIAL_LAUNCH_PROBE_CASES = (
     "short_null_application",
@@ -1062,13 +1073,19 @@ def _assert_credential_launch_probe_evidence_parser_contract(source: str) -> Non
     assert "$envelopeStage = [string]$probe.stage" in helper
     assert "$Stage.Value = $envelopeStage" in helper
     assert "$records = @($probe.records)" in helper
-    for field in ("case", "success", "native_error", "length_bucket"):
+    for field in ("case", "success", "native_error", "wait_outcome", "length_bucket"):
         assert re.search(rf"(?m)^\s+{field}\s*=", helper)
     assert "-isnot [string]" in helper
     assert "-isnot [bool]" in helper
     assert "-isnot [long]" in helper
     assert "$nativeError = [int64]$record.native_error" in helper
-    assert "if ($nativeError -lt 0 -or $nativeError -gt [int]::MaxValue)" in helper
+    assert "if ($nativeError -lt [int]::MinValue -or $nativeError -gt [int]::MaxValue)" in helper
+    assert "$waitOutcome -cnotin $allowedWaitOutcomes" in helper
+    allowed_wait_outcomes_match = re.search(
+        r"\$allowedWaitOutcomes = @\((.*?)\n\s*\)", helper, re.DOTALL
+    )
+    assert allowed_wait_outcomes_match is not None
+    assert tuple(re.findall(r"'([^']+)'", allowed_wait_outcomes_match.group(1))) == _CREDENTIAL_LAUNCH_PROBE_WAIT_OUTCOMES
     assert "short_null_application" in helper
     assert "long_null_application" in helper
     assert "short_explicit_application" in helper
@@ -1097,7 +1114,7 @@ def _assert_credential_launch_probe_rejection_contract(source: str) -> None:
     }
     assert rejection_assignment_counts == {
         **{rejection: 1 for rejection in _CREDENTIAL_LAUNCH_PROBE_REJECTIONS[1:] if rejection not in ("field_type", "success_error_relation")},
-        "field_type": 2,
+        "field_type": 3,
         "success_error_relation": 2,
     }
     assert "if ($null -ne $Rejection -and $Rejection.Value -eq 'none')" in helper
@@ -1107,13 +1124,15 @@ def _assert_credential_launch_probe_rejection_contract(source: str) -> None:
         ("if (($probeProperties -join ',') -cne 'records,stage')", "envelope_schema", "credential launch probe envelope schema was invalid"),
         ("if ($probe.stage -isnot [string] -or $probe.stage -cnotin $allowedStages)", "stage", "credential launch probe stage was invalid"),
         ("if ($records.Count -ne $expectedCases.Count)", "record_count", "credential launch probe record count was invalid"),
-        ("if (($recordProperties -join ',') -cne 'case,length_bucket,native_error,success')", "record_schema", "credential launch probe record schema was invalid"),
+        ("if (($recordProperties -join ',') -cne 'case,length_bucket,native_error,success,wait_outcome')", "record_schema", "credential launch probe record schema was invalid"),
         ("if ($record.case -isnot [string] -or $record.length_bucket -isnot [string])", "field_type", "credential launch probe string fields were invalid"),
         ("if ($record.success -isnot [bool] -or $record.native_error -isnot [long])", "field_type", "credential launch probe numeric fields were invalid"),
-        ("if ($nativeError -lt 0 -or $nativeError -gt [int]::MaxValue)", "native_error_range", "credential launch probe native error was outside the Int32 range"),
+        ("if ($record.wait_outcome -isnot [string])", "field_type", "credential launch probe wait outcome field was invalid"),
+        ("if ($nativeError -lt [int]::MinValue -or $nativeError -gt [int]::MaxValue)", "native_error_range", "credential launch probe native error was outside the Int32 range"),
+        ("if ($waitOutcome -cnotin $allowedWaitOutcomes)", "wait_outcome", "credential launch probe wait outcome was invalid"),
         ("if ([string]$record.case -cne $expectedCases[$index])", "case", "credential launch probe case was invalid"),
-        ("if ([bool]$record.success -and $nativeError -ne 0)", "success_error_relation", "credential launch probe success record had an error"),
-        ("if (-not [bool]$record.success -and $nativeError -eq 0)", "success_error_relation", "credential launch probe failure record lacked an error"),
+        ("if (-not [bool]$record.success -and ($waitOutcome -ne 'none' -or $nativeError -eq 0))", "success_error_relation", "credential launch probe failure record had an invalid outcome"),
+        ("if ([bool]$record.success -and (($waitOutcome -eq 'none' -and $nativeError -ne 0) -or ($waitAllowsZeroError -and $nativeError -ne 0) -or ($waitRequiresError -and $nativeError -eq 0) -or (-not $waitAllowsZeroError -and -not $waitRequiresError -and $waitOutcome -ne 'none'))) {", "success_error_relation", "credential launch probe success record had an invalid outcome"),
         ("if ([string]$record.length_bucket -cne $expectedLengthBucket)", "length_bucket", "credential launch probe length bucket was invalid"),
     )
     for guard, rejection, message in guard_bindings:
@@ -1145,9 +1164,10 @@ def test_credential_launch_probe_rejection_contract_is_exact_and_mutation_aware(
         ("envelope_schema", "$Rejection.Value = 'record_schema'"),
         ("stage", "$Rejection.Value = 'field_type'"),
         ("record_count", "$Rejection.Value = 'native_error_range'"),
-        ("record_schema", "$Rejection.Value = 'case'"),
-        ("field_type", "$Rejection.Value = 'success_error_relation'"),
-        ("native_error_range", "$Rejection.Value = 'length_bucket'"),
+        ("record_schema", "$Rejection.Value = 'field_type'"),
+        ("field_type", "$Rejection.Value = 'wait_outcome'"),
+        ("native_error_range", "$Rejection.Value = 'wait_outcome'"),
+        ("wait_outcome", "$Rejection.Value = 'case'"),
         ("case", "$Rejection.Value = 'normalization'"),
         ("success_error_relation", "$Rejection.Value = 'size'"),
         ("length_bucket", "$Rejection.Value = 'json'"),
@@ -1176,9 +1196,9 @@ Set-StrictMode -Version Latest
 Import-Module $env:SPOTTER_SECURITY_MODULE -Force
 $securityModule = Get-Module Security
 $baseRecords = @(
-    [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; length_bucket = 'short' },
-    [ordered]@{ case = 'long_null_application'; success = $false; native_error = 1; length_bucket = 'over_1024' },
-    [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; length_bucket = 'short' }
+    [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'short' },
+    [ordered]@{ case = 'long_null_application'; success = $false; native_error = 1; wait_outcome = 'none'; length_bucket = 'over_1024' },
+    [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'short' }
 )
 function Parse-Fixture([string]$json) {
     $stage = 'not_started'
@@ -1199,15 +1219,16 @@ $fixtures = @(
     @{ name = 'record_schema'; expected = 'record_schema' },
     @{ name = 'field_type'; expected = 'field_type' },
     @{ name = 'native_error_range'; expected = 'native_error_range' },
+    @{ name = 'wait_outcome'; expected = 'wait_outcome' },
     @{ name = 'case'; expected = 'case' },
     @{ name = 'success_error_relation'; expected = 'success_error_relation' },
     @{ name = 'length_bucket'; expected = 'length_bucket' }
 )
 foreach ($fixture in $fixtures) {
     $records = @(
-        [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; length_bucket = 'short' },
-        [ordered]@{ case = 'long_null_application'; success = $false; native_error = 1; length_bucket = 'over_1024' },
-        [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; length_bucket = 'short' }
+        [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'short' },
+        [ordered]@{ case = 'long_null_application'; success = $false; native_error = 1; wait_outcome = 'none'; length_bucket = 'over_1024' },
+        [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'short' }
     )
     switch ($fixture.name) {
         'valid' { $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
@@ -1218,7 +1239,8 @@ foreach ($fixture in $fixtures) {
         'record_count' { $json = [pscustomobject]@{ stage = 'complete'; records = @($records[0], $records[1]) } | ConvertTo-Json -Compress -Depth 3 }
         'record_schema' { [void]$records[1].Remove('length_bucket'); $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
         'field_type' { $records[1].success = 'false'; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
-        'native_error_range' { $records[1].native_error = -1; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'native_error_range' { $records[1].native_error = [int64]([int]::MaxValue + 1L); $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
+        'wait_outcome' { $records[1].wait_outcome = 'raw_wait_status'; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
         'case' { $records[1].case = 'wrong_case'; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
         'success_error_relation' { $records[1].success = $true; $records[1].native_error = 258; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
         'length_bucket' { $records[1].length_bucket = 'short'; $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3 }
@@ -1313,30 +1335,35 @@ $records = @(
         case = 'short_null_application'
         success = $true
         native_error = 0
+        wait_outcome = 'none'
         length_bucket = 'short'
     },
     [ordered]@{
         case = 'long_null_application'
         success = $false
         native_error = 1
+        wait_outcome = 'none'
         length_bucket = 'over_1024'
     },
     [ordered]@{
         case = 'short_explicit_application'
         success = $true
         native_error = 0
+        wait_outcome = 'none'
         length_bucket = 'short'
     }
 )
 foreach ($fixture in @(
-    @{ name = 'negative'; native_error = -1; success = $false; expected = 'probe_unavailable' },
-    @{ name = 'zero'; native_error = 0; success = $true; expected = $null },
-    @{ name = 'positive'; native_error = 1; success = $false; expected = $null },
-    @{ name = 'int32_max'; native_error = [int]::MaxValue; success = $false; expected = $null },
-    @{ name = 'oversized'; native_error = [int64]([int]::MaxValue + 1L); success = $false; expected = 'probe_unavailable' }
+    @{ name = 'negative'; native_error = -1; success = $false; wait_outcome = 'none'; expected = $null },
+    @{ name = 'int32_min'; native_error = [int]::MinValue; success = $false; wait_outcome = 'none'; expected = $null },
+    @{ name = 'zero'; native_error = 0; success = $true; wait_outcome = 'none'; expected = $null },
+    @{ name = 'positive'; native_error = 1; success = $false; wait_outcome = 'none'; expected = $null },
+    @{ name = 'int32_max'; native_error = [int]::MaxValue; success = $false; wait_outcome = 'none'; expected = $null },
+    @{ name = 'oversized'; native_error = [int64]([int]::MaxValue + 1L); success = $false; wait_outcome = 'none'; expected = 'probe_unavailable' }
 )) {
     $records[1].native_error = $fixture.native_error
     $records[1].success = $fixture.success
+    $records[1].wait_outcome = $fixture.wait_outcome
     $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3
     $result = & $securityModule {
         param($probeJson)
@@ -1359,6 +1386,9 @@ foreach ($fixture in @(
     if ([int64]$result.evidence[1].native_error -ne [int64]$fixture.native_error) {
         throw "valid native error fixture changed native error: $($fixture.name)"
     }
+    if ([string]$result.evidence[1].wait_outcome -cne [string]$fixture.wait_outcome) {
+        throw "valid native error fixture changed wait outcome: $($fixture.name)"
+    }
 }
 Write-Output 'native error range fixtures accepted'
 '''
@@ -1373,6 +1403,97 @@ Write-Output 'native error range fixtures accepted'
     assert "native error range fixtures accepted" in result.stdout
 
 
+def test_credential_launch_probe_record_semantics_are_exact() -> None:
+    pwsh = shutil.which("pwsh")
+    assert pwsh, "pwsh is required for native probe record semantic fixtures"
+    module = ROOT / "Security.psm1"
+    fixture = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $env:SPOTTER_SECURITY_MODULE -Force
+$securityModule = Get-Module Security
+function New-Record([bool]$success, [long]$nativeError, [string]$waitOutcome) {
+    [ordered]@{
+        case = 'short_null_application'
+        success = $true
+        native_error = 0
+        wait_outcome = 'none'
+        length_bucket = 'short'
+    }, [ordered]@{
+        case = 'long_null_application'
+        success = $success
+        native_error = $nativeError
+        wait_outcome = $waitOutcome
+        length_bucket = 'over_1024'
+    }, [ordered]@{
+        case = 'short_explicit_application'
+        success = $true
+        native_error = 0
+        wait_outcome = 'none'
+        length_bucket = 'short'
+    }
+}
+function Parse-Record([bool]$success, [long]$nativeError, [string]$waitOutcome) {
+    $json = [pscustomobject]@{ stage = 'complete'; records = @(New-Record $success $nativeError $waitOutcome) } | ConvertTo-Json -Compress -Depth 3
+    $stage = 'not_started'
+    $rejection = 'none'
+    $evidence = & $securityModule {
+        param($probeJson, $outputStage, $outputRejection)
+        ConvertTo-CredentialLaunchProbeEvidence -ProbeJson $probeJson -Stage $outputStage -Rejection $outputRejection
+    } $json ([ref]$stage) ([ref]$rejection)
+    [pscustomobject]@{ evidence = $evidence; stage = $stage; rejection = $rejection }
+}
+$valid = @(
+    @{ name = 'normal'; success = $true; native_error = 0; wait_outcome = 'none' },
+    @{ name = 'process_failure'; success = $false; native_error = -5; wait_outcome = 'none' },
+    @{ name = 'timeout'; success = $true; native_error = 0; wait_outcome = 'timeout' },
+    @{ name = 'unexpected'; success = $true; native_error = 0; wait_outcome = 'unexpected' },
+    @{ name = 'wait_failed'; success = $true; native_error = -5; wait_outcome = 'wait_failed' },
+    @{ name = 'termination_timeout'; success = $true; native_error = 0; wait_outcome = 'termination_timeout' },
+    @{ name = 'termination_wait_failed'; success = $true; native_error = -5; wait_outcome = 'termination_wait_failed' },
+    @{ name = 'termination_unexpected'; success = $true; native_error = 0; wait_outcome = 'termination_unexpected' }
+)
+foreach ($fixture in $valid) {
+    $result = Parse-Record $fixture.success $fixture.native_error $fixture.wait_outcome
+    if ($result.stage -ne 'complete' -or $result.rejection -ne 'none' -or $result.evidence.Count -ne 3) {
+        throw "valid semantic fixture was rejected: $($fixture.name) ($($result.stage), $($result.rejection))"
+    }
+    $record = $result.evidence[1]
+    if ([bool]$record.success -ne [bool]$fixture.success -or [int]$record.native_error -ne [int]$fixture.native_error -or [string]$record.wait_outcome -cne $fixture.wait_outcome) {
+        throw "valid semantic fixture changed: $($fixture.name)"
+    }
+    if ($record.native_error.GetType().FullName -ne 'System.Int32') {
+        throw "native error was not normalized to Int32: $($fixture.name)"
+    }
+}
+$invalid = @(
+    @{ name = 'failed_without_error'; success = $false; native_error = 0; wait_outcome = 'none' },
+    @{ name = 'failed_with_wait_outcome'; success = $false; native_error = -5; wait_outcome = 'timeout' },
+    @{ name = 'normal_with_error'; success = $true; native_error = 5; wait_outcome = 'none' },
+    @{ name = 'wait_failed_without_error'; success = $true; native_error = 0; wait_outcome = 'wait_failed' },
+    @{ name = 'termination_wait_failed_without_error'; success = $true; native_error = 0; wait_outcome = 'termination_wait_failed' },
+    @{ name = 'timeout_with_error'; success = $true; native_error = -5; wait_outcome = 'timeout' },
+    @{ name = 'unexpected_with_error'; success = $true; native_error = 5; wait_outcome = 'unexpected' }
+)
+foreach ($fixture in $invalid) {
+    $result = Parse-Record $fixture.success $fixture.native_error $fixture.wait_outcome
+    if ($result.stage -ne 'parse' -or $result.rejection -ne 'success_error_relation' -or $result.evidence -ne 'probe_unavailable') {
+        throw "invalid semantic fixture was accepted or misclassified: $($fixture.name) ($($result.stage), $($result.rejection))"
+    }
+}
+Write-Output 'native probe record semantic fixtures accepted'
+'''
+    result = subprocess.run(
+        [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", fixture],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=os.environ | {"SPOTTER_SECURITY_MODULE": str(module.resolve())},
+    )
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "native probe record semantic fixtures accepted" in result.stdout
+
+
 def test_credential_launch_probe_stage_fixtures_are_exact() -> None:
     pwsh = shutil.which("pwsh")
     assert pwsh, "pwsh is required for native probe stage fixtures"
@@ -1383,9 +1504,9 @@ Set-StrictMode -Version Latest
 Import-Module $env:SPOTTER_SECURITY_MODULE -Force
 $securityModule = Get-Module Security
 $records = @(
-    [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; length_bucket = 'short' },
-    [ordered]@{ case = 'long_null_application'; success = $true; native_error = 0; length_bucket = 'over_1024' },
-    [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; length_bucket = 'short' }
+    [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'short' },
+    [ordered]@{ case = 'long_null_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'over_1024' },
+    [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'short' }
 )
 function Parse-Fixture([string]$json) {
     $stage = 'not_started'
@@ -1425,18 +1546,23 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Import-Module $env:SPOTTER_SECURITY_MODULE -Force
 $securityModule = Get-Module Security
-$fixtures = @('missing_field', 'semantic_mismatch')
+$fixtures = @('missing_field', 'semantic_mismatch', 'invalid_wait_outcome', 'invalid_timeout_error')
 foreach ($fixture in $fixtures) {
     $records = @(
-        [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; length_bucket = 'short' },
-        [ordered]@{ case = 'long_null_application'; success = $true; native_error = 0; length_bucket = 'over_1024' },
-        [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; length_bucket = 'short' }
+        [ordered]@{ case = 'short_null_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'short' },
+        [ordered]@{ case = 'long_null_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'over_1024' },
+        [ordered]@{ case = 'short_explicit_application'; success = $true; native_error = 0; wait_outcome = 'none'; length_bucket = 'short' }
     )
     if ($fixture -eq 'missing_field') {
         [void]$records[1].Remove('length_bucket')
-    } else {
-        $records[1].success = $true
+    } elseif ($fixture -eq 'semantic_mismatch') {
         $records[1].native_error = 17
+    } elseif ($fixture -eq 'invalid_wait_outcome') {
+        $records[1].wait_outcome = 'raw_wait_status'
+    } else {
+        $records[1].success = $false
+        $records[1].native_error = 0
+        $records[1].wait_outcome = 'timeout'
     }
     $json = [pscustomobject]@{ stage = 'complete'; records = $records } | ConvertTo-Json -Compress -Depth 3
     $result = & $securityModule {
@@ -1647,7 +1773,7 @@ def test_credential_launch_probe_evidence_parser_rejects_range_bound_mutations()
     helper = module[helper_start:helper_end]
     _assert_credential_launch_probe_evidence_parser_contract(module)
     for label, mutation in (
-        ("lower", helper.replace(" -lt 0", "", 1)),
+        ("lower", helper.replace(" -lt [int]::MinValue", "", 1)),
         ("upper", helper.replace(" -gt [int]::MaxValue", "", 1)),
     ):
         mutated_module = module[:helper_start] + mutation + module[helper_end:]
@@ -1716,6 +1842,51 @@ def test_credential_launch_probe_evidence_capture_rejects_alternate_output_chann
         raise AssertionError(f"native-start probe output-channel mutation was accepted: {command}")
 
 
+def _powershell_if_chain_branches(
+    source: str, start_marker: str
+) -> tuple[tuple[str, str], ...]:
+    start = source.index(start_marker)
+    opening_brace = source.index("{", start + len(start_marker) - 1)
+    branches = []
+    block_end = _powershell_braced_block_end(source, opening_brace)
+    branches.append((start_marker.removesuffix(" {").strip(), source[opening_brace + 1 : block_end - 1]))
+    cursor = block_end
+    while True:
+        continuation = re.match(
+            r"\s*(?P<header>elseif\s*\(.*?\)|else)\s*\{",
+            source[cursor:],
+            re.DOTALL,
+        )
+        if continuation is None:
+            break
+        opening_brace = cursor + continuation.end() - 1
+        block_end = _powershell_braced_block_end(source, opening_brace)
+        branches.append(
+            (
+                continuation["header"],
+                source[opening_brace + 1 : block_end - 1],
+            )
+        )
+        cursor = block_end
+    return tuple(branches)
+
+
+def _assert_wait_branch_assignments(
+    branch_body: str, expected_outcome: str, expected_native_error: str
+) -> None:
+    assignments = tuple(
+        (name, value.strip())
+        for name, value in re.findall(
+            r"(?m)^\s*\$(waitOutcome|nativeError)\s*=\s*(.+?)\s*$",
+            branch_body,
+        )
+    )
+    assert assignments == (
+        ("waitOutcome", f"'{expected_outcome}'"),
+        ("nativeError", expected_native_error),
+    )
+
+
 def _assert_credential_launch_probe_wait_and_termination_contract(
     module: str,
 ) -> None:
@@ -1747,23 +1918,92 @@ def _assert_credential_launch_probe_wait_and_termination_contract(
         "$terminationWaitResult = "
         "[SnipeSpotter.CredentialLaunchNative]::WaitForSingleObject($processInfo.hProcess, 1000)"
     ) in probe
-    assert "$nativeError = [int]$waitResult" in probe
-    assert "$nativeError = [int]$terminationWaitResult" in probe
-    for branch in (
+    assert "$nativeError = [int]$waitResult" not in probe
+    assert "$nativeError = [int]$terminationWaitResult" not in probe
+    assert "$waitOutcome = 'timeout'" in probe
+    assert "$waitOutcome = 'wait_failed'" in probe
+    assert "$waitOutcome = 'unexpected'" in probe
+    assert "$waitOutcome = 'termination_timeout'" in probe
+    assert "$waitOutcome = 'termination_wait_failed'" in probe
+    assert "$waitOutcome = 'termination_unexpected'" in probe
+    assert "if ($nativeError -eq 0 -and $waitOutcome -eq 'none') { $nativeError = 1 }" in probe
+
+    initial_wait_branches = _powershell_if_chain_branches(
+        probe,
+        "if ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_OBJECT_0) {",
+    )
+    assert tuple(header for header, _ in initial_wait_branches) == (
+        "if ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_OBJECT_0)",
+        "elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT)",
+        "elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED)",
+        "else",
+    )
+    assert not re.search(
+        r"(?m)^\s*\$(?:waitOutcome|nativeError)\s*=", initial_wait_branches[0][1]
+    )
+    timeout_body, = (body for header, body in initial_wait_branches if "WAIT_TIMEOUT" in header)
+    timeout_assignments_end = timeout_body.index("$probeStage = 'terminate'")
+    _assert_wait_branch_assignments(
+        timeout_body[:timeout_assignments_end], "timeout", "0"
+    )
+    wait_failed_body, = (
+        body for header, body in initial_wait_branches if "WAIT_FAILED" in header
+    )
+    _assert_wait_branch_assignments(
+        wait_failed_body,
+        "wait_failed",
+        "[Runtime.InteropServices.Marshal]::GetLastWin32Error()",
+    )
+    unexpected_body = initial_wait_branches[-1][1]
+    _assert_wait_branch_assignments(unexpected_body, "unexpected", "0")
+
+    termination_call_branches = _powershell_if_chain_branches(
+        timeout_body,
         "if (-not $terminateSucceeded) {",
-        "} elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {",
-        "} elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {",
-    ):
-        branch_start = probe.index(branch)
-        branch_end = probe.index("throw ", branch_start)
-        branch_body = probe[branch_start:branch_end]
-        assert branch_body.count(
-            "$nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()"
-        ) == 1
+    )
+    assert len(termination_call_branches) == 1
+    _assert_wait_branch_assignments(
+        termination_call_branches[0][1],
+        "termination_wait_failed",
+        "[Runtime.InteropServices.Marshal]::GetLastWin32Error()",
+    )
+    termination_wait_branches = _powershell_if_chain_branches(
+        timeout_body,
+        "if ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_OBJECT_0) {",
+    )
+    assert tuple(header for header, _ in termination_wait_branches) == (
+        "if ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_OBJECT_0)",
+        "elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT)",
+        "elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED)",
+        "else",
+    )
+    assert not re.search(
+        r"(?m)^\s*\$(?:waitOutcome|nativeError)\s*=", termination_wait_branches[0][1]
+    )
+    termination_timeout_body, = (
+        body for header, body in termination_wait_branches if "WAIT_TIMEOUT" in header
+    )
+    _assert_wait_branch_assignments(
+        termination_timeout_body, "termination_timeout", "0"
+    )
+    termination_wait_failed_body, = (
+        body for header, body in termination_wait_branches if "WAIT_FAILED" in header
+    )
+    _assert_wait_branch_assignments(
+        termination_wait_failed_body,
+        "termination_wait_failed",
+        "[Runtime.InteropServices.Marshal]::GetLastWin32Error()",
+    )
+    termination_unexpected_body = termination_wait_branches[-1][1]
+    _assert_wait_branch_assignments(
+        termination_unexpected_body, "termination_unexpected", "0"
+    )
+
     assert probe.index("$waitResult =") < probe.index("WAIT_TIMEOUT")
     assert probe.index("WAIT_TIMEOUT") < probe.index("TerminateProcess")
     assert probe.index("TerminateProcess") < probe.index("$terminationWaitResult =")
     assert probe.index("$terminationWaitResult =") < probe.index("$lengthBucket =")
+    assert "$waitOutcome = 'none'" in probe
 
 
 def test_credential_launch_probe_models_bounded_wait_and_termination() -> None:
@@ -1780,6 +2020,47 @@ def test_credential_launch_probe_wait_and_termination_mutations_are_rejected() -
         module.replace(
             "hProcess, 1000)",
             "hProcess, 0)",
+            1,
+        ),
+        module.replace(
+            "                        $waitOutcome = 'wait_failed'\n"
+            "                        $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()\n"
+            "                        throw 'credential probe child wait failed'",
+            "                        $waitOutcome = 'unexpected'\n"
+            "                        $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()\n"
+            "                        throw 'credential probe child wait failed'",
+            1,
+        ).replace(
+            "                        $waitOutcome = 'unexpected'\n"
+            "                        $nativeError = 0\n"
+            "                        throw 'credential probe child returned an unexpected wait status'",
+            "                        $waitOutcome = 'wait_failed'\n"
+            "                        $nativeError = 0\n"
+            "                        throw 'credential probe child returned an unexpected wait status'",
+            1,
+        ),
+        module.replace(
+            "                        $waitOutcome = 'unexpected'\n"
+            "                        $nativeError = 0\n",
+            "                        $nativeError = 0\n",
+            1,
+        ),
+        module.replace(
+            "                            $waitOutcome = 'termination_wait_failed'\n"
+            "                            $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()\n"
+            "                            throw 'credential probe child termination failed'",
+            "                            $waitOutcome = 'timeout'\n"
+            "                            $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()\n"
+            "                            throw 'credential probe child termination failed'",
+            1,
+        ),
+        module.replace(
+            "                            $waitOutcome = 'termination_wait_failed'\n"
+            "                            $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()\n"
+            "                            throw 'credential probe child termination wait failed'",
+            "                            $waitOutcome = 'timeout'\n"
+            "                            $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()\n"
+            "                            throw 'credential probe child termination wait failed'",
             1,
         ),
     )
@@ -1937,7 +2218,8 @@ def test_credential_launch_probe_has_exact_privacy_safe_schema() -> None:
     assert values == {
         "case": "$case.Case",
         "success": "$success",
-        "native_error": "$nativeError",
+        "native_error": "[int]$nativeError",
+        "wait_outcome": "$waitOutcome",
         "length_bucket": "$lengthBucket",
     }
     assert "ConvertTo-Json -Compress" in probe
@@ -2374,6 +2656,7 @@ def main() -> None:
     test_credential_launch_diagnostic_stage_schema_fixtures()
     test_credential_launch_probe_stage_fixtures_cover_pre_native_exception()
     test_credential_launch_probe_evidence_parser_enforces_int32_native_error_range()
+    test_credential_launch_probe_record_semantics_are_exact()
     test_credential_launch_probe_evidence_parser_rejects_range_bound_mutations()
     test_credential_launch_probe_evidence_parser_rejects_nested_mutations()
     test_credential_launch_probe_evidence_capture_rejects_alternate_output_channels()

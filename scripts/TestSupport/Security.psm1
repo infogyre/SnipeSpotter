@@ -120,7 +120,7 @@ function Get-CredentialLaunchDiagnostic {
         [Parameter(Mandatory = $true)][object]$ErrorRecord,
         [Parameter(Mandatory = $false)][object]$NativeProbe = 'probe_unavailable',
         [Parameter(Mandatory = $false)][ValidateSet('not_started', 'password_bstr', 'case_setup', 'pipe_create', 'handle_setup', 'process_create', 'wait', 'terminate', 'cleanup', 'serialize', 'parse', 'complete')][string]$NativeProbeStage = 'not_started',
-        [Parameter(Mandatory = $false)][ValidateSet('none', 'size', 'json', 'envelope_schema', 'stage', 'record_count', 'record_schema', 'field_type', 'native_error_range', 'case', 'success_error_relation', 'length_bucket', 'normalization')][string]$NativeProbeRejection = 'none'
+        [Parameter(Mandatory = $false)][ValidateSet('none', 'size', 'json', 'envelope_schema', 'stage', 'record_count', 'record_schema', 'field_type', 'native_error_range', 'wait_outcome', 'case', 'success_error_relation', 'length_bucket', 'normalization')][string]$NativeProbeRejection = 'none'
     )
 
     $nativeErrorCode = 0
@@ -209,6 +209,15 @@ function ConvertTo-CredentialLaunchProbeEvidence {
         'parse',
         'complete'
     )
+    $allowedWaitOutcomes = @(
+        'none',
+        'timeout',
+        'wait_failed',
+        'unexpected',
+        'termination_timeout',
+        'termination_wait_failed',
+        'termination_unexpected'
+    )
     if ($null -ne $Stage) { $Stage.Value = 'parse' }
     if ($null -ne $Rejection) { $Rejection.Value = 'none' }
     try {
@@ -247,7 +256,7 @@ function ConvertTo-CredentialLaunchProbeEvidence {
         for ($index = 0; $index -lt $expectedCases.Count; $index++) {
             $record = $records[$index]
             $recordProperties = @($record.PSObject.Properties.Name | Sort-Object)
-            if (($recordProperties -join ',') -cne 'case,length_bucket,native_error,success') {
+            if (($recordProperties -join ',') -cne 'case,length_bucket,native_error,success,wait_outcome') {
                 if ($null -ne $Rejection) { $Rejection.Value = 'record_schema' }
                 throw 'credential launch probe record schema was invalid'
             }
@@ -259,22 +268,33 @@ function ConvertTo-CredentialLaunchProbeEvidence {
                 if ($null -ne $Rejection) { $Rejection.Value = 'field_type' }
                 throw 'credential launch probe numeric fields were invalid'
             }
+            if ($record.wait_outcome -isnot [string]) {
+                if ($null -ne $Rejection) { $Rejection.Value = 'field_type' }
+                throw 'credential launch probe wait outcome field was invalid'
+            }
             $nativeError = [int64]$record.native_error
-            if ($nativeError -lt 0 -or $nativeError -gt [int]::MaxValue) {
+            if ($nativeError -lt [int]::MinValue -or $nativeError -gt [int]::MaxValue) {
                 if ($null -ne $Rejection) { $Rejection.Value = 'native_error_range' }
                 throw 'credential launch probe native error was outside the Int32 range'
+            }
+            $waitOutcome = [string]$record.wait_outcome
+            if ($waitOutcome -cnotin $allowedWaitOutcomes) {
+                if ($null -ne $Rejection) { $Rejection.Value = 'wait_outcome' }
+                throw 'credential launch probe wait outcome was invalid'
             }
             if ([string]$record.case -cne $expectedCases[$index]) {
                 if ($null -ne $Rejection) { $Rejection.Value = 'case' }
                 throw 'credential launch probe case was invalid'
             }
-            if ([bool]$record.success -and $nativeError -ne 0) {
+            $waitAllowsZeroError = $waitOutcome -in @('timeout', 'unexpected', 'termination_timeout', 'termination_unexpected')
+            $waitRequiresError = $waitOutcome -in @('wait_failed', 'termination_wait_failed')
+            if (-not [bool]$record.success -and ($waitOutcome -ne 'none' -or $nativeError -eq 0)) {
                 if ($null -ne $Rejection) { $Rejection.Value = 'success_error_relation' }
-                throw 'credential launch probe success record had an error'
+                throw 'credential launch probe failure record had an invalid outcome'
             }
-            if (-not [bool]$record.success -and $nativeError -eq 0) {
+            if ([bool]$record.success -and (($waitOutcome -eq 'none' -and $nativeError -ne 0) -or ($waitAllowsZeroError -and $nativeError -ne 0) -or ($waitRequiresError -and $nativeError -eq 0) -or (-not $waitAllowsZeroError -and -not $waitRequiresError -and $waitOutcome -ne 'none'))) {
                 if ($null -ne $Rejection) { $Rejection.Value = 'success_error_relation' }
-                throw 'credential launch probe failure record lacked an error'
+                throw 'credential launch probe success record had an invalid outcome'
             }
             $expectedLengthBucket = if ($index -eq 1) { 'over_1024' } else { 'short' }
             if ([string]$record.length_bucket -cne $expectedLengthBucket) {
@@ -285,6 +305,7 @@ function ConvertTo-CredentialLaunchProbeEvidence {
                 case = [string]$record.case
                 success = [bool]$record.success
                 native_error = [int]$nativeError
+                wait_outcome = $waitOutcome
                 length_bucket = [string]$record.length_bucket
             }
         }
@@ -442,6 +463,7 @@ function Invoke-CredentialLaunchProbe {
             $processInfo = [SnipeSpotter.CredentialLaunchNative+PROCESS_INFORMATION]::new()
             $success = $false
             $nativeError = 0
+            $waitOutcome = 'none'
             try {
                 $securityAttributes = [SnipeSpotter.CredentialLaunchNative+SECURITY_ATTRIBUTES]::new()
                 $securityAttributes.nLength = [Runtime.InteropServices.Marshal]::SizeOf($securityAttributes)
@@ -535,12 +557,14 @@ function Invoke-CredentialLaunchProbe {
                         # The credentialed probe child exited within the bounded wait.
                     } elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT) {
                         if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
-                        $nativeError = [int]$waitResult
+                        $waitOutcome = 'timeout'
+                        $nativeError = 0
                         $probeStage = 'terminate'
                         if ($null -ne $Stage) { $Stage.Value = $probeStage }
                         $terminateSucceeded = [SnipeSpotter.CredentialLaunchNative]::TerminateProcess($processInfo.hProcess, 1)
                         if (-not $terminateSucceeded) {
                             $probeFailureStage = $probeStage
+                            $waitOutcome = 'termination_wait_failed'
                             $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                             throw 'credential probe child termination failed'
                         }
@@ -551,30 +575,35 @@ function Invoke-CredentialLaunchProbe {
                             # The timed-out credentialed probe child was terminated within the bounded wait.
                         } elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_TIMEOUT) {
                             $probeFailureStage = $probeStage
-                            $nativeError = [int]$terminationWaitResult
+                            $waitOutcome = 'termination_timeout'
+                            $nativeError = 0
                             throw 'credential probe child termination did not complete within the bounded wait'
                         } elseif ($terminationWaitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {
                             $probeFailureStage = $probeStage
+                            $waitOutcome = 'termination_wait_failed'
                             $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                             throw 'credential probe child termination wait failed'
                         } else {
                             $probeFailureStage = $probeStage
-                            $nativeError = [int]$terminationWaitResult
+                            $waitOutcome = 'termination_unexpected'
+                            $nativeError = 0
                             throw 'credential probe child termination returned an unexpected wait status'
                         }
                     } elseif ($waitResult -eq [SnipeSpotter.CredentialLaunchNative]::WAIT_FAILED) {
                         if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
+                        $waitOutcome = 'wait_failed'
                         $nativeError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
                         throw 'credential probe child wait failed'
                     } else {
                         if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
-                        $nativeError = [int]$waitResult
+                        $waitOutcome = 'unexpected'
+                        $nativeError = 0
                         throw 'credential probe child returned an unexpected wait status'
                     }
                 }
             } catch {
                 if ($null -eq $probeFailureStage) { $probeFailureStage = $probeStage }
-                if ($nativeError -eq 0) { $nativeError = 1 }
+                if ($nativeError -eq 0 -and $waitOutcome -eq 'none') { $nativeError = 1 }
             } finally {
                 $probeStage = 'cleanup'
                 if ($null -ne $Stage) { $Stage.Value = $probeStage }
@@ -600,7 +629,8 @@ function Invoke-CredentialLaunchProbe {
             $records += [ordered]@{
                 case = $case.Case
                 success = $success
-                native_error = $nativeError
+                native_error = [int]$nativeError
+                wait_outcome = $waitOutcome
                 length_bucket = $lengthBucket
             }
         }
