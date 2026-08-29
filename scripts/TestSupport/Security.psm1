@@ -747,7 +747,7 @@ function Assert-StandardUserCannotReadWrite {
         [Parameter(Mandatory = $false)][ValidateRange(1, 600)][int]$TimeoutSeconds = 30
     )
 
-    if (-not (Test-Path -LiteralPath $Path)) { throw "ACL target does not exist: $Path" }
+    if (-not (Test-Path -LiteralPath $Path)) { throw 'ACL target does not exist' }
     $probe = @'
 $AccessDeniedHResult = -2147024891
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -829,15 +829,112 @@ Write-Output 'identity-class=standard-user'
 Write-Output 'access=read-write-denied'
 exit 0
 '@
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($probe))
-    $result = Invoke-AsStandardUser -User $User -FilePath (Join-Path $PSHOME 'pwsh.exe') -ArgumentList @(
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded, $Path, $PathType
-    ) -TimeoutSeconds $TimeoutSeconds
-    [void](Assert-ChildIsStandardUser -Result $result)
-    if (-not $result.Stdout.Contains('access=read-write-denied')) {
-        throw "standard-user ACL probe did not report denial: $($result.Stderr.Trim())"
+    $temporaryRoot = Join-Path $env:SystemRoot 'Temp'
+    $probeDirectory = Join-Path $temporaryRoot ('snipespotter-acl-probe-' + [Guid]::NewGuid().ToString('N'))
+    $probePath = Join-Path $probeDirectory 'probe.ps1'
+    if (Test-Path -LiteralPath $probeDirectory) { throw 'standard-user ACL probe artifact collision' }
+    try {
+        try {
+            $userSid = ([Security.Principal.NTAccount]::new("$($User.Domain)\$($User.Name)")).Translate(
+                [Security.Principal.SecurityIdentifier]
+            )
+        $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
+        $readAndExecute = [Security.AccessControl.FileSystemRights]::ReadAndExecute
+        $allow = [Security.AccessControl.AccessControlType]::Allow
+        $noInheritance = [Security.AccessControl.InheritanceFlags]::None
+        $noPropagation = [Security.AccessControl.PropagationFlags]::None
+        $directorySecurity = [Security.AccessControl.DirectorySecurity]::new()
+        $directorySecurity.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @(
+            [Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+                $fullControl,
+                $noInheritance,
+                $noPropagation,
+                $allow
+            ),
+            [Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'),
+                $fullControl,
+                $noInheritance,
+                $noPropagation,
+                $allow
+            ),
+            [Security.AccessControl.FileSystemAccessRule]::new(
+                $userSid,
+                $readAndExecute,
+                $noInheritance,
+                $noPropagation,
+                $allow
+            )
+        )) {
+            $directorySecurity.AddAccessRule($rule)
+        }
+        [IO.Directory]::CreateDirectory($probeDirectory, $directorySecurity) | Out-Null
+        $probeBytes = [Text.UTF8Encoding]::new($false).GetBytes($probe)
+        $probeStream = [IO.File]::Open($probePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $probeStream.Write($probeBytes, 0, $probeBytes.Length)
+        } finally {
+            $probeStream.Dispose()
+        }
+        $fileSecurity = [Security.AccessControl.FileSecurity]::new()
+        $fileSecurity.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @(
+            [Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+                $fullControl,
+                $noInheritance,
+                $noPropagation,
+                $allow
+            ),
+            [Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'),
+                $fullControl,
+                $noInheritance,
+                $noPropagation,
+                $allow
+            ),
+            [Security.AccessControl.FileSystemAccessRule]::new(
+                $userSid,
+                $readAndExecute,
+                $noInheritance,
+                $noPropagation,
+                $allow
+            )
+        )) {
+            $fileSecurity.AddAccessRule($rule)
+        }
+        [IO.File]::SetAccessControl($probePath, $fileSecurity)
+        $commandExecutable = Join-Path $PSHOME 'pwsh.exe'
+        $commandArguments = @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $probePath, $Path, $PathType
+        )
+        $commandLine = ('"' + $commandExecutable + '" ' + (($commandArguments | ForEach-Object {
+            '"' + $_ + '"'
+        }) -join ' '))
+        if ($commandLine.Length -ge 1024) { throw 'standard-user ACL probe command line exceeded the native limit' }
+        } catch {
+            if ($_.Exception.Message -eq 'standard-user ACL probe command line exceeded the native limit') {
+                throw
+            }
+            throw 'standard-user ACL probe setup failed'
+        }
+        $result = Invoke-AsStandardUser -User $User -FilePath $commandExecutable -ArgumentList $commandArguments -TimeoutSeconds $TimeoutSeconds
+        [void](Assert-ChildIsStandardUser -Result $result)
+        if (-not $result.Stdout.Contains('access=read-write-denied')) {
+            throw 'standard-user ACL probe did not report denial'
+        }
+        return $result
+    } finally {
+        try {
+            if (Test-Path -LiteralPath $probeDirectory -PathType Container) {
+                Remove-Item -LiteralPath $probeDirectory -Recurse -Force -ErrorAction Stop
+            }
+        } catch {
+            throw 'standard-user ACL probe cleanup failed'
+        }
     }
-    return $result
 }
 
 Export-ModuleMember -Function New-TemporaryStandardUser, Remove-TemporaryStandardUser, Get-TokenProof, Assert-StandardUserToken, Invoke-AsStandardUser, Assert-ChildIsStandardUser, Assert-StandardUserCannotReadWrite

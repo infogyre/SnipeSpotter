@@ -1,5 +1,6 @@
 """Static contract checks for Windows lifecycle test-support modules."""
 
+import base64
 import os
 import re
 import shutil
@@ -670,6 +671,115 @@ def test_elevated_result_requires_msi_and_direct_scm_success_in_both_modes() -> 
     assert download_start < source_start < validate_start < direct_start < result_start
     assert "steps.validate.outcome" in result
     assert "steps.direct_scm.outcome" in result
+
+
+def _assert_standard_user_acl_probe_transport_contract(module: str) -> None:
+    helper = module[module.index("function Assert-StandardUserCannotReadWrite") :]
+    assert "-EncodedCommand" not in helper
+    for required in (
+        "[Guid]::NewGuid().ToString('N')",
+        "$temporaryRoot = Join-Path $env:SystemRoot 'Temp'",
+        "artifact collision",
+        "CreateNew",
+        "FileShare]::None",
+        "DirectorySecurity",
+        "[Security.AccessControl.FileSecurity]::new()",
+        "InheritanceFlags]::None",
+        "SetAccessRuleProtection($true, $false)",
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "SecurityIdentifier",
+        "ReadAndExecute",
+        "SetAccessControl",
+        "GetBytes($probe)",
+        "-File",
+        "$Path",
+        "$PathType",
+        "commandLine.Length",
+        "-ge 1024",
+        "finally",
+        "Remove-Item -LiteralPath $probeDirectory -Recurse -Force -ErrorAction Stop",
+        "throw 'standard-user ACL probe cleanup failed'",
+    ):
+        assert required in helper, f"standard-user ACL probe is missing {required!r}"
+    assert "ConvertTo-SecureString" not in helper
+    assert "ProgramData" not in helper
+    assert "$inheritChildren" not in helper
+    assert "throw \"standard-user ACL probe" not in helper
+    assert "throw \"ACL target does not exist" not in helper
+    assert "throw \"standard-user executable" not in helper
+    assert helper.count("$userSid,") == 2
+    assert helper.count("$userSid,\n                $readAndExecute,") == 2
+    assert helper.count("$userSid,\n                $fullControl") == 0
+    assert helper.count("$commandArguments = @(\n            '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $probePath, $Path, $PathType\n        )") == 1
+    assert helper.count("SetAccessRuleProtection($true, $false)") == 2
+    protection_calls = [match.start() for match in re.finditer("SetAccessRuleProtection\\(\\$true, \\$false\\)", helper)]
+    assert protection_calls[0] > helper.index("DirectorySecurity")
+    assert protection_calls[0] < helper.index("FileSecurity")
+    assert protection_calls[1] > helper.index("FileSecurity")
+    cleanup_start = helper.rindex("    } finally {")
+    setup_start = helper.index("    try {", helper.index("$probePath"))
+    launch_start = helper.index("$result = Invoke-AsStandardUser")
+    assert helper.index("$probeDirectory") < launch_start
+    assert launch_start < cleanup_start
+    assert helper.index("$Path, $PathType") < launch_start
+    assert "$temporaryRoot = Join-Path $env:SystemRoot 'Temp'" in helper
+    assert "$probeDirectory = Join-Path $temporaryRoot" in helper
+    assert helper.index("[Guid]::NewGuid().ToString('N')") < helper.index("$probeDirectory = Join-Path $temporaryRoot")
+    assert helper.index("$probePath = Join-Path $probeDirectory") < helper.index("CreateNew")
+    assert helper.index("CreateNew") < helper.index("SetAccessControl")
+    assert helper.index("SetAccessControl") < launch_start
+    assert helper.index("throw 'standard-user ACL probe setup failed'") > setup_start
+    assert helper.index("throw 'standard-user ACL probe setup failed'") < launch_start
+    assert helper.index("Remove-Item -LiteralPath $probeDirectory") > cleanup_start
+
+
+def test_standard_user_acl_probe_uses_bounded_secure_script_transport() -> None:
+    _assert_standard_user_acl_probe_transport_contract(read_module("Security.psm1"))
+
+
+def test_standard_user_acl_probe_regresses_the_oversized_encoded_transport() -> None:
+    module = read_module("Security.psm1")
+    probe_start = module.index("$probe = @'") + len("$probe = @'\n")
+    probe_end = module.index("\n'@", probe_start)
+    probe = module[probe_start:probe_end]
+    encoded_length = len(base64.b64encode(probe.encode("utf-16-le")).decode("ascii"))
+    assert encoded_length > 1024
+    helper = module[module.index("function Assert-StandardUserCannotReadWrite") :]
+    assert "-EncodedCommand" not in helper
+    command_section = helper[helper.index("$commandArguments") : helper.index("$result = Invoke-AsStandardUser")]
+    assert re.search(r"(?<![A-Za-z])\$probe(?![A-Za-z])", command_section) is None
+    assert "$probePath" in command_section
+    assert "$Path" in command_section
+    assert "$PathType" in helper[helper.index("$commandArguments") : helper.index("$result = Invoke-AsStandardUser")]
+
+
+def test_standard_user_acl_probe_transport_contract_rejects_unsafe_mutations() -> None:
+    module = read_module("Security.psm1")
+    helper_start = module.index("function Assert-StandardUserCannotReadWrite")
+    helper = module[helper_start:]
+    cleanup_start = helper.rindex("    } finally {")
+    cleanup = helper[cleanup_start:]
+    mutations = (
+        ("-File", "-EncodedCommand", helper),
+        ("[Guid]::NewGuid().ToString('N')", "'fixed-probe'", helper),
+        ("SetAccessRuleProtection($true, $false)", "SetAccessRuleProtection($false, $true)", helper[: helper.index("$fileSecurity")]),
+        ("SetAccessRuleProtection($true, $false)", "SetAccessRuleProtection($false, $true)", helper[helper.index("$fileSecurity") :]),
+        ("$userSid,\n                $readAndExecute,", "$userSid,\n                $userSidRights,", helper),
+        ("-ge 1024", "-lt 1024", helper),
+        ("    } finally {", "    }", cleanup),
+        ("Remove-Item -LiteralPath $probeDirectory", "Write-Output 'cleanup'", cleanup),
+    )
+    for expected, replacement, source in mutations:
+        assert expected in source
+        mutation = source.replace(expected, replacement, 1)
+        assert replacement in mutation
+        mutated_module = module[:helper_start] + "function Assert-StandardUserCannotReadWrite" + mutation[len("function Assert-StandardUserCannotReadWrite") :]
+        try:
+            _assert_standard_user_acl_probe_transport_contract(mutated_module)
+        except AssertionError:
+            continue
+        raise AssertionError(f"standard-user ACL probe transport mutation was accepted: {expected}")
 
 
 def test_security_module_proves_standard_user_token_and_access_denials() -> None:
@@ -2631,6 +2741,9 @@ def main() -> None:
     test_direct_scm_acl_assertion_uses_exact_normalized_contract()
     test_acl_contract_callers_pass_declared_path_kinds_everywhere()
     test_elevated_result_requires_msi_and_direct_scm_success_in_both_modes()
+    test_standard_user_acl_probe_uses_bounded_secure_script_transport()
+    test_standard_user_acl_probe_regresses_the_oversized_encoded_transport()
+    test_standard_user_acl_probe_transport_contract_rejects_unsafe_mutations()
     test_security_module_proves_standard_user_token_and_access_denials()
     test_credentialed_process_does_not_request_ignored_window_suppression()
     test_credentialed_launch_diagnostic_schema_is_exact_and_bounded()
