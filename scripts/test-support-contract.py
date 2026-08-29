@@ -202,6 +202,17 @@ def test_direct_scm_exercises_installed_cli_to_service_sync_flow() -> None:
     assert "Start-Sleep -Seconds 5" not in source
 
 
+def test_direct_scm_waits_for_loopback_prefix_before_method_call() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    fixture_start = source.index("$fixture = Start-SnipeItLoopbackFixture")
+    readiness_wait = source.index(
+        "Wait-Condition -Description 'Snipe-IT loopback fixture readiness'",
+        fixture_start,
+    )
+    prefix_method_call = source.index("$fixture.Prefix.StartsWith(", fixture_start)
+    assert fixture_start < readiness_wait < prefix_method_call
+
+
 def _run_powershell_fixture(
     script: str,
     env: dict[str, str] | None = None,

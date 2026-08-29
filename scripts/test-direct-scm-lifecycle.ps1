@@ -920,10 +920,10 @@ try {
     } | Out-Null
 
     $fixture = Start-SnipeItLoopbackFixture -AuthorizationSentinel $tokenSentinel
-    Assert-True $fixture.Prefix.StartsWith('http://127.0.0.1:') 'loopback fixture did not bind only to 127.0.0.1'
     Wait-Condition -Description 'Snipe-IT loopback fixture readiness' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
         $fixture.State.Ready -and $fixture.Listener.IsListening
     } | Out-Null
+    Assert-True $fixture.Prefix.StartsWith('http://127.0.0.1:') 'loopback fixture did not bind only to 127.0.0.1'
 
     foreach ($update in @(
         @('snipeit.url', $fixture.Prefix.TrimEnd('/')),
