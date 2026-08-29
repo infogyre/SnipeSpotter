@@ -27,6 +27,26 @@ impl std::fmt::Display for ServiceUnavailable {
 
 impl std::error::Error for ServiceUnavailable {}
 
+const PRODUCTION_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(feature = "test-support")]
+const TEST_TRANSPORT_TIMEOUT_MIN_MS: u64 = 1;
+#[cfg(feature = "test-support")]
+const TEST_TRANSPORT_TIMEOUT_MAX_MS: u64 = 30_000;
+
+#[cfg(feature = "test-support")]
+fn parse_test_transport_timeout_ms(value: &str) -> std::result::Result<u64, String> {
+    let millis = value
+        .parse::<u64>()
+        .map_err(|_| String::from("must be an integer number of milliseconds"))?;
+    if (TEST_TRANSPORT_TIMEOUT_MIN_MS..=TEST_TRANSPORT_TIMEOUT_MAX_MS).contains(&millis) {
+        Ok(millis)
+    } else {
+        Err(format!(
+            "must be between {TEST_TRANSPORT_TIMEOUT_MIN_MS} and {TEST_TRANSPORT_TIMEOUT_MAX_MS} milliseconds"
+        ))
+    }
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "spotter-cli", version, about)]
 pub struct Cli {
@@ -44,6 +64,9 @@ pub struct Cli {
     #[cfg(feature = "test-support")]
     #[arg(long, global = true, hide = true)]
     pub test_mutex_name: Option<String>,
+    #[cfg(feature = "test-support")]
+    #[arg(long, global = true, hide = true, value_parser = parse_test_transport_timeout_ms)]
+    pub test_transport_timeout_ms: Option<u64>,
     #[cfg(feature = "test-support")]
     #[arg(long, global = true, hide = true)]
     pub test_service_executable: Option<PathBuf>,
@@ -541,11 +564,33 @@ pub fn transport_endpoint(cli: &Cli) -> Option<String> {
     cli.test_pipe_endpoint.clone()
 }
 
+#[cfg(feature = "test-support")]
+/// Return the validated transport timeout selected by test support, or the production default.
+#[must_use]
+pub fn transport_timeout(cli: &Cli) -> Duration {
+    match cli.test_transport_timeout_ms {
+        Some(milliseconds)
+            if (TEST_TRANSPORT_TIMEOUT_MIN_MS..=TEST_TRANSPORT_TIMEOUT_MAX_MS)
+                .contains(&milliseconds) =>
+        {
+            Duration::from_millis(milliseconds)
+        }
+        _ => PRODUCTION_TRANSPORT_TIMEOUT,
+    }
+}
+
 #[cfg(not(feature = "test-support"))]
 /// Return no endpoint override for the fixed production transport.
 #[must_use]
 pub const fn transport_endpoint(_cli: &Cli) -> Option<String> {
     None
+}
+
+#[cfg(not(feature = "test-support"))]
+/// Return the fixed production transport timeout.
+#[must_use]
+pub const fn transport_timeout(_cli: &Cli) -> Duration {
+    PRODUCTION_TRANSPORT_TIMEOUT
 }
 
 #[cfg(not(feature = "test-support"))]
@@ -890,6 +935,49 @@ mod tests {
             Ok(self.answer)
         }
     }
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn test_transport_timeout_override_is_positive_and_bounded() {
+        assert!(
+            Cli::try_parse_from(["spotter-cli", "--test-transport-timeout-ms", "1", "status",])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["spotter-cli", "--test-transport-timeout-ms", "0", "status",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "spotter-cli",
+                "--test-transport-timeout-ms",
+                "30001",
+                "status",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "spotter-cli",
+                "--test-transport-timeout-ms",
+                "not-a-duration",
+                "status",
+            ])
+            .is_err()
+        );
+
+        let cli = Cli::try_parse_from([
+            "spotter-cli",
+            "--test-transport-timeout-ms",
+            "200",
+            "status",
+        ])
+        .expect("bounded timeout must parse");
+        assert_eq!(transport_timeout(&cli), Duration::from_millis(200));
+        let cli =
+            Cli::try_parse_from(["spotter-cli", "status"]).expect("production timeout must parse");
+        assert_eq!(transport_timeout(&cli), PRODUCTION_TRANSPORT_TIMEOUT);
+    }
+
     #[test]
     fn parses_and_dispatches_sync() -> Result<()> {
         let cli = Cli::try_parse_from(["spotter-cli", "sync"])?;
