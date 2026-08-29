@@ -45,6 +45,7 @@ jobs:
               - 'spotter-build/**'
               - 'installer/**'
               - 'scripts/test-msi-lifecycle.ps1'
+              - 'scripts/test-direct-scm-lifecycle.ps1'
               - 'scripts/TestSupport/**'
               - 'Cargo.toml'
               - 'Cargo.lock'

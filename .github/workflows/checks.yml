@@ -158,6 +158,12 @@ jobs:
               assert required_path in caller, f'ci.yml path filter missing {required_path}'
           assert 'if: always()' in caller and 'CHECKS_RESULT:' in caller
           assert 'run_elevated:' in caller
+          for elevated_path in (
+              'scripts/test-msi-lifecycle.ps1',
+              'scripts/test-direct-scm-lifecycle.ps1',
+              'scripts/TestSupport/**',
+          ):
+              assert elevated_path in caller, f'ci.yml elevated path filter missing {elevated_path}'
           assert '  elevated:' in caller
           assert 'needs: [changes, checks, elevated, elevated_skip]' in caller
           assert 'RUN_ELEVATED:' in caller and 'ELEVATED_RESULT:' in caller
