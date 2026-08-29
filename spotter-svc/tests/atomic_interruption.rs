@@ -248,7 +248,9 @@ fn barrier_write_leaves_complete_old_or_new_content() -> Result<()> {
         let _ = terminate(child);
     }
     result?;
-    assert_old_or_new(&path, b"old-state", b"new-state")?;
+    assert_eq!(fs::read(&path)?, b"old-state");
+    let removed = recover_stale_temporary_files(directory.path(), std::process::id(), 0)?;
+    assert_eq!(removed, 1);
     Ok(())
 }
 
@@ -259,7 +261,7 @@ fn after_replace_barrier_can_be_terminated_with_complete_content() -> Result<()>
     fs::write(&path, b"old-state")?;
     let marker = directory.path().join("marker.txt");
     let child = marker_child(&path, &marker, "after-replace");
-    let result = wait_for_marker(&marker, "after-replace");
+    let result = wait_for_marker(&marker, "after-replace-complete");
     if result.is_ok() {
         terminate(child)?;
     } else {

@@ -2,11 +2,10 @@
 
 #[cfg(windows)]
 use std::{
-    env,
+    env, fs,
     path::PathBuf,
     sync::{Arc, Barrier},
     thread,
-    time::Duration,
 };
 
 #[cfg(windows)]
@@ -38,15 +37,26 @@ fn main() -> anyhow::Result<()> {
     let barrier = Arc::new(Barrier::new(2));
     let worker_barrier = Arc::clone(&barrier);
     let worker_path = path.clone();
+    let completion_marker = marker.clone();
     let worker = thread::spawn(move || {
         write_with_barriers(&worker_path, b"new-state", point, worker_barrier, marker)
     });
+    if point == BarrierPoint::BeforeReplace {
+        // Keep the writer before replacement until the parent terminates this helper.
+        loop {
+            thread::park();
+        }
+    }
     barrier.wait();
-    thread::sleep(Duration::from_secs(30));
     worker
         .join()
         .map_err(|_| anyhow::anyhow!("atomic helper writer panicked"))??;
-    Ok(())
+    fs::write(&completion_marker, "after-replace-complete")
+        .with_context(|| "atomic helper failed to write completion marker")?;
+    // Keep the completed process alive until the parent has observed the marker.
+    loop {
+        thread::park();
+    }
 }
 
 #[cfg(not(windows))]
