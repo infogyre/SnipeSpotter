@@ -39,13 +39,15 @@ Linux only builds and tests `spotter-core` (the cross-platform crate). Windows-o
 
 | Step | Command | Gate |
 |---|---|---|
-| Workspace tests | `cargo test --workspace --all-targets` | Tests |
+| Workspace tests, including `hosted_hardware` integration tests | `cargo test --workspace --all-targets` | Tests |
 | Workspace clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Lint |
 | PowerShell script lint | `Invoke-ScriptAnalyzer` on all `.ps1` and `.psm1` files | Script quality |
 
+The Windows workspace test command includes the already-required `spotter-svc/tests/hosted_hardware.rs` integration tests. They are part of the Windows check result; the separate manual hardware experiment only collects diagnostic observations and does not create another CI gate.
+
 #### Package contract (`ubuntu-latest`)
 
-Verifies the workspace has exactly 5 packages with the expected names: `spotter-core`, `spotter-win32`, `spotter-build`, `spotter-svc`, `spotter-cli`.
+Verifies the workspace has exactly six packages with these names: `spotter-core`, `spotter-win32`, `spotter-build`, `spotter-svc`, `spotter-cli`, and `spotter-hardware-service`. The last package is an experimental/test-support LocalSystem host for the manual hosted hardware workflow. It is excluded from the installer and release artifacts.
 
 #### CI success (aggregate gate)
 
@@ -76,9 +78,9 @@ All third-party GitHub Actions are pinned to full commit SHAs with version comme
    git push origin vX.Y.Z
    ```
 4. **Release workflow runs automatically**: The tag push triggers `release.yml`, which:
-   - **Verify job** (Ubuntu): Confirms the tag points to `main`, validates the tag version matches `Cargo.toml`, and runs the full test suite.
-   - **Build job** (Windows): Builds `spotter-svc.exe` and `spotter-cli.exe` with `cargo build --release --locked --target x86_64-pc-windows-msvc`, asserts exact `.exe` and underscore-named `.pdb` files exist, and uploads a closed artifact inventory.
-   - **Package job** (Windows): Installs WiX 6, verifies `wix --version`, generates CycloneDX SBOMs, builds the MSI with explicit version/platform properties, renames it deterministically, validates the MSI lifecycle (install, service registration, start/stop, ACLs, PATH, uninstall), and uploads packaged artifacts.
+   - **Verify job** (Ubuntu): Confirms the tag points to `main`, validates the tag version matches `Cargo.toml`, and verifies the locked workspace metadata. The Windows `build` job runs the workspace and production-owner integration tests.
+   - **Build job** (Windows): Runs the workspace tests, including the already-required `hosted_hardware` integration tests, then builds only `spotter-svc.exe` and `spotter-cli.exe` with `cargo build --release --locked --target x86_64-pc-windows-msvc`, asserts exact `.exe` and underscore-named `.pdb` files exist, and uploads a closed artifact inventory. The experimental `spotter-hardware-service` host is not a release binary.
+   - **Package job** (Windows): Installs WiX 6, verifies `wix --version`, generates CycloneDX SBOMs, builds the MSI with explicit version/platform properties, renames it deterministically, validates the MSI lifecycle (install, service registration, start/stop, ACLs, PATH, uninstall), and uploads packaged artifacts. The MSI does not contain or register `spotter-hardware-service`.
    - **Aggregate job** (Ubuntu): Downloads all artifacts, creates `SHA256SUMS`, generates SLSA provenance attestation, creates a draft GitHub Release, and uploads all assets (MSI, supplemental ZIP with exes + PDBs + SBOMs, checksums).
    - **Publish job**: Flips the draft release to published only after all preceding jobs pass.
 
@@ -157,6 +159,8 @@ This installs the previous MSI, adds a marker to `settings.toml`, installs the n
 
 The reusable `elevated-windows.yml` lane is invoked for relevant PR paths and by the release workflow after the MSI is built. It uses unique run identities, bounded condition-based waits, sustained service/pipe checks where available, and failure-safe cleanup. A cleanup failure is a failed lifecycle result; it is never silently accepted. The PR caller emits an explicit successful skip when no elevated path is relevant so the aggregate `ci-success` check remains deterministic.
 
+The direct SCM lane uses `SnipeSpotterDirect-$RunIdentity` for the service, named pipe, mutex, and data root. The identity is deliberately distinct from the MSI service `SnipeSpotter`, and the harness refuses to use a pre-existing test service. `service install` fails with an actionable “already installed” error when the test service exists, and fails with a marked-for-deletion error when SCM reports that state; it does not start the service. `service uninstall` fails with an actionable “not installed” error when the service is missing, waits up to 90 seconds for `Stopped` after requesting a stop, deletes the registration, then waits up to another 90 seconds for SCM disappearance. A pending stop, pending deletion, or either timeout is a failure.
+
 ### Hosted hardware experiment
 
 `hardware-experiment.yml` is protected and manually dispatched. Its `images` input drives the generated matrix; `windows-2022` and `windows-latest` are always required, while the optional `windows-2025` label is scheduled only when explicitly requested. The fixed `repetitions=3` input creates three repetitions per selected image. Each image/repetition cell runs both direct-admin and LocalSystem collection with one protected per-cell HMAC key, validates both reports before upload, records the requested image label/alias and exact runner metadata plus the numeric session ID from each process context, and removes keys and temporary reports during failure-safe cleanup. Unsupported optional images are reported in the preparation job's machine-readable `skipped_images` output. The workflow stops at `awaiting_operator_hardware_approval`; hosted observations are evidence only and do not implement release promotion or physical-hardware qualification.
@@ -185,7 +189,7 @@ The hosted experiment is intentionally separate from the raw fixture scripts abo
 
 1. Create a protected GitHub environment named `hardware-experiment-approval` and require an operator reviewer. Do not put secrets in this environment; the experiment does not need credentials.
 2. Dispatch the workflow with `operator_acknowledgement=APPROVE`, the default `images=windows-2022,windows-latest` (or include the explicitly approved optional `windows-2025` label), and `repetitions=3`.
-3. The job named `awaiting_operator_hardware_approval` runs after the Windows matrix and pauses at the protected environment before any observation can be promoted. Its gate rejects acknowledgements other than the exact word `APPROVE`; it is a post-observation evidence checkpoint, not a pre-allocation authorization gate.
+3. The job named `awaiting_operator_hardware_approval` runs after the Windows matrix and pauses at the protected environment. Its gate checks matrix/privacy success and rejects acknowledgements other than the exact word `APPROVE`; it is a post-observation evidence checkpoint, not pre-run authorization, physical-hardware validation, or an automatic hardware/release gate.
 4. `windows-2022` and `windows-latest` are required. The preparation job reports optional `windows-2025` as skipped when it is not requested; an unknown image label is rejected rather than replacing either required image.
 
 The generated matrix runs three repetitions per selected image. Each image/repetition cell collects both direct-admin and LocalSystem reports with one shared protected HMAC key, derives the session ID inside each process context, validates both locally, and uploads only the redacted JSON reports with seven-day retention. The matrix has no package, release, publish, promotion, deployment, Snipe-IT, or physical-hardware step. A failing validator prevents upload; cleanup removes the key, service host files, and reports and fails if cleanup cannot complete.

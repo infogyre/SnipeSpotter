@@ -8,10 +8,11 @@ SnipeSpotter separates deterministic decisions from operating-system and network
 graph TD
     Core[spotter-core: Functional Core] --> SVC[spotter-svc: Imperative Shell]
     Core --> CLI[spotter-cli: Imperative Shell]
-    Win32[spotter-win32: Windows FFI] --> SVC
+    Win32[spotter-win32: Windows-target runtime FFI] --> SVC
     Win32 --> CLI
-    Build[spotter-build: build-time resources] --> SVC
+    Build[spotter-build: cross-platform build helper] --> SVC
     Build --> CLI
+    Build --> HWS[spotter-hardware-service: experimental test-support host]
     Core -.-> Build
 ```
 
@@ -19,7 +20,9 @@ Dependency rules:
 
 - `spotter-core` has zero I/O, no async, no platform-specific FFI. `cfg(windows)` is permitted only for path constants that select a directory root without performing I/O.
 - `spotter-svc` and `spotter-cli` never import from each other.
-- `spotter-win32` and `spotter-build` are Windows-only and never compile on non-Windows targets.
+- `spotter-win32` is a Windows-target runtime crate. It is not a cross-platform dependency and is kept behind Windows target dependencies in the service and CLI.
+- `spotter-build` is a cross-platform build helper. Its build script can compile without invoking an RC compiler on non-Windows targets; resource compilation runs only for supported Windows MSVC targets. The helper can therefore be used by the production binaries and the experimental hardware-service host without making the runtime crates Windows-only.
+- The workspace contains exactly six packages: `spotter-core`, `spotter-win32`, `spotter-build`, `spotter-svc`, `spotter-cli`, and `spotter-hardware-service`. `spotter-hardware-service` is an experimental/test-support LocalSystem host for the hosted hardware observation workflow. It is not included in the installer or release artifacts.
 - `spotter-build` reads `spotter-core` source at build time (file parse, not crate dependency).
 
 ## Crate responsibilities
@@ -48,20 +51,24 @@ Narrowly scoped unsafe wrappers with RAII ownership:
 
 ### spotter-build (Build helper)
 
-Parses `PRODUCT_NAME` and `COMPANY_NAME` from `spotter-core/src/identity.rs` at build time and passes them as preprocessor defines to the RC compiler. Embeds `VERSIONINFO` and STRINGTABLE resources. The CLI exe gets a `requireAdministrator` manifest; the service exe gets `asInvoker`.
+Parses `PRODUCT_NAME` and `COMPANY_NAME` from `spotter-core/src/identity.rs` at build time and passes them to the RC compiler. Embeds `VERSIONINFO` and STRINGTABLE resources when the target is Windows MSVC; non-Windows targets emit rerun directives and skip resource compilation. The CLI exe gets a `requireAdministrator` manifest; the service exe gets `asInvoker`.
+
+### spotter-hardware-service (Experimental test-support host)
+
+Provides the temporary Windows service host used by the manual hosted hardware experiment. When built with the `hardware-experiment` feature on Windows, it runs the bounded collector as a LocalSystem service process and reports service status to SCM. It is test support, not a product service: the installer and release workflow exclude it.
 
 ### spotter-svc (Service shell)
 
 Implements the Gather -- Process -- Persist cycle:
 
 - **FSM** (`fsm.rs`): Enum + match loop. All states visible in one function. The FSM is the single owner of active config, Snipe-IT client, sync execution, and in-memory state. Commands are serialized: one sync/check-in at a time, duplicate triggers coalesce, config updates commit atomically.
-- **Production owner test boundary** (`service.rs`): `CommandOwner::handle` remains the production orchestration subject. Its external boundaries are intentionally narrow: secret protection, settings/state/journal persistence, clock/path inputs, hardware discovery, remote reads, and remote mutations. Test-support construction substitutes only those ports and uses unique temporary roots/endpoints; production construction continues to use DPAPI, ProgramData, Windows discovery, and the authenticated Snipe-IT client.
+- **Production owner test boundary** (`service.rs`): `CommandOwner::handle` is the production orchestration subject. Its external boundaries are intentionally narrow: secret protection, settings persistence, signed-state persistence, journal persistence, clock inputs, path inputs, hardware discovery, remote reads, and remote mutations. Test-support construction replaces those boundaries with test ports and unique temporary roots/endpoints, then exercises the same command-handling FSM; production construction continues to use DPAPI, ProgramData, Windows discovery, and the authenticated Snipe-IT client.
 - **Hardware discovery** (`discovery.rs`): `discover_hardware()` calls `GetSystemFirmwareTable` for SMBIOS and WMI `WmiMonitorID` for monitors. Abstracted behind a `HardwareDiscovery` trait with real and mock implementations.
 - **Snipe-IT client** (`snipeit_client.rs`): `reqwest`-based HTTP client with bearer token auth, rate limit handling (`X-RateLimit-Remaining`, `Retry-After`), pagination, and `Option<String>` base URL override for wiremock testing.
 - **Sync engine** (`sync_engine.rs`): Orchestrates gather (discover hardware, find assets by serial, resolve taxonomy, load prior state) -- process (`plan_sync()`) -- persist (journal each operation, reconcile before execution, mark confirmed, persist state delta).
 - **IPC server** (`ipc_server.rs`): Named-pipe server with JSON-over-newline protocol. Transport handlers validate framing and enqueue `FsmCommand` values to the FSM. Each request carries a one-shot response sender for committed results.
-- **Config I/O** (`config_io.rs`): Crash-safe Windows replacement via `ReplaceFileW` / `MoveFileExW`. DPAPI decryption wraps the token in `SecretString`.
-- **State I/O** (`state_io.rs`): HMAC-signed state with crash-safe replacement. HMAC key generated with `getrandom` on first run.
+- **Config I/O** (`config_io.rs`): Uses the shared same-directory replacement writer. On Windows, an existing destination is replaced with `ReplaceFileW`; a first create uses `MoveFileExW` with replace-existing and write-through flags. The temporary file is flushed before replacement, its protected ACL is applied before writing and reapplied to the destination after replacement, and a parent-directory flush is attempted on a best-effort basis. Synchronous errors remove the temporary file and owner metadata; successful writes remove owner metadata synchronously.
+- **State I/O** (`state_io.rs`): HMAC-signed state uses the same replacement contract. The process-level guarantee is old-or-new: readers observe either the complete prior file or the complete replacement, never a partially written destination. Temporary names carry the owning PID and nonce, and the matching owner sidecar records the same `PID:nonce` pair. Recovery verifies that owner, checks the owner is dead, and requires a conservative age threshold; malformed, unowned, current-process, live-owner, or too-new files remain untouched. This excludes arbitrary power-loss guarantees and does not define multi-writer coordination semantics.
 - **Operation journal** (`operation_journal.rs`): Append-only, fsynced journal of `Prepared` → `RemoteOutcomeObserved` → `StateCommitted` records with deterministic IDs. Recovery loads signed state plus pending evidence, reconciles only operations without an observed outcome, applies validated candidate-state evidence, and compacts only after the signed state commit.
 - **Logging** (`logging.rs`): `tracing-subscriber` with `tracing-appender` rolling file appender. Daily rotation, configurable level and retention.
 - **Service registration** (`service.rs`): `windows-service` crate for SCM integration. Service name: `SnipeSpotter`, account: `LocalSystem`, start type: automatic.
@@ -98,6 +105,12 @@ Key FSM properties:
 - `CheckinAll` and `CheckinSerial` are serialized after any active sync and operate on the latest committed monitor state.
 - State transitions write to `state.toml` before sending notifications (commit-before-notify).
 
+### Installed-service lifecycle validation
+
+The MSI registers `SnipeSpotter` with automatic start and the `LocalSystem` account, but it does not start the service during installation. A later start with the blank settings template must still sustain `Running` in the Service Control Manager (SCM) and expose the named pipe; the IPC status response is `Unconfigured` until required settings are supplied. The elevated lifecycle check proves sustained SCM `Running`, the process owner `NT AUTHORITY\\SYSTEM`, named-pipe health, and the `Unconfigured` response. Those checks do not establish an authenticated LocalSystem secret-use proof.
+
+Ordinary production `spotter-cli service install` and `service uninstall` use the fixed `SnipeSpotter` SCM and runtime identity, so they can target the same service identity registered by the MSI. Only the elevated feature-gated test-support lane supplies hidden overrides: it generates `SnipeSpotterDirect-$RunIdentity` with matching unique pipe, mutex, data-root, and test executable values so lifecycle tests do not collide with the MSI service. The overrides are supplied together and are not part of the ordinary production CLI path.
+
 ## Synchronization flow
 
 ```mermaid
@@ -127,16 +140,18 @@ Operation recovery:
 
 ## Security boundaries
 
-- **API tokens**: Encrypted by the LocalSystem service with machine-scope DPAPI (`CRYPTPROTECT_LOCAL_MACHINE`). Plaintext never persists. The elevated CLI submits plaintext over the SYSTEM/admin-only pipe; the service performs encryption.
+- **API tokens**: Encrypted by the LocalSystem service with machine-scope DPAPI (`CRYPTPROTECT_LOCAL_MACHINE`). The ciphertext is machine-bound and non-portable; re-enter the token after an OS or machine replacement. Plaintext never persists. The elevated CLI submits plaintext over the SYSTEM/admin-only pipe; the service performs encryption. The documented ports and tests do not constitute an authenticated LocalSystem secret-use proof beyond the implemented service and pipe checks.
 - **Named-pipe access**: Restricted to `NT AUTHORITY\SYSTEM` and `BUILTIN\Administrators` via an SDDL DACL (`D:P(A;;GA;;;SY)(A;;GA;;;BA)`). No handle inheritance.
-- **ProgramData ACLs**: Settings, state, HMAC key, journal, and logs under `%ProgramData%\infogyre\SnipeSpotter\` with inheritable full control only to SYSTEM and Administrators.
+- **ProgramData ACLs**: Settings, state, HMAC key, journal, and logs under `%ProgramData%\infogyre\SnipeSpotter\` use a protected DACL with explicit full-control Allow entries only for SYSTEM and built-in Administrators. Runtime startup reapplies the contract to the existing root and artifacts, and atomic replacement reapplies it to each destination. Validation rejects inherited or unauthorized Allow entries and duplicates; Deny ACEs are preserved. The installer creates the initial tree, but it is not the security boundary.
 - **Signed state**: HMAC-SHA256 over canonical JSON that excludes the HMAC field. Constant-time verification via `subtle`. Tampered state is rejected; the operator preserves files for diagnosis rather than deleting them.
 - **IPC line limit**: 64 KiB maximum per request or response line to prevent DoS.
 - **Elevation**: CLI manifest requires `requireAdministrator`. Runtime `is_elevated()` check as belt-and-suspenders backup.
 
 ## Hosted hardware experiment boundary
 
-The optional hosted hardware experiment is deliberately separate from the product runtime and existing raw fixture recon scripts. It lives under `scripts/hardware/` and is invoked only by `.github/workflows/hardware-experiment.yml`; the workflow records the protected `awaiting_operator_hardware_approval` checkpoint after the observation matrix and before any promotion.
+The optional hosted hardware experiment is deliberately separate from the product runtime and existing raw fixture recon scripts. It lives under `scripts/hardware/` and is invoked only by `.github/workflows/hardware-experiment.yml`. The already-required `spotter-svc/tests/hosted_hardware.rs` integration tests run in the Windows workspace checks and release build job; the manual experiment is additional diagnostic evidence, not a replacement for those tests or an automatic hardware gate.
+
+The workflow runs its observation matrix before the protected `awaiting_operator_hardware_approval` job. That job is a post-observation evidence checkpoint: it checks matrix/privacy success and the exact acknowledgement, but it is not pre-run authorization, physical-hardware validation, or automatic release promotion.
 
 Its imperative-shell collector (`collect_hardware.ps1`) gathers only bounded summaries: requested runner image and alias, exact runner/build metadata, process bitness, caller class/context, the numeric Windows process session ID captured in each context, classified API results and durations, SMBIOS lengths/type histograms, WMI counts/array lengths/placeholder classes, chassis class counts, and HMAC fragments. The workflow creates one protected temporary HMAC key per image/repetition and shares it between direct-admin and LocalSystem collection; it is never uploaded and is removed during failure-safe cleanup. Raw firmware, EDID, WMI strings, serials, asset tags, environment dumps, tokens, and exception text are never emitted.
 

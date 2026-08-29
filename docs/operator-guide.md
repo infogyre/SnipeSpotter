@@ -192,7 +192,9 @@ Forces check-in of monitors regardless of check-in policy. `--all` checks in all
 
 ### service install / uninstall
 
-Direct CLI SCM registration is intentionally separate from MSI registration. `service install` creates the sibling service with AutoStart, own-process type, the production service executable, the `LocalSystem` account, and the documented description. If the service is already installed, the command returns an actionable operational error without mutating it. `service uninstall` stops a running service, waits for `Stopped`, requests deletion, and waits for SCM disappearance; uninstalling a missing service returns an actionable operational error. A pending stop or delete timeout is a failure, not an accepted early result.
+Ordinary production `spotter-cli service install` and `service uninstall` use the fixed `SnipeSpotter` SCM and runtime identity, so they can target the same service registered by the MSI. `service install` creates that service with AutoStart, own-process type, the production service executable, the `LocalSystem` account, and the documented description. If the service is already installed, the command returns an actionable `already installed` error without mutating it; SCM’s marked-for-deletion state is also reported as a failure. `service uninstall` returns an actionable `not installed` error when the service is missing, waits up to 90 seconds for `Stopped` after requesting a stop, requests deletion, then waits up to another 90 seconds for SCM disappearance. A pending stop, pending deletion, or either timeout is a failure, not an accepted early result.
+
+Only the elevated feature-gated test-support lane supplies hidden identity overrides. It generates `SnipeSpotterDirect-$RunIdentity` with matching unique pipe, mutex, data-root, and test executable values so lifecycle tests do not collide with the MSI’s `SnipeSpotter` service. The duplicate, missing, stop, delete, and wait contracts above apply to that generated test identity when the lane invokes the same commands.
 
 ```powershell
 spotter-cli service install

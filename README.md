@@ -12,7 +12,7 @@ SnipeSpotter synchronizes Windows system and monitor inventory with an existing 
 - **Named-pipe IPC**: The CLI communicates with the service over a named pipe restricted to SYSTEM and built-in Administrators via a DACL.
 - **Operation journaling**: Prepared operations are durably journaled before remote execution. Recovery reconciles server state before retrying uncertain mutations.
 - **Signed state**: Service state is HMAC-SHA256 signed with constant-time verification to detect tampering.
-- **WiX 6 MSI installer**: Installs binaries, PDBs, and CycloneDX SBOMs; registers the service as automatic LocalSystem; adds `bin\` to system PATH; creates ProgramData with restricted ACLs.
+- **WiX 6 MSI installer**: Installs binaries, PDBs, and CycloneDX SBOMs; registers the service as automatic LocalSystem without starting it; adds `bin\` to system PATH; creates ProgramData with restricted ACLs.
 - **Configurable monitor check-in**: `Manual` policy never auto-checks in; `AutoNonPortable` checks in absent monitors on non-portable chassis after a configurable threshold.
 
 ## Workspace
@@ -24,8 +24,9 @@ SnipeSpotter synchronizes Windows system and monitor inventory with an existing 
 | `spotter-build` | RC resource embedding, manifest propagation | Build-time |
 | `spotter-svc` | Windows service: FSM loop, WMI/SMBIOS discovery, HTTP client, IPC server, config/state I/O, operation journal, logging | Imperative Shell |
 | `spotter-cli` | Operator CLI: clap commands, IPC client, output formatting, SCM registrar | Imperative Shell |
+| `spotter-hardware-service` | Experimental/test-support LocalSystem host for the hosted hardware observation workflow; excluded from the installer and release artifacts | Imperative Shell |
 
-The service and CLI never import from each other. The core crate has zero I/O, zero async, and zero platform-specific FFI.
+The workspace contains exactly six packages: `spotter-core`, `spotter-win32`, `spotter-build`, `spotter-svc`, `spotter-cli`, and `spotter-hardware-service`. The service and CLI never import from each other. The core crate has zero I/O, zero async, and zero platform-specific FFI.
 
 ## Quick start
 
@@ -53,6 +54,9 @@ SnipeSpotter does not create Snipe-IT assets, manufacturers, categories, or mode
 - [Architecture](docs/architecture.md) -- crate layout, FCIS boundaries, FSM states, sync flow, security model
 - [Operator guide](docs/operator-guide.md) -- installation, configuration, CLI reference, troubleshooting, recovery
 - [CI and release guide](docs/ci-guide.md) -- CI topology, release process, manual MSI build, lifecycle validation
+- [Hardware report template](docs/hardware-report-template.md) -- diagnostic report format and evidence limits
+
+Validation has separate boundaries: the installed product lifecycle is validated by the elevated MSI/SCM checks, while hosted hardware observations are diagnostic evidence only. The Windows checks already run the hosted-hardware integration tests; a manual experiment does not establish physical-hardware coverage or a release gate. See the [architecture](docs/architecture.md), [operator guide](docs/operator-guide.md), and [CI and release guide](docs/ci-guide.md) for the implemented contracts.
 
 ## Requirements
 

@@ -70,30 +70,33 @@ All 12 reports passed the privacy validator:
 
 Machine HMAC fragments differ across images (expected — different VMs). Within-run fragments are identical across direct-admin and LocalSystem contexts, confirming identifier consistency within a single VM.
 
-## Promotion assessment
+## Evidence summary
 
-### Stable assertions supported by evidence
+Record observations here; do not turn them into release, PR, or hardware gates in this template. The regular Windows workspace checks and the release build job run the required `spotter-svc/tests/hosted_hardware.rs` integration tests. The manually dispatched hardware experiment is separate: it collects redacted, bounded observations in three repetitions per selected hosted image, in both direct-admin and LocalSystem contexts. It does not run those integration tests or replace the regular checks.
 
-The following assertions are stable across all 12 cells and both images. They are safe to promote as PR-level CI gates:
+For each observation, record the image label and alias, exact runner metadata, repetition, execution context, result, and relevant bounded measurement. Keep the report limited to the privacy schema. The observations in this document describe GitHub-hosted virtual machines, not physical hardware.
 
-1. **SMBIOS acquisition succeeds** on both windows-2022 and windows-latest.
-2. **SMBIOS structure count is 15** with the exact type histogram.
-3. **WMI monitor query succeeds** and returns exactly 1 monitor.
-4. **Monitor array lengths are bounded** (manufacturer/product/serial = 16, week/year = 1).
-5. **Chassis is desktop (non-portable)** — chassis type 3, no portable/server/enclosure.
-6. **All 4 hardware APIs succeed in both direct-admin and LocalSystem contexts.**
+### Observation categories
 
-### Behaviors requiring physical hardware
+Use the categories below when summarizing a run. They describe evidence to review, not proposed gates:
 
-The following cannot be verified on hosted runners and require physical/self-hosted hardware:
+- SMBIOS acquisition result, bounded byte length, structure count, and type histogram.
+- WMI monitor query result, bounded monitor count, array lengths, and placeholder classes.
+- Chassis classification and bounded class counts.
+- Process identity result and the numeric Windows process session ID captured in each context.
+- API result classifications and durations for direct-admin and LocalSystem contexts.
+- Privacy-validator result, report size, and whether raw identifiers or payloads were emitted.
+- HMAC fragment comparison within a VM and across distinct hosted VMs, without recording the key.
 
-- Physical serial number fidelity (real vendor/model strings)
-- EDID byte-level correctness
-- Monitor hotplug detection
-- Multi-monitor scenarios (>1 active monitor)
-- Vendor-specific SMBIOS extensions
-- Physical chassis type variety (laptop, server, tablet)
+### Limitations and follow-up
 
-### Recommendation
+Hosted observations cannot verify the following physical or vendor-specific behaviors:
 
-Promote the 6 stable assertions above as hosted-runner CI gates. These verify that the production hardware acquisition pipeline works correctly on GitHub-hosted Windows runners without claiming physical hardware fidelity. Physical hardware qualification remains a separate, operator-defined follow-up.
+- Physical serial-number fidelity and real vendor/model strings.
+- EDID byte-level correctness.
+- Monitor hotplug detection.
+- Multi-monitor scenarios.
+- Vendor-specific SMBIOS extensions.
+- Physical chassis-type variety, including laptops, servers, and tablets.
+
+The `awaiting_operator_hardware_approval` job is a post-observation evidence checkpoint. It does not authorize the run before allocation and does not automatically promote an observation, fixture, release gate, or physical-hardware qualification. Any future gate or policy change requires a separate explicit decision and documented policy; this report alone is not that decision.
