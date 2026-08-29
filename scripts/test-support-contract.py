@@ -122,6 +122,8 @@ _CREDENTIAL_LAUNCH_PROBE_FORBIDDEN_FIELDS = (
     "handle",
 )
 _CREDENTIAL_LAUNCH_PROBE_UNAVAILABLE = "probe_unavailable"
+_DIRECT_RESULT_SHAPE_FAILURE_SIGNAL = "direct result-shape schema assertion failed"
+
 _CREDENTIAL_LAUNCH_PROBE_STAGES = (
     "not_started",
     "password_bstr",
@@ -200,6 +202,326 @@ def test_direct_scm_exercises_installed_cli_to_service_sync_flow() -> None:
     assert "Arguments @('--token'" not in source
     assert "-Environment" not in source
     assert "Start-Sleep -Seconds 5" not in source
+
+
+def test_direct_scm_result_shape_diagnostic_precedes_first_exit_code_consumer() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    diagnostic_name = "Write-DirectCliResultShapeDiagnostic"
+    assert f"function {diagnostic_name}" in source
+    diagnostic = _powershell_function(source, diagnostic_name)
+    for required in (
+        "result_count",
+        "result_is_array",
+        "record_${index}_has_exit_code",
+        "record_${index}_has_stdout",
+        "record_${index}_has_stderr",
+        "record_${index}_has_description",
+        "Write-BoundedDiagnostic",
+    ):
+        assert required in diagnostic
+    for forbidden in (
+        "result_value",
+        "$Result.Stdout",
+        "$Result.Stderr",
+        "$Result.Description",
+        "$Result.ExitCode",
+        "Arguments",
+        "Token",
+    ):
+        assert forbidden not in diagnostic
+
+    lifecycle_start = source.index("$install = Invoke-DirectCli")
+    diagnostic_call = source.index(
+        f"{diagnostic_name} -Result $install -Stage 'ServiceInstall'",
+        lifecycle_start,
+    )
+    exit_code_consumer = source.index("$install.ExitCode", lifecycle_start)
+    assert diagnostic_call < exit_code_consumer
+
+
+def _direct_result_shape_fixture(helper: str) -> str:
+    diagnostics_module = str(ROOT / "Diagnostics.psm1").replace("'", "''")
+    return f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module '{diagnostics_module}' -Force
+$root = Join-Path ([IO.Path]::GetTempPath()) ('direct-result-shape-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+$LogDirectory = $root
+$WarningPreference = 'SilentlyContinue'
+{helper}
+
+$schemaFailureSignal = '{_DIRECT_RESULT_SHAPE_FAILURE_SIGNAL}'
+function Assert-Shape {{
+    param(
+        [Parameter(Mandatory = $true)][object]$Json,
+        [Parameter(Mandatory = $true)][string[]]$ExpectedKeys,
+        [Parameter(Mandatory = $true)][int]$ExpectedCount,
+        [Parameter(Mandatory = $true)][bool]$ExpectedArray
+    )
+    $actualKeys = @($Json.PSObject.Properties.Name | Sort-Object)
+    $expectedKeySet = @($ExpectedKeys | Sort-Object)
+    if (($actualKeys -join '|') -cne ($expectedKeySet -join '|')) {{
+        throw $schemaFailureSignal
+    }}
+    if ($Json.stage -isnot [string]) {{ throw $schemaFailureSignal }}
+    if ($Json.result_count -isnot [int] -and $Json.result_count -isnot [long]) {{
+        throw $schemaFailureSignal
+    }}
+    if ($Json.result_is_array -isnot [bool]) {{ throw $schemaFailureSignal }}
+    if ([int]$Json.result_count -ne $ExpectedCount) {{ throw $schemaFailureSignal }}
+    if ([bool]$Json.result_is_array -ne $ExpectedArray) {{ throw $schemaFailureSignal }}
+    foreach ($key in @($ExpectedKeys | Where-Object {{ $_ -like 'record_*' }})) {{
+        if ($Json.$key -isnot [bool]) {{ throw $schemaFailureSignal }}
+    }}
+}}
+
+function Read-Diagnostic {{
+    $path = Join-Path $LogDirectory 'direct-cli-result-shape.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{ throw $schemaFailureSignal }}
+    $text = [IO.File]::ReadAllText($path)
+    if ($text.Contains($sentinel, [StringComparison]::Ordinal)) {{ throw $schemaFailureSignal }}
+    try {{
+        $json = $text | ConvertFrom-Json
+    }} catch {{
+        throw $schemaFailureSignal
+    }}
+    return @{{ Text = $text; Json = $json }}
+}}
+
+try {{
+$sentinel = 'direct-result-sensitive-sentinel'
+$baseKeys = @('stage', 'result_count', 'result_is_array')
+$recordKeys = @(
+    'record_0_has_exit_code', 'record_0_has_stdout', 'record_0_has_stderr', 'record_0_has_description'
+)
+$scalar = [pscustomobject][ordered]@{{
+    ExitCode = 0
+    Stdout = "$sentinel-stdout"
+    Stderr = "$sentinel-stderr"
+    Description = "$sentinel-description"
+    Password = "$sentinel-password"
+    Exception = [Exception]::new($sentinel)
+}}
+
+Write-DirectCliResultShapeDiagnostic -Result $null -Stage 'NullResult'
+$nullDiagnostic = Read-Diagnostic
+Assert-Shape -Json $nullDiagnostic.Json -ExpectedKeys $baseKeys -ExpectedCount 0 -ExpectedArray $false
+if ([int][Text.Encoding]::UTF8.GetByteCount($nullDiagnostic.Text) -gt 32768) {{ throw $schemaFailureSignal }}
+
+Write-DirectCliResultShapeDiagnostic -Result $scalar -Stage 'ScalarResult'
+$scalarDiagnostic = Read-Diagnostic
+Assert-Shape -Json $scalarDiagnostic.Json -ExpectedKeys ($baseKeys + $recordKeys) -ExpectedCount 1 -ExpectedArray $false
+if ($scalarDiagnostic.Json.record_0_has_exit_code -ne $true -or
+    $scalarDiagnostic.Json.record_0_has_stdout -ne $true -or
+    $scalarDiagnostic.Json.record_0_has_stderr -ne $true -or
+    $scalarDiagnostic.Json.record_0_has_description -ne $true) {{
+    throw $schemaFailureSignal
+}}
+
+$arrayResult = @(
+    $scalar
+    [pscustomobject][ordered]@{{
+        ExitCode = 1
+        Stdout = "$sentinel-array-stdout"
+        Stderr = "$sentinel-array-stderr"
+        Description = "$sentinel-array-description"
+        'arbitrary.property' = $sentinel
+    }}
+)
+$arrayKeys = @($baseKeys + $recordKeys + @(
+    'record_1_has_exit_code', 'record_1_has_stdout', 'record_1_has_stderr', 'record_1_has_description'
+))
+Write-DirectCliResultShapeDiagnostic -Result $arrayResult -Stage 'ArrayResult'
+$arrayDiagnostic = Read-Diagnostic
+Assert-Shape -Json $arrayDiagnostic.Json -ExpectedKeys $arrayKeys -ExpectedCount 2 -ExpectedArray $true
+
+$oversizedResult = @()
+for ($index = 0; $index -lt 32; $index++) {{ $oversizedResult += $scalar }}
+$oversizedKeys = @($baseKeys)
+for ($index = 0; $index -lt 4; $index++) {{
+    $oversizedKeys += @(
+        "record_$($index)_has_exit_code",
+        "record_$($index)_has_stdout",
+        "record_$($index)_has_stderr",
+        "record_$($index)_has_description"
+    )
+}}
+Write-DirectCliResultShapeDiagnostic -Result $oversizedResult -Stage 'OversizedResult'
+$oversizedDiagnostic = Read-Diagnostic
+Assert-Shape -Json $oversizedDiagnostic.Json -ExpectedKeys $oversizedKeys -ExpectedCount 32 -ExpectedArray $true
+if ([int][Text.Encoding]::UTF8.GetByteCount($oversizedDiagnostic.Text) -gt 32768) {{
+    throw $schemaFailureSignal
+}}
+Write-Output 'direct result-shape fixture accepted'
+}} catch {{
+    [Console]::Error.WriteLine($schemaFailureSignal)
+    exit 1
+}}
+"""
+
+
+def test_direct_scm_result_shape_diagnostic_has_exact_bounded_schema() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper = _powershell_function(source, "Write-DirectCliResultShapeDiagnostic")
+    assert "$MaxDiagnosticRecords = 4" in helper
+    result = _run_powershell_fixture(_direct_result_shape_fixture(helper))
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "direct result-shape fixture accepted" in result.stdout
+
+
+def test_direct_scm_result_shape_diagnostic_does_not_mask_original_failure() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper = _powershell_function(source, "Write-DirectCliResultShapeDiagnostic")
+    diagnostics_module = str(ROOT / "Diagnostics.psm1").replace("'", "''")
+    fixture = f"""
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module '{diagnostics_module}' -Force
+$root = Join-Path ([IO.Path]::GetTempPath()) ('direct-result-shape-failure-' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $root | Out-Null
+$LogDirectory = Join-Path $root 'missing-diagnostic-directory'
+{helper}
+$record = [pscustomobject][ordered]@{{
+    ExitCode = 1
+    Stdout = 'oversized-stdout'
+    Stderr = 'oversized-stderr'
+    Description = 'oversized-description'
+}}
+$oversizedResult = @()
+for ($index = 0; $index -lt 32; $index++) {{ $oversizedResult += $record }}
+$primaryMessage = 'original lifecycle failure'
+$caught = $null
+try {{
+    Write-DirectCliResultShapeDiagnostic -Result $oversizedResult -Stage 'ServiceInstall'
+    throw $primaryMessage
+}} catch {{
+    $caught = $_
+}}
+if ($null -eq $caught -or $caught.Exception.Message -cne $primaryMessage) {{
+    throw "original failure was masked: $($caught.Exception.Message)"
+}}
+Write-Output 'original failure preserved'
+"""
+    result = _run_powershell_fixture(fixture)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "original failure preserved" in result.stdout
+
+
+def test_direct_scm_result_shape_diagnostic_rejects_privacy_mutations() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper = _powershell_function(source, "Write-DirectCliResultShapeDiagnostic")
+    expected_failure_signal = _DIRECT_RESULT_SHAPE_FAILURE_SIGNAL
+    shared_forbidden_content = (
+        str(ROOT),
+        str(ROOT / "Diagnostics.psm1"),
+        str(Path(tempfile.gettempdir())),
+        "direct-result-shape-",
+        "direct-cli-result-shape.json",
+        "-Result",
+        "-Stage",
+        "Result",
+        "Stage",
+        "ExpectedKeys",
+        "ExpectedCount",
+        "ExpectedArray",
+        "NullResult",
+        "ScalarResult",
+        "ArrayResult",
+        "OversizedResult",
+        "$null",
+        "$scalar",
+        "$arrayResult",
+        "$oversizedResult",
+        "ExitCode",
+        "Stdout",
+        "Stderr",
+        "Description",
+        "Password",
+        "Exception",
+        "record_0_has_exit_code",
+        "record_0_has_stdout",
+        "record_0_has_stderr",
+        "record_0_has_description",
+        "record_1_has_exit_code",
+        "record_1_has_stdout",
+        "record_1_has_stderr",
+        "record_1_has_description",
+        "direct-result-sensitive-sentinel",
+        "direct-result-sensitive-sentinel-stdout",
+        "direct-result-sensitive-sentinel-stderr",
+        "direct-result-sensitive-sentinel-description",
+        "direct-result-sensitive-sentinel-password",
+        "direct-result-sensitive-sentinel-array-stdout",
+        "direct-result-sensitive-sentinel-array-stderr",
+        "direct-result-sensitive-sentinel-array-description",
+        "arbitrary.property",
+    )
+    mutations = (
+        (
+            "extra key",
+            helper.replace(
+                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                "    $values['extra'] = 'extra-sensitive-value'\n"
+                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                1,
+            ),
+            ("extra", "extra-sensitive-value"),
+        ),
+        (
+            "record value",
+            helper.replace(
+                '        $values["record_${index}_has_description"] = $properties -contains \'Description\'\n',
+                '        $values["record_${index}_has_description"] = $properties -contains \'Description\'\n'
+                '        $values["record_${index}_value"] = $record\n',
+                1,
+            ),
+            (
+                "record_0_value",
+                "ExitCode",
+                "Stdout",
+                "Stderr",
+                "Description",
+                "direct-result-sensitive-sentinel",
+                "direct-result-sensitive-sentinel-stdout",
+                "direct-result-sensitive-sentinel-stderr",
+                "direct-result-sensitive-sentinel-description",
+                "direct-result-sensitive-sentinel-password",
+            ),
+        ),
+        (
+            "exception value",
+            helper.replace(
+                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                "    $values['exception'] = [Exception]::new('exception-sensitive-value')\n"
+                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                1,
+            ),
+            ("exception", "exception-sensitive-value", "System.Exception"),
+        ),
+        (
+            "arbitrary property name",
+            helper.replace(
+                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                "    $values['arbitrary.property'] = 'arbitrary-sensitive-value'\n"
+                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                1,
+            ),
+            ("arbitrary.property", "arbitrary-sensitive-value"),
+        ),
+    )
+    for label, mutation, injected_content in mutations:
+        assert mutation != helper, f"{label} mutation was not applied"
+        result = _run_powershell_fixture(_direct_result_shape_fixture(mutation))
+        combined_output = result.stdout + result.stderr
+        assert result.returncode != 0, f"{label} mutation was accepted"
+        assert combined_output.strip() == expected_failure_signal, (
+            f"{label} reported an unexpected failure reason"
+        )
+        for forbidden in (*shared_forbidden_content, *injected_content):
+            assert forbidden not in combined_output, (
+                f"{label} leaked forbidden fixture content {forbidden!r}"
+            )
 
 
 def test_direct_scm_waits_for_loopback_prefix_before_method_call() -> None:
@@ -4025,6 +4347,10 @@ def main() -> None:
     test_required_modules_exist()
     test_snipeit_loopback_fixture_is_private_and_evidence_only()
     test_direct_scm_exercises_installed_cli_to_service_sync_flow()
+    test_direct_scm_result_shape_diagnostic_precedes_first_exit_code_consumer()
+    test_direct_scm_result_shape_diagnostic_has_exact_bounded_schema()
+    test_direct_scm_result_shape_diagnostic_does_not_mask_original_failure()
+    test_direct_scm_result_shape_diagnostic_rejects_privacy_mutations()
     test_ac4_real_capture_handlers_are_runspace_independent()
     test_ac4_stream_capture_is_incremental_bounded_and_fail_closed()
     test_ac4_stream_capture_mutations_are_rejected()

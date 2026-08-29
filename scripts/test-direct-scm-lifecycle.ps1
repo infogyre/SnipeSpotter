@@ -835,6 +835,37 @@ function Assert-EncryptedTokenSetting {
     }
 }
 
+function Write-DirectCliResultShapeDiagnostic {
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Result,
+        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Stage
+    )
+    $MaxDiagnosticRecords = 4
+    $resultIsArray = [bool]($Result -is [array])
+    $records = if ($null -eq $Result) { $null } else { @($Result) }
+    $resultCount = if ($null -eq $Result) { 0 } else { $records.Count }
+    $values = [ordered]@{
+        stage = $Stage
+        result_count = $resultCount
+        result_is_array = $resultIsArray
+    }
+    $recordsToInspect = [Math]::Min($resultCount, $MaxDiagnosticRecords)
+    for ($index = 0; $index -lt $recordsToInspect; $index++) {
+        $record = $records[$index]
+        $properties = if ($null -eq $record) { @() } else { @($record.PSObject.Properties.Name) }
+        $values["record_${index}_has_exit_code"] = $properties -contains 'ExitCode'
+        $values["record_${index}_has_stdout"] = $properties -contains 'Stdout'
+        $values["record_${index}_has_stderr"] = $properties -contains 'Stderr'
+        $values["record_${index}_has_description"] = $properties -contains 'Description'
+    }
+    try {
+        $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'
+        Write-BoundedDiagnostic -Path $diagnosticPath -Values $values -MaxBytes 32768
+    } catch {
+        Write-Warning 'direct CLI result shape diagnostic capture failed'
+    }
+}
+
 function Invoke-DirectUninstall {
     $result = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('service', 'uninstall')) -Description 'ServiceUninstall'
     if ($result.ExitCode -ne 0) {
@@ -891,6 +922,7 @@ $primaryError = $null
 $cleanupError = $null
 try {
     $install = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('service', 'install')) -Description 'ServiceInstall'
+    Write-DirectCliResultShapeDiagnostic -Result $install -Stage 'ServiceInstall'
     Assert-True ($install.ExitCode -eq 0) "direct service install failed: $($install.Stderr.Trim())"
 
     $duplicate = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('service', 'install')) -Description 'DuplicateServiceInstall'
