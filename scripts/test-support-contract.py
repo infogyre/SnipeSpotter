@@ -738,6 +738,25 @@ def test_standard_user_acl_probe_uses_bounded_secure_script_transport() -> None:
     _assert_standard_user_acl_probe_transport_contract(read_module("Security.psm1"))
 
 
+def test_standard_user_acl_probe_uses_acl_aware_creation_and_acl_apis() -> None:
+    helper = read_module("Security.psm1").split(
+        "function Assert-StandardUserCannotReadWrite", 1
+    )[1]
+    assert (
+        "[IO.Directory]::CreateDirectory($probeDirectory, $directorySecurity)"
+        not in helper
+    )
+    assert "[IO.File]::SetAccessControl($probePath, $fileSecurity)" not in helper
+    assert (
+        "[IO.FileSystemAclExtensions]::CreateDirectory($directorySecurity, $probeDirectory)"
+        in helper
+    )
+    assert (
+        "[IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($probePath), $fileSecurity)"
+        in helper
+    )
+
+
 def test_standard_user_acl_probe_regresses_the_oversized_encoded_transport() -> None:
     module = read_module("Security.psm1")
     probe_start = module.index("$probe = @'") + len("$probe = @'\n")
@@ -2742,6 +2761,7 @@ def main() -> None:
     test_acl_contract_callers_pass_declared_path_kinds_everywhere()
     test_elevated_result_requires_msi_and_direct_scm_success_in_both_modes()
     test_standard_user_acl_probe_uses_bounded_secure_script_transport()
+    test_standard_user_acl_probe_uses_acl_aware_creation_and_acl_apis()
     test_standard_user_acl_probe_regresses_the_oversized_encoded_transport()
     test_standard_user_acl_probe_transport_contract_rejects_unsafe_mutations()
     test_security_module_proves_standard_user_token_and_access_denials()

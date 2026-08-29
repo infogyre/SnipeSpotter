@@ -870,7 +870,7 @@ exit 0
         )) {
             $directorySecurity.AddAccessRule($rule)
         }
-        [IO.Directory]::CreateDirectory($probeDirectory, $directorySecurity) | Out-Null
+        [IO.FileSystemAclExtensions]::CreateDirectory($directorySecurity, $probeDirectory) | Out-Null
         $probeBytes = [Text.UTF8Encoding]::new($false).GetBytes($probe)
         $probeStream = [IO.File]::Open($probePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try {
@@ -905,7 +905,7 @@ exit 0
         )) {
             $fileSecurity.AddAccessRule($rule)
         }
-        [IO.File]::SetAccessControl($probePath, $fileSecurity)
+        [IO.FileSystemAclExtensions]::SetAccessControl([IO.FileInfo]::new($probePath), $fileSecurity)
         $commandExecutable = Join-Path $PSHOME 'pwsh.exe'
         $commandArguments = @(
             '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $probePath, $Path, $PathType
