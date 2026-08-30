@@ -16,6 +16,15 @@ use windows::{
     core::{PCWSTR, w},
 };
 
+#[cfg(test)]
+use windows::{
+    Win32::Security::{
+        Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    },
+    core::PWSTR,
+};
+
 const SDDL_REVISION_1: u32 = 1;
 const ADMIN_PIPE_SDDL: PCWSTR = w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 
@@ -96,8 +105,50 @@ pub fn create_admin_pipe_security_attributes() -> Result<SecurityAttributes> {
 }
 
 #[cfg(test)]
+fn render_security_descriptor_sddl(descriptor: PSECURITY_DESCRIPTOR) -> Result<String> {
+    if descriptor.is_invalid() {
+        anyhow::bail!("Windows returned an invalid security descriptor");
+    }
+
+    let mut text = PWSTR::null();
+    // SAFETY: `descriptor` remains owned by `SecurityAttributes` for this call, `text` is a
+    // writable out-parameter, and the returned string is released with `LocalFree` below.
+    unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor,
+            SDDL_REVISION_1,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::addr_of_mut!(text),
+            None,
+        )
+    }
+    .context("failed to render named-pipe security descriptor")?;
+
+    let rendered =
+        unsafe { text.to_string() }.context("invalid rendered named-pipe security descriptor");
+    // SAFETY: Windows allocated `text` for the conversion above; `LocalFree` is the matching
+    // deallocator, and the string has already been copied into `rendered` when conversion succeeds.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+    }
+    rendered
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_has_only_local_system_and_builtin_administrators_full_access() -> Result<()> {
+        let attributes = create_admin_pipe_security_attributes()?;
+        let rendered = render_security_descriptor_sddl(attributes.descriptor)?;
+
+        assert_eq!(rendered, "D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+        for broad_principal in ["BU", "WD", "AU"] {
+            assert!(!rendered.contains(&format!(";;;{broad_principal}")));
+        }
+        Ok(())
+    }
 
     #[test]
     fn attributes_have_noninheritable_descriptor() -> Result<()> {
