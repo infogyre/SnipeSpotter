@@ -838,9 +838,20 @@ function Assert-EncryptedTokenSetting {
 function Write-DirectCliResultShapeDiagnostic {
     param(
         [Parameter(Mandatory = $true)][AllowNull()][object]$Result,
-        [Parameter(Mandatory = $true)][ValidateNotNullOrEmpty()][string]$Stage
+        [Parameter(Mandatory = $true)][ValidateSet('ServiceUninstall', 'StatusHealthCheck', 'ServiceInstall', 'DuplicateServiceInstall', 'ConfigSet', 'SetToken', 'TriggerSync', 'MissingServiceUninstall')][string]$Stage
     )
     $MaxDiagnosticRecords = 4
+    $diagnosticFile = switch ($Stage) {
+        'ServiceUninstall' { 'direct-cli-result-shape-service-uninstall.json' }
+        'StatusHealthCheck' { 'direct-cli-result-shape-status-health-check.json' }
+        'ServiceInstall' { 'direct-cli-result-shape-service-install.json' }
+        'DuplicateServiceInstall' { 'direct-cli-result-shape-duplicate-service-install.json' }
+        'ConfigSet' { 'direct-cli-result-shape-config-set.json' }
+        'SetToken' { 'direct-cli-result-shape-set-token.json' }
+        'TriggerSync' { 'direct-cli-result-shape-trigger-sync.json' }
+        'MissingServiceUninstall' { 'direct-cli-result-shape-missing-service-uninstall.json' }
+        default { throw 'direct CLI result shape diagnostic stage was not allowlisted' }
+    }
     $resultIsArray = [bool]($Result -is [array])
     $records = if ($null -eq $Result) { $null } else { @($Result) }
     $resultCount = if ($null -eq $Result) { 0 } else { $records.Count }
@@ -859,7 +870,7 @@ function Write-DirectCliResultShapeDiagnostic {
         $values["record_${index}_has_description"] = $properties -contains 'Description'
     }
     try {
-        $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'
+        $diagnosticPath = Join-Path $LogDirectory $diagnosticFile
         Write-BoundedDiagnostic -Path $diagnosticPath -Values $values -MaxBytes 32768
     } catch {
         Write-Warning 'direct CLI result shape diagnostic capture failed'
@@ -868,6 +879,7 @@ function Write-DirectCliResultShapeDiagnostic {
 
 function Invoke-DirectUninstall {
     $result = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('service', 'uninstall')) -Description 'ServiceUninstall'
+    Write-DirectCliResultShapeDiagnostic -Result $result -Stage 'ServiceUninstall'
     if ($result.ExitCode -ne 0) {
         throw "direct service uninstall failed with exit code $($result.ExitCode): $($result.Stderr.Trim())"
     }
@@ -875,6 +887,7 @@ function Invoke-DirectUninstall {
 
 function Get-DirectStatus {
     $result = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('--json', 'status')) -Description 'StatusHealthCheck'
+    Write-DirectCliResultShapeDiagnostic -Result $result -Stage 'StatusHealthCheck'
     if ($result.ExitCode -ne 0) { return $null }
     try {
         $status = $result.Stdout | ConvertFrom-Json
@@ -926,6 +939,7 @@ try {
     Assert-True ($install.ExitCode -eq 0) "direct service install failed: $($install.Stderr.Trim())"
 
     $duplicate = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('service', 'install')) -Description 'DuplicateServiceInstall'
+    Write-DirectCliResultShapeDiagnostic -Result $duplicate -Stage 'DuplicateServiceInstall'
     Assert-True ($duplicate.ExitCode -eq 1) "already-installed contract returned exit code $($duplicate.ExitCode)"
     Assert-True ($duplicate.Stderr.Contains('already installed')) 'already-installed contract did not report an actionable error'
 
@@ -963,12 +977,14 @@ try {
         @('snipeit.checkin_status_id', '2')
     )) {
         $result = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('config', 'set', $update[0], $update[1])) -Description "SetConfig-$($update[0])"
+        Write-DirectCliResultShapeDiagnostic -Result $result -Stage 'ConfigSet'
         Assert-True ($result.ExitCode -eq 0) "configuration update $($update[0]) failed"
         Assert-NoSentinelInText -Text $result.Stdout -Sentinel $tokenSentinel -Description "configuration update $($update[0]) stdout"
         Assert-NoSentinelInText -Text $result.Stderr -Sentinel $tokenSentinel -Description "configuration update $($update[0]) stderr"
     }
 
     $tokenResult = Invoke-TokenCli -Arguments (@(Get-CommonCliArgument) + @('config', 'set-token')) -Token $tokenSentinel -Description 'SetToken'
+    Write-DirectCliResultShapeDiagnostic -Result $tokenResult -Stage 'SetToken'
     Assert-True ($tokenResult.ExitCode -eq 0) 'token submission failed'
     Assert-NoSentinelInText -Text $tokenResult.Stdout -Sentinel $tokenSentinel -Description 'token submission stdout'
     Assert-NoSentinelInText -Text $tokenResult.Stderr -Sentinel $tokenSentinel -Description 'token submission stderr'
@@ -984,6 +1000,7 @@ try {
     } | Out-Null
 
     $sync = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('sync')) -Description 'TriggerSync'
+    Write-DirectCliResultShapeDiagnostic -Result $sync -Stage 'TriggerSync'
     Assert-True ($sync.ExitCode -eq 0) 'explicit sync trigger failed'
     Assert-NoSentinelInText -Text $sync.Stdout -Sentinel $tokenSentinel -Description 'sync stdout'
     Assert-NoSentinelInText -Text $sync.Stderr -Sentinel $tokenSentinel -Description 'sync stderr'
@@ -1051,6 +1068,7 @@ try {
     Wait-ServiceRemoved -Name $serviceName -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
 
     $missing = Invoke-DirectCli -Arguments (@(Get-CommonCliArgument) + @('service', 'uninstall')) -Description 'MissingServiceUninstall'
+    Write-DirectCliResultShapeDiagnostic -Result $missing -Stage 'MissingServiceUninstall'
     Assert-True ($missing.ExitCode -eq 1) "missing-service contract returned exit code $($missing.ExitCode)"
     Assert-True ($missing.Stderr.Contains('not installed')) 'missing-service contract did not report an actionable error'
 } catch {

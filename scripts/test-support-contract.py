@@ -123,6 +123,26 @@ _CREDENTIAL_LAUNCH_PROBE_FORBIDDEN_FIELDS = (
 )
 _CREDENTIAL_LAUNCH_PROBE_UNAVAILABLE = "probe_unavailable"
 _DIRECT_RESULT_SHAPE_FAILURE_SIGNAL = "direct result-shape schema assertion failed"
+_DIRECT_RESULT_SHAPE_STAGES = (
+    "ServiceUninstall",
+    "StatusHealthCheck",
+    "ServiceInstall",
+    "DuplicateServiceInstall",
+    "ConfigSet",
+    "SetToken",
+    "TriggerSync",
+    "MissingServiceUninstall",
+)
+_DIRECT_RESULT_SHAPE_FILES = (
+    "direct-cli-result-shape-service-uninstall.json",
+    "direct-cli-result-shape-status-health-check.json",
+    "direct-cli-result-shape-service-install.json",
+    "direct-cli-result-shape-duplicate-service-install.json",
+    "direct-cli-result-shape-config-set.json",
+    "direct-cli-result-shape-set-token.json",
+    "direct-cli-result-shape-trigger-sync.json",
+    "direct-cli-result-shape-missing-service-uninstall.json",
+)
 
 _CREDENTIAL_LAUNCH_PROBE_STAGES = (
     "not_started",
@@ -226,7 +246,7 @@ def test_direct_scm_result_shape_diagnostic_precedes_first_exit_code_consumer() 
         "$Result.Description",
         "$Result.ExitCode",
         "Arguments",
-        "Token",
+        "$Token",
     ):
         assert forbidden not in diagnostic
 
@@ -237,6 +257,56 @@ def test_direct_scm_result_shape_diagnostic_precedes_first_exit_code_consumer() 
     )
     exit_code_consumer = source.index("$install.ExitCode", lifecycle_start)
     assert diagnostic_call < exit_code_consumer
+
+
+def test_direct_scm_result_shape_diagnostic_covers_every_exit_code_consumer() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+    helper = _powershell_function(source, "Write-DirectCliResultShapeDiagnostic")
+    stage_match = re.search(
+        r"\[ValidateSet\((?P<stages>'(?:[^']|'')+'(?:\s*,\s*'(?:[^']|'')+')*)\)\]\[string\]\$Stage",
+        helper,
+    )
+    assert stage_match is not None
+    assert tuple(re.findall(r"'([^']+)'", stage_match.group("stages"))) == _DIRECT_RESULT_SHAPE_STAGES
+    for filename in _DIRECT_RESULT_SHAPE_FILES:
+        assert f"'{filename}'" in helper
+    assert helper.count("direct-cli-result-shape-") == len(_DIRECT_RESULT_SHAPE_FILES)
+    assert "Join-Path $LogDirectory $Stage" not in helper
+    assert "direct-cli-result-shape.json" not in helper
+
+    consumer_specs = (
+        ("Invoke-DirectUninstall", "$result = Invoke-DirectCli", "$result.ExitCode", "ServiceUninstall"),
+        ("Get-DirectStatus", "$result = Invoke-DirectCli", "$result.ExitCode", "StatusHealthCheck"),
+        ("lifecycle", "$install = Invoke-DirectCli", "$install.ExitCode", "ServiceInstall"),
+        ("lifecycle", "$duplicate = Invoke-DirectCli", "$duplicate.ExitCode", "DuplicateServiceInstall"),
+        ("lifecycle", "$result = Invoke-DirectCli", "$result.ExitCode", "ConfigSet"),
+        ("lifecycle", "$tokenResult = Invoke-TokenCli", "$tokenResult.ExitCode", "SetToken"),
+        ("lifecycle", "$sync = Invoke-DirectCli", "$sync.ExitCode", "TriggerSync"),
+        ("lifecycle", "$missing = Invoke-DirectCli", "$missing.ExitCode", "MissingServiceUninstall"),
+    )
+    lifecycle_start = source.index("$identity =")
+    calls = []
+    for owner, assignment, consumer, stage in consumer_specs:
+        owner_start = lifecycle_start if owner == "lifecycle" else source.index(f"function {owner}")
+        assignment_position = source.index(assignment, owner_start)
+        diagnostic_call = source.index(
+            f"Write-DirectCliResultShapeDiagnostic -Result ${assignment.split('$')[1].split()[0]} -Stage '{stage}'",
+            assignment_position,
+        )
+        consumer_position = source.index(consumer, assignment_position)
+        between = source[diagnostic_call:consumer_position]
+        assert assignment_position < diagnostic_call < consumer_position, (
+            f"{stage} diagnostic must immediately precede its first ExitCode consumer"
+        )
+        assert between.count("\n") == 1, f"{stage} diagnostic is not immediately before its consumer"
+        calls.append(stage)
+    assert tuple(calls) == _DIRECT_RESULT_SHAPE_STAGES
+
+    workflow = (ROOT.parent.parent / ".github" / "workflows" / "elevated-windows.yml").read_text(
+        encoding="utf-8"
+    )
+    assert "-LogDirectory (Join-Path $env:RUNNER_TEMP 'snipespotter-msi-logs')" in workflow
+    assert "path: ${{ runner.temp }}/snipespotter-msi-logs/*" in workflow
 
 
 def _direct_result_shape_fixture(helper: str) -> str:
@@ -277,7 +347,21 @@ function Assert-Shape {{
 }}
 
 function Read-Diagnostic {{
-    $path = Join-Path $LogDirectory 'direct-cli-result-shape.json'
+    param([Parameter(Mandatory = $true)][ValidateSet(
+        'ServiceUninstall', 'StatusHealthCheck', 'ServiceInstall', 'DuplicateServiceInstall',
+        'ConfigSet', 'SetToken', 'TriggerSync', 'MissingServiceUninstall'
+    )][string]$Stage)
+    $paths = @{{
+        ServiceUninstall = 'direct-cli-result-shape-service-uninstall.json'
+        StatusHealthCheck = 'direct-cli-result-shape-status-health-check.json'
+        ServiceInstall = 'direct-cli-result-shape-service-install.json'
+        DuplicateServiceInstall = 'direct-cli-result-shape-duplicate-service-install.json'
+        ConfigSet = 'direct-cli-result-shape-config-set.json'
+        SetToken = 'direct-cli-result-shape-set-token.json'
+        TriggerSync = 'direct-cli-result-shape-trigger-sync.json'
+        MissingServiceUninstall = 'direct-cli-result-shape-missing-service-uninstall.json'
+    }}
+    $path = Join-Path $LogDirectory $paths[$Stage]
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {{ throw $schemaFailureSignal }}
     $text = [IO.File]::ReadAllText($path)
     if ($text.Contains($sentinel, [StringComparison]::Ordinal)) {{ throw $schemaFailureSignal }}
@@ -304,13 +388,13 @@ $scalar = [pscustomobject][ordered]@{{
     Exception = [Exception]::new($sentinel)
 }}
 
-Write-DirectCliResultShapeDiagnostic -Result $null -Stage 'NullResult'
-$nullDiagnostic = Read-Diagnostic
+Write-DirectCliResultShapeDiagnostic -Result $null -Stage 'ServiceUninstall'
+$nullDiagnostic = Read-Diagnostic -Stage 'ServiceUninstall'
 Assert-Shape -Json $nullDiagnostic.Json -ExpectedKeys $baseKeys -ExpectedCount 0 -ExpectedArray $false
 if ([int][Text.Encoding]::UTF8.GetByteCount($nullDiagnostic.Text) -gt 32768) {{ throw $schemaFailureSignal }}
 
-Write-DirectCliResultShapeDiagnostic -Result $scalar -Stage 'ScalarResult'
-$scalarDiagnostic = Read-Diagnostic
+Write-DirectCliResultShapeDiagnostic -Result $scalar -Stage 'StatusHealthCheck'
+$scalarDiagnostic = Read-Diagnostic -Stage 'StatusHealthCheck'
 Assert-Shape -Json $scalarDiagnostic.Json -ExpectedKeys ($baseKeys + $recordKeys) -ExpectedCount 1 -ExpectedArray $false
 if ($scalarDiagnostic.Json.record_0_has_exit_code -ne $true -or
     $scalarDiagnostic.Json.record_0_has_stdout -ne $true -or
@@ -332,8 +416,8 @@ $arrayResult = @(
 $arrayKeys = @($baseKeys + $recordKeys + @(
     'record_1_has_exit_code', 'record_1_has_stdout', 'record_1_has_stderr', 'record_1_has_description'
 ))
-Write-DirectCliResultShapeDiagnostic -Result $arrayResult -Stage 'ArrayResult'
-$arrayDiagnostic = Read-Diagnostic
+Write-DirectCliResultShapeDiagnostic -Result $arrayResult -Stage 'ConfigSet'
+$arrayDiagnostic = Read-Diagnostic -Stage 'ConfigSet'
 Assert-Shape -Json $arrayDiagnostic.Json -ExpectedKeys $arrayKeys -ExpectedCount 2 -ExpectedArray $true
 
 $oversizedResult = @()
@@ -347,8 +431,8 @@ for ($index = 0; $index -lt 4; $index++) {{
         "record_$($index)_has_description"
     )
 }}
-Write-DirectCliResultShapeDiagnostic -Result $oversizedResult -Stage 'OversizedResult'
-$oversizedDiagnostic = Read-Diagnostic
+Write-DirectCliResultShapeDiagnostic -Result $oversizedResult -Stage 'MissingServiceUninstall'
+$oversizedDiagnostic = Read-Diagnostic -Stage 'MissingServiceUninstall'
 Assert-Shape -Json $oversizedDiagnostic.Json -ExpectedKeys $oversizedKeys -ExpectedCount 32 -ExpectedArray $true
 if ([int][Text.Encoding]::UTF8.GetByteCount($oversizedDiagnostic.Text) -gt 32768) {{
     throw $schemaFailureSignal
@@ -417,7 +501,7 @@ def test_direct_scm_result_shape_diagnostic_rejects_privacy_mutations() -> None:
         str(ROOT / "Diagnostics.psm1"),
         str(Path(tempfile.gettempdir())),
         "direct-result-shape-",
-        "direct-cli-result-shape.json",
+        *(_DIRECT_RESULT_SHAPE_FILES),
         "-Result",
         "-Stage",
         "Result",
@@ -461,9 +545,9 @@ def test_direct_scm_result_shape_diagnostic_rejects_privacy_mutations() -> None:
         (
             "extra key",
             helper.replace(
-                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
-                "    $values['extra'] = 'extra-sensitive-value'\n"
-                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                "        $diagnosticPath = Join-Path $LogDirectory $diagnosticFile\n",
+                "        $values['extra'] = 'extra-sensitive-value'\n"
+                "        $diagnosticPath = Join-Path $LogDirectory $diagnosticFile\n",
                 1,
             ),
             ("extra", "extra-sensitive-value"),
@@ -492,9 +576,9 @@ def test_direct_scm_result_shape_diagnostic_rejects_privacy_mutations() -> None:
         (
             "exception value",
             helper.replace(
-                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
-                "    $values['exception'] = [Exception]::new('exception-sensitive-value')\n"
-                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                "        $diagnosticPath = Join-Path $LogDirectory $diagnosticFile\n",
+                "        $values['exception'] = [Exception]::new('exception-sensitive-value')\n"
+                "        $diagnosticPath = Join-Path $LogDirectory $diagnosticFile\n",
                 1,
             ),
             ("exception", "exception-sensitive-value", "System.Exception"),
@@ -502,9 +586,9 @@ def test_direct_scm_result_shape_diagnostic_rejects_privacy_mutations() -> None:
         (
             "arbitrary property name",
             helper.replace(
-                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
-                "    $values['arbitrary.property'] = 'arbitrary-sensitive-value'\n"
-                "    $diagnosticPath = Join-Path $LogDirectory 'direct-cli-result-shape.json'\n",
+                "        $diagnosticPath = Join-Path $LogDirectory $diagnosticFile\n",
+                "        $values['arbitrary.property'] = 'arbitrary-sensitive-value'\n"
+                "        $diagnosticPath = Join-Path $LogDirectory $diagnosticFile\n",
                 1,
             ),
             ("arbitrary.property", "arbitrary-sensitive-value"),
@@ -4348,6 +4432,7 @@ def main() -> None:
     test_snipeit_loopback_fixture_is_private_and_evidence_only()
     test_direct_scm_exercises_installed_cli_to_service_sync_flow()
     test_direct_scm_result_shape_diagnostic_precedes_first_exit_code_consumer()
+    test_direct_scm_result_shape_diagnostic_covers_every_exit_code_consumer()
     test_direct_scm_result_shape_diagnostic_has_exact_bounded_schema()
     test_direct_scm_result_shape_diagnostic_does_not_mask_original_failure()
     test_direct_scm_result_shape_diagnostic_rejects_privacy_mutations()
