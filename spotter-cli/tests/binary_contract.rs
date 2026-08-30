@@ -1,8 +1,4 @@
 #![cfg(windows)]
-#![expect(
-    unsafe_code,
-    reason = "The Windows named-pipe readiness probe calls WaitNamedPipeW directly"
-)]
 
 use std::process::{Command, Output};
 
@@ -119,7 +115,13 @@ fn pipe_is_available(endpoint: &str) -> bool {
     let endpoint = HSTRING::from(endpoint);
     // SAFETY: `endpoint` is a valid nul-terminated Windows string owned by `HSTRING`; a zero
     // timeout only probes the current pipe state and never blocks this readiness poll.
-    unsafe { WaitNamedPipeW(&endpoint, 0).as_bool() }
+    #[expect(
+        unsafe_code,
+        reason = "The Windows named-pipe readiness probe calls WaitNamedPipeW directly"
+    )]
+    unsafe {
+        WaitNamedPipeW(&endpoint, 0).as_bool()
+    }
 }
 
 #[cfg(all(windows, feature = "test-support"))]
