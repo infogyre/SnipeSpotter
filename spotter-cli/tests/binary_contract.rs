@@ -265,7 +265,10 @@ async fn connected_nonresponsive_service_times_out_as_generic_error() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert_eq!(output.stderr, b"error: service request timed out\n");
+    assert_eq!(
+        output.stderr,
+        b"error: service request timed out: timed out waiting on channel\n"
+    );
     release_guard.release();
     server.shutdown().await;
 }
