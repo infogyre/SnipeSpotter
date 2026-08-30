@@ -31,9 +31,11 @@ Double-click the MSI in Explorer and follow the wizard. Administrator elevation 
    - Logon account: `LocalSystem` (runtime principal: `NT AUTHORITY\SYSTEM`)
 4. Adds `%ProgramFiles%\infogyre\SnipeSpotter\bin\` to the system `PATH` environment variable.
 5. Creates `%ProgramData%\infogyre\SnipeSpotter\` with a blank `settings.toml` template.
-6. Applies a protected ACL contract to the ProgramData tree. Directories receive explicit self FullControl plus inherit-only ContainerInherit/ObjectInherit GenericAll rules for `SYSTEM` and built-in `Administrators`; files receive only explicit self FullControl rules for those SIDs. Inherited or unauthorized Allow ACEs are rejected, while Deny ACEs remain preserved.
+6. Applies the initial protected ACL contract to the ProgramData tree. Directories receive explicit self FullControl plus inherit-only ContainerInherit/ObjectInherit GenericAll rules for `SYSTEM` and built-in `Administrators`; files receive only explicit self FullControl rules for those SIDs. Inherited or unauthorized Allow ACEs are rejected, while Deny ACEs remain preserved.
 
-The service is registered but not started during installation. When started, it remains `Running` while unconfigured and serves the administrator-only named pipe so the CLI can complete configuration; an unconfigured state is not a service-health failure. It will start on the next boot, or you can start it manually after installation.
+The installer creates the initial tree, but runtime startup is the security boundary: the service reapplies the protected contract to the root and existing runtime artifacts, and the atomic writer applies it to temporary files and reapplies it to each replaced destination. A standard user is not an allowed principal for the root, settings, state, HMAC key, journal, or logs.
+
+The service is registered but not started during installation. When started, it remains `Running` while unconfigured and serves the administrator-only named pipe so the CLI can complete configuration; `Unconfigured` is an operating state, not a service-health failure. It will start on the next boot, or you can start it manually after installation.
 
 ### Major upgrade
 
@@ -192,9 +194,21 @@ Forces check-in of monitors regardless of check-in policy. `--all` checks in all
 
 ### service install / uninstall
 
-Ordinary production `spotter-cli service install` and `service uninstall` use the fixed `SnipeSpotter` SCM and runtime identity, so they can target the same service registered by the MSI. `service install` creates that service with AutoStart, own-process type, the production service executable, the `LocalSystem` account, and the documented description. If the service is already installed, the command returns an actionable `already installed` error without mutating it; SCM’s marked-for-deletion state is also reported as a failure. `service uninstall` returns an actionable `not installed` error when the service is missing, waits up to 90 seconds for `Stopped` after requesting a stop, requests deletion, then waits up to another 90 seconds for SCM disappearance. A pending stop, pending deletion, or either timeout is a failure, not an accepted early result.
+Ordinary production `spotter-cli service install` and `service uninstall` use the fixed `SnipeSpotter` SCM and runtime identity, so they can target the same service registered by the MSI. `service install` creates an AutoStart, own-process service using the production executable, the `LocalSystem` account, and the documented description. It does not start the service.
 
-Only the elevated feature-gated test-support lane supplies hidden identity overrides. It generates `SnipeSpotterDirect-$RunIdentity` with matching unique pipe, mutex, data-root, and test executable values so lifecycle tests do not collide with the MSI’s `SnipeSpotter` service. The duplicate, missing, stop, delete, and wait contracts above apply to that generated test identity when the lane invokes the same commands.
+The command contracts are:
+
+| Situation | Result |
+|---|---|
+| `install`, service absent | Registers the service and returns success. |
+| `install`, service already registered | Returns exit code 1 with `service ... is already installed`; it does not mutate the existing registration. |
+| `install`, SCM reports marked for deletion | Returns exit code 1 with a marked-for-deletion error; it does not proceed. |
+| `uninstall`, service absent | Returns exit code 1 with `service ... is not installed`. |
+| `uninstall`, service running | Requests stop, waits up to 90 seconds for `Stopped`, requests deletion, then waits up to another 90 seconds for SCM disappearance. |
+| `uninstall`, service already stopped | Requests deletion, then waits up to 90 seconds for SCM disappearance. |
+| stop/delete wait times out or remains pending | Returns an error; an early return is not success. |
+
+Only the elevated feature-gated test-support lane supplies hidden identity overrides. It generates `SnipeSpotterDirect-$RunIdentity` with matching unique pipe, mutex, data root, and test executable values, so lifecycle tests do not collide with the MSI’s `SnipeSpotter` service. The same duplicate, missing, stop, delete, and wait contracts apply to that generated test identity when the lane invokes the real CLI.
 
 ```powershell
 spotter-cli service install
@@ -249,8 +263,10 @@ If the service logs an HMAC verification failure:
 
 1. Stop the service: `sc stop SnipeSpotter`.
 2. Preserve `state.toml`, the journal directory, and logs for diagnosis.
-3. Do not delete a pending journal blindly. Recovery reconciles remote assignment before retrying uncertain operations.
+3. Do not delete a pending journal blindly. Recovery processes pending prepared and observed operations in durable prepared order, reconciles remote assignment, and keeps evidence until signed state is saved and the operation is committed.
 4. If the state is unrecoverable, you may delete `state.toml` and `state-hmac-key.bin` to reset state. The next sync will rebuild monitor state from Snipe-IT.
+
+Settings, state, keys, and journal compaction use same-directory replacement. The writer guarantees complete old-or-new destination content across the tested process-interruption points; it does not guarantee survival across physical power loss. It is a single-writer design. A failed write cleans up only its own temporary file, while startup cleanup removes stale temporary files only when the PID/nonce sidecar matches, the owner is dead, and the age threshold has elapsed. Leave files with missing or malformed metadata, a live/current owner, or insufficient age in place for diagnosis.
 
 ### After machine reinstallation
 
@@ -262,16 +278,16 @@ DPAPI ciphertext is bound to the machine. After an OS reinstall:
 
 ## Hosted hardware experiment
 
-This Phase 0 diagnostic scaffold is separate from SnipeSpotter installation, synchronization, and MSI lifecycle validation. Its contract and validator can be checked on non-Windows systems, but collection, LocalSystem execution, protected approval, and artifact upload run only on GitHub-hosted Windows runners. It does not need a Snipe-IT URL, API token, administrator credential, or physical device.
+This privacy-safe diagnostic experiment is separate from SnipeSpotter installation, synchronization, and MSI lifecycle validation. Its schema and validator can be checked on non-Windows systems, but collection, LocalSystem execution, protected approval, and artifact upload run only on GitHub-hosted Windows runners. It does not need a Snipe-IT URL, API token, administrator credential, or physical device.
 
-An authorized operator may dispatch `.github/workflows/hardware-experiment.yml` with the exact `operator_acknowledgement=APPROVE` input. The workflow then runs the bounded matrix and pauses at the protected environment job named `awaiting_operator_hardware_approval` before any observation can be promoted; that protected environment is a post-observation evidence checkpoint, not pre-run authorization:
+An authorized operator may dispatch `.github/workflows/hardware-experiment.yml` with the exact `operator_acknowledgement=APPROVE` input. The workflow then runs the bounded matrix and pauses at the protected environment job named `awaiting_operator_hardware_approval`. Approving that environment only lets the post-observation checkpoint job complete; the workflow promotes nothing:
 
 1. Set `operator_acknowledgement` to the exact value `APPROVE` when dispatching.
 2. Use the default `images=windows-2022,windows-latest`; add `windows-2025` only when that optional hosted label is explicitly approved.
 3. Keep `repetitions=3`; the preparation job rejects other values and reports optional images that were not selected.
 4. Review both direct-admin and LocalSystem reports for each of the three repetitions per selected image.
 5. Download reports only for the approved diagnostic question; artifacts expire after seven days.
-6. Do not promote runner-specific gates, persistent fixtures, or a physical matrix from the observations without a separate explicit operator approval after reviewing the checkpoint report.
+6. Any runner-specific gate, persistent fixture, or physical matrix requires a separate operator-approved and reviewed repository change after the checkpoint report is reviewed.
 
 The collector records the requested image label and alias, exact bounded runner/build metadata, process bitness, caller class, the numeric Windows process session ID captured in each context, classified API outcomes/durations, bounded SMBIOS lengths/type histograms, WMI counts/array lengths/placeholder classes, chassis class counts, and short HMAC fragments. It never records raw serials, asset tags, monitor strings, firmware/EDID, environment values, tokens, or exception text. One protected per-image/repetition HMAC key is shared by the direct and LocalSystem contexts, never uploaded, and removed by failure-safe cleanup. The validator runs before upload and emits only generic pass/fail output.
 

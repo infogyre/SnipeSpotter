@@ -18,7 +18,14 @@ SnipeSpotter uses a reusable-workflow pattern with path gating to keep CI fast.
 
 ### Path gating
 
-`ci.yml` uses `dorny/paths-filter` to detect changes in the `run_checks` and `run_elevated` path sets. Only relevant paths trigger each reusable workflow. When elevated paths are not relevant, `elevated-skip` emits an explicit successful result and `ci-success` consumes it; relevant paths require the reusable elevated workflow result. A `force_all` input bypasses gating for manual runs.
+`ci.yml` uses `dorny/paths-filter` to detect changes in the `run_checks` and `run_elevated` path sets. The ordinary checks set is:
+
+- `Cargo.toml`, `Cargo.lock`, and `deny.toml`;
+- `.github/workflows/**`;
+- `spotter-*/**`;
+- `scripts/**`.
+
+The elevated set is narrower where possible but includes every installed-system input: `spotter-svc/**`, `spotter-cli/**`, `spotter-win32/**`, `spotter-build/**`, `installer/**`, `scripts/test-msi-lifecycle.ps1`, `scripts/test-direct-scm-lifecycle.ps1`, `scripts/TestSupport/**`, the Cargo manifests/lockfile, and workflow files. A relevant change runs the reusable workflow. When no elevated path is relevant, `elevated-skip` emits an explicit successful skip and `ci-success` consumes that result; a relevant path must produce both a successful reusable job and `lifecycle_result=success`. `force_all` bypasses gating for manual runs.
 
 ### Jobs
 
@@ -39,11 +46,15 @@ Linux only builds and tests `spotter-core` (the cross-platform crate). Windows-o
 
 | Step | Command | Gate |
 |---|---|---|
-| Workspace tests, including `hosted_hardware` integration tests | `cargo test --workspace --all-targets` | Tests |
+| Workspace tests | `cargo test --workspace --all-targets` | Tests |
+| Production-owner integration tests | `cargo test -p spotter-svc --all-targets --features test-support --locked` | Owner/FSM coverage |
+| Actual CLI binary contracts | `cargo test -p spotter-cli --test binary_contract --features test-support --locked` | CLI subprocess coverage |
 | Workspace clippy | `cargo clippy --workspace --all-targets -- -D warnings` | Lint |
+| Hardware experiment host compile | `cargo check -p spotter-hardware-service --features hardware-experiment --locked` | Build contract |
 | PowerShell script lint | `Invoke-ScriptAnalyzer` on all `.ps1` and `.psm1` files | Script quality |
+| Hardware collector contract | `python -m unittest discover -s scripts/hardware -p 'test_*.py' -v` | Privacy/schema contract |
 
-The Windows workspace test command includes the already-required `spotter-svc/tests/hosted_hardware.rs` integration tests. They are part of the Windows check result; the separate manual hardware experiment only collects diagnostic observations and does not create another CI gate.
+`cargo test --workspace --all-targets` includes the Windows-gated `spotter-svc/tests/hosted_hardware.rs` integration tests. Live transport coverage in `spotter-cli/tests/named_pipe.rs` starts the secured server on a unique pipe, inspects the live pipe DACL, and exchanges a production client/server message. Actual executable coverage in `spotter-cli/tests/binary_contract.rs` invokes `CARGO_BIN_EXE_spotter-cli` and checks exit status, stdout, and stderr; it is not only a library-dispatch test. The owner, DPAPI, atomic, named-pipe, and CLI-binary tests are ordinary Windows evidence; they do not install an MSI or prove LocalSystem behavior. The manual hardware experiment is separate diagnostic evidence and does not create another CI gate.
 
 #### Package contract (`ubuntu-latest`)
 
@@ -157,9 +168,11 @@ This installs the previous MSI, adds a marker to `settings.toml`, installs the n
 
 ### Elevated coverage and cleanup
 
-The reusable `elevated-windows.yml` lane is invoked for relevant PR paths and by the release workflow after the MSI is built. It uses unique run identities, bounded condition-based waits, sustained service/pipe checks where available, and failure-safe cleanup. A cleanup failure is a failed lifecycle result; it is never silently accepted. The PR caller emits an explicit successful skip when no elevated path is relevant so the aggregate `ci-success` check remains deterministic.
+The reusable `elevated-windows.yml` lane runs on `windows-latest` for relevant pull-request paths and after the MSI is built in `release.yml`. It accepts an artifact/source mode, a unique run identity, and a diagnostics artifact name. The PR caller emits an explicit successful skip when no elevated path is relevant; otherwise `ci-success` requires both the reusable job and its `lifecycle_result` to succeed. The release aggregate depends on the same lifecycle job before publishing.
 
-The direct SCM lane uses `SnipeSpotterDirect-$RunIdentity` for the service, named pipe, mutex, and data root. The identity is deliberately distinct from the MSI service `SnipeSpotter`, and the harness refuses to use a pre-existing test service. `service install` fails with an actionable “already installed” error when the test service exists, and fails with a marked-for-deletion error when SCM reports that state; it does not start the service. `service uninstall` fails with an actionable “not installed” error when the service is missing, waits up to 90 seconds for `Stopped` after requesting a stop, deletes the registration, then waits up to another 90 seconds for SCM disappearance. A pending stop, pending deletion, or either timeout is a failure.
+The MSI segment uses `scripts/test-msi-lifecycle.ps1`. It installs the MSI, checks registration and inventory, verifies the protected ProgramData ACL contract, starts the service, waits for `Running` to remain stable for five seconds, checks the process owner is `NT AUTHORITY\\SYSTEM`, waits for the fixed named pipe, invokes the installed CLI for JSON `Unconfigured` status, checks replacement ACL preservation and standard-user denial, then stops and cleans up. The service is expected to remain healthy while unconfigured; an early stop fails. Failure diagnostics are bounded and cleanup failures fail the lane rather than being silently accepted.
+
+The direct SCM segment uses the test-support CLI and `SnipeSpotterDirect-$RunIdentity` for the service, named pipe, mutex, and data root. It refuses to use a pre-existing test service. It checks the generated registration (own-process executable, AutoStart, LocalSystem, and matching runtime arguments), sustained `Running`, SYSTEM process ownership, named-pipe status, controlled loopback authentication, ciphertext-only settings, runtime ACLs, and standard-user read/write denial. `service install` returns exit code 1 with an actionable `already installed` error when the test service exists, reports SCM marked-for-deletion as an error, and does not start the service. `service uninstall` returns exit code 1 with `not installed` when the service is missing; for a running service it waits up to 90 seconds for `Stopped`, requests deletion, and waits up to another 90 seconds for SCM disappearance. Pending stop, pending deletion, and either timeout fail the lane. Unique service, process, pipe, temporary data, user, endpoint, and diagnostic files are removed in failure-safe cleanup.
 
 ### Hosted hardware experiment
 
@@ -192,7 +205,7 @@ The hosted experiment is intentionally separate from the raw fixture scripts abo
 3. The job named `awaiting_operator_hardware_approval` runs after the Windows matrix and pauses at the protected environment. Its gate checks matrix/privacy success and rejects acknowledgements other than the exact word `APPROVE`; it is a post-observation evidence checkpoint, not pre-run authorization, physical-hardware validation, or an automatic hardware/release gate.
 4. `windows-2022` and `windows-latest` are required. The preparation job reports optional `windows-2025` as skipped when it is not requested; an unknown image label is rejected rather than replacing either required image.
 
-The generated matrix runs three repetitions per selected image. Each image/repetition cell collects both direct-admin and LocalSystem reports with one shared protected HMAC key, derives the session ID inside each process context, validates both locally, and uploads only the redacted JSON reports with seven-day retention. The matrix has no package, release, publish, promotion, deployment, Snipe-IT, or physical-hardware step. A failing validator prevents upload; cleanup removes the key, service host files, and reports and fails if cleanup cannot complete.
+The generated matrix runs three repetitions per selected image. Each image/repetition cell collects both direct-admin and LocalSystem reports with one shared protected HMAC key, derives the session ID inside each process context, validates both locally, and uploads only the redacted JSON reports with seven-day retention. The matrix has no package, release, publish, promotion, deployment, Snipe-IT, or physical-hardware step. A failing validator prevents upload; cleanup removes the key, service host files, and reports and fails if cleanup cannot complete. The reports are evidence about hosted virtual runner images only, not physical hardware. No runner-specific assertion, fixture, release gate, or physical matrix may be promoted without explicit operator approval after the checkpoint.
 
 ### Privacy gates
 

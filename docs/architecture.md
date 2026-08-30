@@ -68,14 +68,38 @@ Implements the Gather -- Process -- Persist cycle:
 - **Sync engine** (`sync_engine.rs`): Orchestrates gather (discover hardware, find assets by serial, resolve taxonomy, load prior state) -- process (`plan_sync()`) -- persist (journal each operation, reconcile before execution, mark confirmed, persist state delta).
 - **IPC server** (`ipc_server.rs`): Named-pipe server with JSON-over-newline protocol. Transport handlers validate framing and enqueue `FsmCommand` values to the FSM. Each request carries a one-shot response sender for committed results.
 - **Config I/O** (`config_io.rs`): Uses the shared same-directory replacement writer. On Windows, an existing destination is replaced with `ReplaceFileW`; a first create uses `MoveFileExW` with replace-existing and write-through flags. The temporary file is flushed before replacement, its protected ACL is applied before writing and reapplied to the destination after replacement, and a parent-directory flush is attempted on a best-effort basis. Synchronous errors remove the temporary file and owner metadata; successful writes remove owner metadata synchronously.
-- **State I/O** (`state_io.rs`): HMAC-signed state uses the same replacement contract. The process-level guarantee is old-or-new: readers observe either the complete prior file or the complete replacement, never a partially written destination. Temporary names carry the owning PID and nonce, and the matching owner sidecar records the same `PID:nonce` pair. Recovery verifies that owner, checks the owner is dead, and requires a conservative age threshold; malformed, unowned, current-process, live-owner, or too-new files remain untouched. This excludes arbitrary power-loss guarantees and does not define multi-writer coordination semantics.
-- **Operation journal** (`operation_journal.rs`): Append-only, fsynced journal of `Prepared` → `RemoteOutcomeObserved` → `StateCommitted` records with deterministic IDs. Recovery loads signed state plus pending evidence, reconciles only operations without an observed outcome, applies validated candidate-state evidence, and compacts only after the signed state commit.
+- **State I/O** (`state_io.rs`): HMAC-signed state uses the same replacement contract. The process-level guarantee is old-or-new: readers observe either the complete prior file or the complete replacement, never a partially written destination. Temporary names carry the owning PID and nonce, and the matching owner sidecar records the same `PID:nonce` pair. Recovery verifies that owner, checks the owner is dead, and requires a conservative age threshold; malformed, unowned, current-process, live-owner, or too-new files remain untouched. This is process-interruption evidence, not a physical power-loss guarantee, and the writer does not define concurrent multi-writer coordination.
+- **Operation journal** (`operation_journal.rs`): Append-only, fsynced journal of `Prepared` → `RemoteOutcomeObserved` → `StateCommitted` records with deterministic IDs. Recovery loads signed state plus pending evidence, reconciles both prepared and observed operations, applies validated candidate-state evidence, and compacts only after the signed state commit.
 - **Logging** (`logging.rs`): `tracing-subscriber` with `tracing-appender` rolling file appender. Daily rotation, configurable level and retention.
 - **Service registration** (`service.rs`): `windows-service` crate for SCM integration. Service name: `SnipeSpotter`, account: `LocalSystem`, start type: automatic.
 
 ### spotter-cli (CLI)
 
 `clap` derive with nested subcommands. Depends on injectable `IpcTransport`, `ServiceRegistrar`, `ElevationChecker`, and `TokenReader` ports. Unit tests use fakes; production adapters perform named-pipe, SCM, console, and elevation I/O.
+
+## Owner seams and evidence layers
+
+`CommandOwner::handle` is the production orchestration subject. Tests replace only its external boundaries; the owner, command handling, and FSM remain real. The constructor keeps these seams narrow:
+
+| Seam | Production boundary | Test boundary |
+|---|---|---|
+| Secret protection | Machine-scope DPAPI through `spotter-win32` | Deterministic secret-protector fake |
+| Settings, state, and journal stores | `%ProgramData%` files, signed state, and the atomic writer | In-memory or temporary stores with recorded saves |
+| Remote reads and mutations | One authenticated `SnipeItClient` | Scripted remote port and factory |
+| Hardware discovery | Windows SMBIOS/WMI discovery | Fixed or failing discovery port |
+| Time, paths, and runtime identity | Product constants and the service runtime options | Fixed clock plus unique temporary roots, pipes, mutexes, and service names |
+
+The fake ports stop at I/O boundaries. They do not replace planning, candidate-state validation, journal ordering, command serialization, or commit-before-response behavior.
+
+Evidence has explicit limits:
+
+| Evidence layer | What the repository exercises | What it does not establish |
+|---|---|---|
+| Functional core | Cross-platform configuration, parser, planner, IPC, and signed-state behavior in `spotter-core` tests | Windows APIs, SCM, named-pipe security, or an installed service |
+| Ordinary Windows | Real owner/FSM tests, DPAPI/config tests, atomic fault and interruption tests, a live secured named pipe, and actual `spotter-cli.exe` subprocess contracts | Installed MSI lifecycle, LocalSystem execution, or a standard-user ACL probe |
+| Elevated installed system | The reusable MSI and direct-SCM lanes: sustained service health, process owner, installed CLI IPC, controlled loopback token use, ACL checks, and cleanup | Physical hardware behavior or protection against physical power loss |
+| Hosted virtual diagnostic | Redacted capability and shape observations across selected GitHub-hosted images and direct-admin/LocalSystem contexts | Physical hardware, vendor fidelity, or release promotion |
+| Physical qualification | No physical/self-hosted qualification lane is defined here | Any physical-hardware guarantee |
 
 ## Service lifecycle (FSM)
 
@@ -136,7 +160,15 @@ Operation recovery:
 - Before execution, the engine reconciles the current server assignment/status. If the desired state is already applied, it treats that as success.
 - After each confirmed or reconciled response, the engine durably appends `RemoteOutcomeObserved` with a validated complete candidate signed-state snapshot. The candidate includes the exact matched-asset and monitor state reached by that operation, including authoritative PATCH metadata.
 - The owner persists the candidate signed state before appending `StateCommitted`; only then may it compact the journal. A failed state save or journal commit leaves the prior active state or recoverable evidence intact.
-- On restart, recovery processes pending records in durable `Prepared` order, reconciles both prepared and observed operations against Snipe-IT, applies validated candidate snapshots or operation-specific legacy deltas to the loaded signed state, persists the result, appends `StateCommitted`, and compacts atomically.
+- On restart, recovery processes pending records in durable `Prepared` order. It reconciles both prepared and observed operations against Snipe-IT, applies validated candidate snapshots or operation-specific legacy deltas to the loaded signed state, persists the result, appends `StateCommitted`, and compacts atomically.
+
+### Atomic replacement contract
+
+Settings, signed state, HMAC keys, and journal compaction use the same-directory atomic writer. It writes the complete bytes to a uniquely named temporary file, flushes that file, applies the protected data ACL, and then replaces the destination. Existing Windows files use `ReplaceFileW`; first creation uses `MoveFileExW` with write-through flags. The destination ACL is reapplied after replacement, and a parent-directory flush is attempted afterward.
+
+The tested process-level guarantee is old-or-new. Faults before replacement leave the complete old destination; faults after replacement, including a directory-flush failure, leave a complete old or new destination, and the interruption helper verifies complete content when terminated at barriers immediately before and after replacement. A failed call removes only its own temporary file and owner sidecar. This does not claim survival across physical power loss, and the writer provides no multi-process or multi-writer consistency guarantee.
+
+Startup stale-file recovery is intentionally conservative. Temporary names carry `PID:nonce` identity and an owner sidecar. Recovery removes a temporary only when the sidecar matches, the owning process is dead, the current process does not own it, and the file is older than the configured threshold. Missing or malformed metadata, live owners, current-process files, and too-new files stay in place. The service currently uses a 300-second age threshold.
 
 ## Security boundaries
 

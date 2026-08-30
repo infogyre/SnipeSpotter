@@ -1,6 +1,6 @@
 # Hosted Windows hardware-visibility experiment
 
-This experiment is a Phase 0 privacy-safe observation scaffold, not a hardware qualification gate. When dispatched on GitHub-hosted Windows, its generated matrix compares bounded capability and shape information from the required `windows-2022` and `windows-latest` labels (and explicitly selected optional labels) in direct-admin and temporary LocalSystem contexts, with three repetitions per selected image.
+This experiment is a privacy-safe hosted-runner observation, not a hardware qualification gate. When dispatched on GitHub-hosted Windows, its generated matrix compares bounded capability and shape information from the required `windows-2022` and `windows-latest` labels (and explicitly selected optional labels) in direct-admin and temporary LocalSystem contexts, with three repetitions per selected image. Hosted virtual evidence is not proof of physical hardware behavior. Approval of the named checkpoint only lets that post-observation job complete; it promotes nothing.
 
 ## Data policy
 
@@ -20,6 +20,6 @@ The workflow generates one random 32-byte HMAC key per image/repetition cell, ho
 
 ## Approval checkpoint
 
-The workflow records the named `awaiting_operator_hardware_approval` checkpoint after the matrix completes. Until an operator explicitly approves a follow-up, observations must not be promoted into permanent PR assertions, long-lived sanitized fixtures, or a physical/self-hosted hardware matrix.
+The workflow records the named `awaiting_operator_hardware_approval` checkpoint after the matrix completes. Approving the protected environment only lets this checkpoint job complete; the workflow contains no promotion step. Permanent PR assertions, long-lived sanitized fixtures, or a physical/self-hosted hardware matrix require a separate operator-approved and reviewed change.
 
 Even after review, hosted virtual observations cannot prove physical serial fidelity, EDID behavior, hotplug behavior, vendor fidelity, or direct/service equality on physical machines. Those remain separate qualification questions.

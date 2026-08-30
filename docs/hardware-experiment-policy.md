@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This is a Phase 0 diagnostic experiment/scaffold for GitHub-hosted Windows runners. Its workflow and privacy contracts are implemented, but native Windows collection and the protected dispatch checkpoint execute only in GitHub Actions. It is not a product feature, release gate, hardware certification, device inventory process, or physical-device test matrix. It does not promote an artifact, publish a release, mutate Snipe-IT, or replace the existing lifecycle workflow.
+This is a privacy-safe diagnostic experiment for GitHub-hosted Windows runners. Its workflow and privacy contracts are implemented, but native Windows collection and the protected dispatch checkpoint execute only in GitHub Actions. It is not a product feature, release gate, hardware certification, device inventory process, or physical-device test matrix. It does not promote an artifact, publish a release, mutate Snipe-IT, or replace the existing lifecycle workflow.
 
 The only supported entry point is the protected `workflow_dispatch` workflow:
 
@@ -15,7 +15,7 @@ The only supported entry point is the protected `workflow_dispatch` workflow:
 
 ## Collection contract
 
-Each approved matrix cell runs three repetitions and emits one report. The required images are `windows-2022` and `windows-latest`; `windows-2025` is optional and is skipped unless the operator explicitly includes it in `images`. The `images` input drives the generated matrix and unknown labels are rejected. Each selected image/repetition cell runs both the `interactive-admin` and `LocalSystem` contexts.
+The generated matrix contains one cell per selected image and repetition. The required images are `windows-2022` and `windows-latest`; `windows-2025` is optional and is skipped unless the operator explicitly includes it in `images`. The `images` input drives the matrix, unknown labels are rejected, and the workflow requires three repetitions. Each image/repetition cell emits two reports: one from `interactive-admin` and one from `LocalSystem`.
 
 A report may contain only:
 
@@ -45,7 +45,7 @@ Validator failures print only a generic count. They never echo report contents o
 
 ## Artifact and retention rules
 
-Reports are uploaded as one artifact per image/context/repetition with a seven-day maximum retention. Do not download, merge, or publish reports outside the repository's approved experiment review. Delete artifacts early when the experiment is cancelled or the diagnostic question is answered.
+Each image/repetition cell uploads one artifact containing both context reports, with a seven-day maximum retention. Do not download, merge, or publish reports outside the repository's approved experiment review. Delete artifacts early when the experiment is cancelled or the diagnostic question is answered.
 
 No workflow step may:
 
