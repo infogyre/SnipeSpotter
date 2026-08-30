@@ -23,7 +23,8 @@ use windows::{
     core::PWSTR,
 };
 
-const EXPECTED_PIPE_ACL_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+// Windows canonicalizes generic-all from the authored SDDL to file-all on a pipe kernel object.
+const EXPECTED_PIPE_ACL_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
 const SDDL_REVISION_1: u32 = 1;
 
 struct OwnedSecurityDescriptor(PSECURITY_DESCRIPTOR);
