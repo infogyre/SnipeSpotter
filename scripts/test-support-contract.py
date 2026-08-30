@@ -245,10 +245,12 @@ def test_direct_scm_result_shape_diagnostic_precedes_first_exit_code_consumer() 
         "$Result.Stderr",
         "$Result.Description",
         "$Result.ExitCode",
+        "$record.PSObject.Properties.Name",
         "Arguments",
         "$Token",
     ):
         assert forbidden not in diagnostic
+    assert "@($record.PSObject.Properties | ForEach-Object { $_.Name })" in diagnostic
 
     lifecycle_start = source.index("$install = Invoke-DirectCli")
     diagnostic_call = source.index(

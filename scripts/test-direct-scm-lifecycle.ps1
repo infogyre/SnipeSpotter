@@ -863,7 +863,11 @@ function Write-DirectCliResultShapeDiagnostic {
     $recordsToInspect = [Math]::Min($resultCount, $MaxDiagnosticRecords)
     for ($index = 0; $index -lt $recordsToInspect; $index++) {
         $record = $records[$index]
-        $properties = if ($null -eq $record) { @() } else { @($record.PSObject.Properties.Name) }
+        $properties = if ($null -eq $record) {
+            @()
+        } else {
+            @($record.PSObject.Properties | ForEach-Object { $_.Name })
+        }
         $values["record_${index}_has_exit_code"] = $properties -contains 'ExitCode'
         $values["record_${index}_has_stdout"] = $properties -contains 'Stdout'
         $values["record_${index}_has_stderr"] = $properties -contains 'Stderr'
