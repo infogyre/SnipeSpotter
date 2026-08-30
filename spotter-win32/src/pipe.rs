@@ -26,7 +26,7 @@ use windows::{
 };
 
 const SDDL_REVISION_1: u32 = 1;
-const ADMIN_PIPE_SDDL: PCWSTR = w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+const ADMIN_PIPE_SDDL: PCWSTR = w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)");
 
 /// Owned security attributes for a named pipe.
 ///
