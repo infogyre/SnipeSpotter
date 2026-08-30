@@ -1021,6 +1021,9 @@ try {
     Assert-True (@($evidence.Requests | Where-Object { $_.route -eq 'hardware_byserial' -and $_.response_class -eq 'not_found' }).Count -gt 0) 'fixture did not serve a hardware not-found read'
     Assert-True (@($evidence.Requests | Where-Object { $_.route -in @('manufacturers', 'models') -and $_.response_class -eq 'rows_empty' }).Count -ge 2) 'fixture did not serve empty taxonomy reads'
 
+    Stop-Service -Name $serviceName -ErrorAction Stop
+    Wait-ServiceState -Name $serviceName -State 'Stopped' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds
+
     $settingsText = [IO.File]::ReadAllText((Join-Path $DataRoot 'settings.toml'))
     Assert-EncryptedTokenSetting -SettingsText $settingsText
     Assert-NoSentinelInText -Text $settingsText -Sentinel $tokenSentinel -Description 'settings.toml'

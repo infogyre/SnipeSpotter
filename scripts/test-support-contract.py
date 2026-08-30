@@ -880,6 +880,34 @@ try {{
     assert "stdin deadline fixture accepted" in result.stdout
 
 
+def test_direct_scm_quiesces_service_before_artifact_scans() -> None:
+    source = DIRECT_SCM.read_text(encoding="utf-8")
+
+    def assert_quiesced(candidate: str) -> int:
+        sync_start = candidate.index("$sync = Invoke-DirectCli")
+        first_scan = candidate.index("Assert-NoSentinelInArtifact -Root $DataRoot", sync_start)
+        stop_service = candidate.index("Stop-Service -Name $serviceName", sync_start)
+        stopped_wait = candidate.index(
+            "Wait-ServiceState -Name $serviceName -State 'Stopped'",
+            stop_service,
+        )
+        second_scan = candidate.index("Assert-NoSentinelInArtifact -Root $LogDirectory", first_scan)
+        assert sync_start < stop_service < stopped_wait < first_scan < second_scan
+        quiesced_section = candidate[stopped_wait:second_scan]
+        assert "Start-Service -Name $serviceName" not in quiesced_section
+        assert "Restart-Service -Name $serviceName" not in quiesced_section
+        return second_scan
+
+    second_scan = assert_quiesced(source)
+    restart_mutation = source[:second_scan] + "Restart-Service -Name $serviceName\n    " + source[second_scan:]
+    try:
+        assert_quiesced(restart_mutation)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("artifact scan quiescence mutation was accepted")
+
+
 def test_ac4_artifact_scanner_handles_bytes_encodings_boundaries_and_fail_closed() -> None:
     source = DIRECT_SCM.read_text(encoding="utf-8")
     required = (
@@ -4462,6 +4490,7 @@ def main() -> None:
     test_ac4_stream_capture_is_incremental_bounded_and_fail_closed()
     test_ac4_stream_capture_mutations_are_rejected()
     test_ac4_stream_capture_mutation_fixtures_are_registered_and_executable()
+    test_direct_scm_quiesces_service_before_artifact_scans()
     test_ac4_artifact_scanner_handles_bytes_encodings_boundaries_and_fail_closed()
     test_ac4_artifact_scanner_mutations_are_rejected()
     test_ac4_loopback_fixture_behaviorally_validates_routes_queries_and_readiness()
