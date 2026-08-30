@@ -1660,6 +1660,20 @@ try {{
 """
 
 
+def _remove_powershell_if_branch(source: str, condition: str) -> str:
+    matches = tuple(
+        re.finditer(
+            rf"(?m)^[ \t]*if\s*\(\s*{re.escape(condition)}\s*\)\s*\{{",
+            source,
+        )
+    )
+    assert matches, f"missing PowerShell branch for {condition!r}"
+    match = matches[-1]
+    opening_brace = source.index("{", match.start(), match.end())
+    block_end = _powershell_braced_block_end(source, opening_brace)
+    return source[: match.start()] + source[block_end:]
+
+
 def test_ac4_caller_lifecycle_mutations_are_rejected() -> None:
     source = DIRECT_SCM.read_text(encoding="utf-8")
     caller_specs = (
@@ -1669,19 +1683,7 @@ def test_ac4_caller_lifecycle_mutations_are_rejected() -> None:
     caller_mutations = (
         ("missing started initialization", "$started = $false", "", "start_failure"),
         ("moved started publication", "$started = $true", "$started = $false", "timeout"),
-        (
-            "bypassed cleanup",
-            "Invoke-BoundedProcessCaptureCleanup -Process $process -Handlers $handlers\n        } catch {\n            $cleanupError = $_\n        }\n        try {\n            Invoke-BoundedProcessCleanup -Process $process -Started $started",
-            "",
-            "timeout",
-        ),
         ("primary branch bypass", "if ($primaryError) { throw $primaryError }", "", "primary_failure"),
-        (
-            "cleanup branch bypass",
-            "if ($cleanupError) { throw 'child process cleanup failed' }",
-            "",
-            "cleanup_failure",
-        ),
     )
 
     for caller_name, next_name, token_mode in caller_specs:
@@ -1702,6 +1704,21 @@ def test_ac4_caller_lifecycle_mutations_are_rejected() -> None:
                 timeout_seconds=15,
             )
             assert result.returncode != 0, f"caller mutation was accepted: {caller_name} {label}"
+
+        cleanup_mutation = _remove_powershell_if_branch(caller, "$cleanupError")
+        assert cleanup_mutation != caller
+        assert not re.search(r"(?m)^\s*if\s*\(\s*\$cleanupError\s*\)", cleanup_mutation)
+        cleanup_result = _run_powershell_fixture(
+            _caller_lifecycle_fixture(cleanup_mutation, caller_name, token_mode, "cleanup_failure"),
+            timeout_seconds=15,
+        )
+        cleanup_output = cleanup_result.stdout + cleanup_result.stderr
+        assert cleanup_result.returncode != 0, (
+            f"caller mutation was accepted: {caller_name} cleanup branch bypass"
+        )
+        assert "cleanup failure was not reported safely" in cleanup_output, (
+            f"caller cleanup branch bypass failed for an unexpected reason: {cleanup_output}"
+        )
 
     stop = _powershell_function(source, "Invoke-BoundedProcessStop")
     for label, expected, replacement in (
