@@ -367,7 +367,7 @@ function Wait-BoundedTask {
         if ($remainingMilliseconds -le 0 -or -not $Task.Wait($remainingMilliseconds)) {
             throw $FailureMessage
         }
-        $Task.GetAwaiter().GetResult()
+        $null = $Task.GetAwaiter().GetResult()
     } catch {
         throw $FailureMessage
     }

@@ -844,6 +844,9 @@ def test_ac4_stream_capture_mutation_fixtures_are_registered_and_executable() ->
     source = DIRECT_SCM.read_text(encoding="utf-8")
     assert "Invoke-BoundedStandardInput" in source
     helper = _powershell_function(source, "Invoke-BoundedStandardInput")
+    wait_helper = _powershell_function(source, "Wait-BoundedTask")
+    assert "$null = $Task.GetAwaiter().GetResult()" in wait_helper
+    assert "\n        $Task.GetAwaiter().GetResult()" not in wait_helper
     remaining_helper = _powershell_function(source, "Get-BoundedRemainingMillisecond")
     stop_helper = _powershell_function(source, "Invoke-BoundedProcessStop")
     fixture = f"""
