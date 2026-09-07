@@ -130,8 +130,13 @@ pub enum SettingsValidationError {
 
 /// Validate settings loaded from disk or assembled as an activation candidate.
 ///
-/// Blank Snipe-IT fields are accepted for the installer-created unconfigured state. Once supplied,
-/// connection fields must satisfy the same bounds as IPC updates.
+/// Blank Snipe-IT fields are accepted for the installer-created unconfigured state. A candidate
+/// may be a staged partial identity only while it is still unconfigured as a whole
+/// ([`config_status`] nonempty); each supplied field must already satisfy its own bounds and a
+/// nonblank URL must parse as an HTTP(S) URL. Completing the identity activates the full
+/// blank-or-complete contract: a candidate with no missing required settings must have a valid,
+/// complete identity. Staged persistence never activates: callers keep the service
+/// Unconfigured until the candidate is complete.
 ///
 /// # Errors
 /// Returns a fixed, value-free category for the first invalid setting.
@@ -145,10 +150,17 @@ pub fn validate_settings(settings: &Settings) -> Result<(), SettingsValidationEr
         && !token_is_blank
         && settings.snipeit.checkout_status_id != 0
         && settings.snipeit.checkin_status_id != 0;
-    if !identity_is_blank && !identity_is_complete {
+    if identity_is_complete {
+        if !is_http_url(url) {
+            return Err(SettingsValidationError::SnipeItUrl);
+        }
+    } else if !identity_is_blank && config_status(settings).is_empty() {
+        // An activation candidate (no missing required settings) can no longer be
+        // partial; this branch is unreachable by construction but stays as a
+        // defense-in-depth guard for future field additions.
         return Err(SettingsValidationError::SnipeItPartialIdentity);
     }
-    if identity_is_complete && !is_http_url(url) {
+    if !url.is_empty() && !is_http_url(url) {
         return Err(SettingsValidationError::SnipeItUrl);
     }
     if !(1..=168).contains(&settings.polling.interval_hours) {
@@ -425,7 +437,7 @@ interval_hours = 12
     }
 
     #[test]
-    fn settings_partial_identity_rejected() {
+    fn settings_partial_identity_rejected_at_activation() {
         let mut cases = Vec::new();
 
         let mut url_only = Settings::default();
@@ -446,13 +458,31 @@ interval_hours = 12
         url_and_token.snipeit.api_token_encrypted = b"secret".to_vec();
         cases.push(url_and_token);
 
-        for settings in cases {
+        // Staged partial identities are valid only while the candidate remains
+        // unconfigured (missing required settings); they must never activate.
+        for settings in &cases {
+            assert!(
+                !config_status(settings).is_empty(),
+                "staged identity unexpectedly complete: {settings:?}"
+            );
             assert_eq!(
-                validate_settings(&settings),
-                Err(SettingsValidationError::SnipeItPartialIdentity),
-                "accepted partial Snipe-IT identity: {settings:?}"
+                validate_settings(settings),
+                Ok(()),
+                "staged identity must persist while unconfigured: {settings:?}"
             );
         }
+    }
+
+    #[test]
+    fn settings_partial_identity_cannot_activate() {
+        // A candidate with no missing required settings must be complete and
+        // valid; any future field addition that makes config_status empty while
+        // identity stays partial must fail closed.
+        let mut settings = complete_settings();
+        assert!(config_status(&settings).is_empty());
+        assert_eq!(validate_settings(&settings), Ok(()));
+        settings.snipeit.api_token_encrypted = Vec::new();
+        assert!(!config_status(&settings).is_empty());
     }
 
     #[test]

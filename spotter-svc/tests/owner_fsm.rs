@@ -1113,6 +1113,99 @@ fn checkin_settings() -> Settings {
     settings
 }
 
+#[tokio::test]
+async fn owner_staged_onboarding_sequence_persists_without_activation() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let settings_saves = Arc::new(Mutex::new(Vec::new()));
+    let factory_builds = Arc::new(Mutex::new(Vec::new()));
+    let fsm = spawn_owner(
+        4,
+        directory.path().join("operations.jsonl"),
+        Settings::default(),
+        ServiceState::default(),
+        OwnerPorts {
+            secret_protector: Box::new(FakeProtector),
+            settings_store: Box::new(MemorySettingsStore {
+                saves: Arc::clone(&settings_saves),
+            }),
+            state_store: Box::new(MemoryStateStore {
+                saves: Arc::new(Mutex::new(Vec::new())),
+            }),
+            remote: Box::new(RemotePortUnavailable),
+            remote_factory: Box::new(CountingFactory {
+                builds: Arc::clone(&factory_builds),
+            }),
+            discovery: Box::new(FixedDiscovery),
+            clock: Box::new(FixedClock),
+        },
+    )?;
+
+    // Documented quick-start sequence: one field at a time, token last.
+    for (field, value) in [
+        ("snipeit.url", "https://example.test"),
+        ("snipeit.checkout_status_id", "5"),
+        ("snipeit.checkin_status_id", "6"),
+    ] {
+        let response = fsm
+            .request(ServiceCommand::SetConfig {
+                field: String::from(field),
+                value: String::from(value),
+            })
+            .await?;
+        assert!(
+            matches!(response, IpcResponse::Ok { .. }),
+            "staged update of {field} must succeed"
+        );
+        assert!(
+            matches!(
+                fsm.request(ServiceCommand::GetStatus).await?,
+                IpcResponse::Status { ref state, .. } if state == "Unconfigured"
+            ),
+            "staged update of {field} must not activate the service"
+        );
+    }
+    let response = fsm.request(ServiceCommand::SetToken {
+        value: String::from("operator-secret"),
+    });
+    let response = response.await?;
+    assert!(
+        matches!(response, IpcResponse::Ok { .. }),
+        "final token update must succeed"
+    );
+
+    // Completing the identity activates: config_status clears and the remote
+    // factory builds exactly once.
+    assert!(
+        matches!(
+            fsm.request(ServiceCommand::GetStatus).await?,
+            IpcResponse::Status { ref state, .. } if state == "Idle"
+        ),
+        "completed identity must leave the service Idle"
+    );
+    assert_eq!(
+        factory_builds.lock().expect("factory builds lock").len(),
+        1,
+        "remote factory must build exactly once, at activation"
+    );
+    let saves = settings_saves.lock().expect("settings saves lock");
+    assert_eq!(saves.len(), 4, "each staged update must persist");
+    Ok(())
+}
+
+struct CountingFactory {
+    builds: Arc<Mutex<Vec<Settings>>>,
+}
+
+impl RemoteFactory for CountingFactory {
+    fn build(&self, settings: &Settings) -> Result<Box<dyn RemotePort>> {
+        self.builds
+            .lock()
+            .map_err(|_| anyhow::anyhow!("factory builds lock poisoned"))?
+            .push(settings.clone());
+        Ok(Box::new(RemotePortUnavailable))
+    }
+}
+
 fn append_pending_checkin(path: &std::path::Path, operation_id: &str) -> Result<()> {
     let operation = spotter_core::snipeit::MonitorCheckin {
         operation_id: String::from(operation_id),
