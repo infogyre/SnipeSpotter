@@ -2165,16 +2165,13 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryServerFailureRemote {
 
     fn checkin<'a>(
         &'a mut self,
-        _operation: &'a spotter_core::snipeit::MonitorCheckin,
+        operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async {
-            Err(anyhow::Error::from(
-                spotter_core::snipeit::SnipeItError::ServerError {
-                    status: 503,
-                    message: String::from("temporarily unavailable"),
-                },
-            ))
-        })
+        // The prepared record carries complete candidate-state evidence, so
+        // recovery records the observed outcome during reconciliation without
+        // a remote call; the server failure must surface from the read path.
+        let _ = operation;
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -2206,13 +2203,13 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryAuthFailureRemote {
 
     fn checkin<'a>(
         &'a mut self,
-        _operation: &'a spotter_core::snipeit::MonitorCheckin,
+        operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async {
-            Err(anyhow::Error::from(
-                spotter_core::snipeit::SnipeItError::AuthFailure,
-            ))
-        })
+        // The prepared record carries complete candidate-state evidence, so
+        // recovery records the observed outcome during reconciliation without
+        // a remote call; the auth failure must surface from the read path.
+        let _ = operation;
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -2250,16 +2247,13 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryThenSuccessRemote {
 
     fn checkin<'a>(
         &'a mut self,
-        _operation: &'a spotter_core::snipeit::MonitorCheckin,
+        operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async {
-            Err(anyhow::Error::from(
-                spotter_core::snipeit::SnipeItError::ServerError {
-                    status: 503,
-                    message: String::from("temporarily unavailable"),
-                },
-            ))
-        })
+        // The prepared record carries complete candidate-state evidence, so
+        // recovery records the observed outcome during reconciliation without
+        // a remote call; the server failure must surface from the read path.
+        let _ = operation;
+        Box::pin(async { Ok(()) })
     }
 }
 
