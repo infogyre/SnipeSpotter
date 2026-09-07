@@ -2,8 +2,11 @@
 
 //! Configuration types and pure validation helpers for `SnipeSpotter`.
 
+use std::time::Duration;
+
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Settings file template shipped for first-run configuration.
 pub const BLANK_SETTINGS_TOML: &str = r#"[snipeit]
@@ -27,7 +30,7 @@ checkin_threshold_hours = 24
 
 /// Complete application settings.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub snipeit: SnipeItSettings,
     pub polling: PollingSettings,
@@ -37,7 +40,7 @@ pub struct Settings {
 
 /// Snipe-IT connection and status settings.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SnipeItSettings {
     pub url: String,
     #[serde(with = "base64_bytes")]
@@ -48,7 +51,7 @@ pub struct SnipeItSettings {
 
 /// Polling schedule settings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PollingSettings {
     pub interval_hours: u64,
 }
@@ -61,7 +64,7 @@ impl Default for PollingSettings {
 
 /// Log rotation settings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingSettings {
     pub level: String,
     pub max_size_mb: u64,
@@ -89,7 +92,7 @@ pub enum CheckinPolicy {
 
 /// Monitor behavior settings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MonitorSettings {
     pub checkin_policy: CheckinPolicy,
     pub checkin_threshold_hours: u64,
@@ -102,6 +105,71 @@ impl Default for MonitorSettings {
             checkin_threshold_hours: 24,
         }
     }
+}
+
+/// A value-level settings validation failure.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SettingsValidationError {
+    #[error("invalid Snipe-IT URL")]
+    SnipeItUrl,
+    #[error("invalid Snipe-IT status ID")]
+    SnipeItStatusId,
+    #[error("invalid polling interval")]
+    PollingInterval,
+    #[error("invalid logging level")]
+    LoggingLevel,
+    #[error("invalid logging size limit")]
+    LoggingMaxSize,
+    #[error("invalid logging file limit")]
+    LoggingMaxFiles,
+    #[error("invalid monitor check-in threshold")]
+    CheckinThreshold,
+}
+
+/// Validate settings loaded from disk or assembled as an activation candidate.
+///
+/// Blank Snipe-IT fields are accepted for the installer-created unconfigured state. Once supplied,
+/// connection fields must satisfy the same bounds as IPC updates.
+///
+/// # Errors
+/// Returns a fixed, value-free category for the first invalid setting.
+pub fn validate_settings(settings: &Settings) -> Result<(), SettingsValidationError> {
+    let url = settings.snipeit.url.trim();
+    if !(url.is_empty() || url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(SettingsValidationError::SnipeItUrl);
+    }
+    let status_ids = [
+        settings.snipeit.checkout_status_id,
+        settings.snipeit.checkin_status_id,
+    ];
+    if status_ids.contains(&0) && status_ids.iter().any(|id| *id != 0) {
+        return Err(SettingsValidationError::SnipeItStatusId);
+    }
+    if !(1..=168).contains(&settings.polling.interval_hours) {
+        return Err(SettingsValidationError::PollingInterval);
+    }
+    if !matches!(
+        settings.logging.level.as_str(),
+        "trace" | "debug" | "info" | "warn" | "error"
+    ) {
+        return Err(SettingsValidationError::LoggingLevel);
+    }
+    if !(1..=10_240).contains(&settings.logging.max_size_mb) {
+        return Err(SettingsValidationError::LoggingMaxSize);
+    }
+    if !(1..=1_000).contains(&settings.logging.max_files) {
+        return Err(SettingsValidationError::LoggingMaxFiles);
+    }
+    if !(1..=8_760).contains(&settings.monitors.checkin_threshold_hours) {
+        return Err(SettingsValidationError::CheckinThreshold);
+    }
+    Ok(())
+}
+
+/// Convert a polling interval to a duration without overflowing.
+#[must_use]
+pub fn poll_duration(interval_hours: u64) -> Option<Duration> {
+    interval_hours.checked_mul(60 * 60).map(Duration::from_secs)
 }
 
 /// Return required settings that still contain their invalid defaults.
@@ -244,18 +312,73 @@ interval_hours = 12
     }
 
     #[test]
-    fn unknown_future_fields_are_ignored() -> Result<(), Box<dyn std::error::Error>> {
-        let settings: Settings = toml::from_str(
-            r#"future_option = true
+    fn unknown_nested_settings_rejected() {
+        for text in [
+            "future_option = true",
+            "[snipeit]\nfuture_option = true",
+            "[polling]\nfuture_option = true",
+            "[logging]\nfuture_retention_mode = \"size\"",
+            "[monitors]\nfuture_option = true",
+        ] {
+            assert!(
+                toml::from_str::<Settings>(text).is_err(),
+                "accepted {text:?}"
+            );
+        }
+    }
 
-[logging]
-level = "debug"
-future_retention_mode = "size"
-"#,
-        )?;
-        assert_eq!(settings.logging.level, "debug");
-        assert_eq!(settings.logging.max_size_mb, 10);
-        assert_eq!(settings.logging.max_files, 5);
-        Ok(())
+    #[test]
+    fn settings_load_validation_matrix() {
+        let mut settings = complete_settings();
+        assert_eq!(validate_settings(&settings), Ok(()));
+
+        settings.polling.interval_hours = 0;
+        assert_eq!(
+            validate_settings(&settings),
+            Err(SettingsValidationError::PollingInterval)
+        );
+        settings.polling.interval_hours = 169;
+        assert_eq!(
+            validate_settings(&settings),
+            Err(SettingsValidationError::PollingInterval)
+        );
+        settings.polling.interval_hours = 4;
+        settings.logging.level = String::from("verbose");
+        assert_eq!(
+            validate_settings(&settings),
+            Err(SettingsValidationError::LoggingLevel)
+        );
+        settings.logging.level = String::from("info");
+        settings.logging.max_size_mb = 0;
+        assert_eq!(
+            validate_settings(&settings),
+            Err(SettingsValidationError::LoggingMaxSize)
+        );
+        settings.logging.max_size_mb = 10;
+        settings.logging.max_files = 0;
+        assert_eq!(
+            validate_settings(&settings),
+            Err(SettingsValidationError::LoggingMaxFiles)
+        );
+        settings.logging.max_files = 5;
+        settings.monitors.checkin_threshold_hours = 0;
+        assert_eq!(
+            validate_settings(&settings),
+            Err(SettingsValidationError::CheckinThreshold)
+        );
+    }
+
+    #[test]
+    fn blank_installer_settings_remain_configurable() {
+        assert_eq!(validate_settings(&Settings::default()), Ok(()));
+    }
+
+    #[test]
+    fn poll_duration_checked() {
+        assert_eq!(
+            poll_duration(4),
+            Some(std::time::Duration::from_secs(14_400))
+        );
+        assert_eq!(poll_duration(u64::MAX), None);
     }
 }

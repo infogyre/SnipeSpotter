@@ -410,6 +410,7 @@ impl CommandOwner {
     fn set_config(&mut self, field: &str, value: &str) -> Result<IpcResponse> {
         let update = validate_config_field(field, value).map_err(anyhow::Error::msg)?;
         let settings = apply_settings_update(&self.controller.settings, &update);
+        spotter_core::validate_settings(&settings).context("invalid settings values")?;
         let remote = if config_status(&settings).is_empty() {
             Some(self.remote_factory.build(&settings)?)
         } else {
@@ -735,7 +736,11 @@ async fn run_polling_timer(
     mut interval_hours: tokio::sync::watch::Receiver<u64>,
 ) {
     loop {
-        let duration = Duration::from_secs(*interval_hours.borrow_and_update() * 60 * 60);
+        let Some(duration) = spotter_core::poll_duration(*interval_hours.borrow_and_update())
+        else {
+            tracing::error!("invalid polling interval; polling stopped");
+            return;
+        };
         tokio::select! {
             () = tokio::time::sleep(duration) => {
                 if let Err(error) = fsm.request(ServiceCommand::TriggerSync).await {
