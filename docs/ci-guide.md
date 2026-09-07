@@ -58,11 +58,13 @@ Linux only builds and tests `spotter-core` (the cross-platform crate). Windows-o
 
 #### Package contract (`ubuntu-latest`)
 
-Verifies the workspace has exactly six packages with these names: `spotter-core`, `spotter-win32`, `spotter-build`, `spotter-svc`, `spotter-cli`, and `spotter-hardware-service`. The last package is an experimental/test-support LocalSystem host for the manual hosted hardware workflow. It is excluded from the installer and release artifacts.
+Verifies the workspace has exactly six packages with these names: `spotter-core`, `spotter-win32`, `spotter-build`, `spotter-svc`, `spotter-cli`, and `spotter-hardware-service`. The last package is an experimental/test-support LocalSystem host for the manual hosted hardware workflow. It is excluded from the installer and release artifacts. This job also runs the custom Python MSI lifecycle, PowerShell support, action-SHA, reusable-workflow input/output, caller path-gating, elevated-wiring, and release-dependency contracts. `docs_workflow_topology_contract` cross-checks the documented job IDs and publication steps against the workflow text; `documented_quickstart_fresh_msi` cross-checks the README onboarding order against the elevated lifecycle harness.
 
 #### CI success (aggregate gate)
 
-A single required status check that depends on all three jobs above. All must pass for the gate to succeed.
+The reusable checks workflow contains the jobs `linux-core`, `windows-workspace`, and `package-contract`, followed by `ci-success`. The aggregate `ci-success` job has `needs: [linux-core, windows-workspace, package-contract]`, always runs, and publishes the reusable workflow’s `checks_ran` and `checks_result` outputs. All selected jobs must pass for success; an explicitly path-skipped invocation reports `skipped` through those outputs.
+
+The separate reusable elevated workflow contains the `lifecycle` job. It is invoked by the CI caller for relevant installed-system paths and by `release.yml` after packaging; it is not folded into `checks.yml`’s three implementation jobs.
 
 ### Action pinning policy
 
@@ -70,9 +72,12 @@ All third-party GitHub Actions are pinned to full commit SHAs with version comme
 
 ### Workflow security
 
-- `persist-credentials: false` on all read-only checkouts.
-- All shell-consumed GitHub expressions are passed through environment variables to prevent template injection.
-- `actionlint` and `zizmor` validate workflow security locally and in CI.
+- `persist-credentials: false` is set on read-only checkouts.
+- Shell-consumed GitHub expressions are passed through environment variables rather than interpolated into scripts.
+- The repository’s custom workflow contract checks enforce full-SHA action references and selected reusable-workflow, path-filter, elevated-result, and release-dependency invariants.
+- The Windows workspace job installs/runs PSScriptAnalyzer and fails on Warning or Error findings in `.ps1` and `.psm1` files.
+
+These are the workflow checks that exist today; this guide does not imply additional workflow-analysis tools run in CI.
 
 ## Release process
 
@@ -91,9 +96,11 @@ All third-party GitHub Actions are pinned to full commit SHAs with version comme
 4. **Release workflow runs automatically**: The tag push triggers `release.yml`, which:
    - **Verify job** (Ubuntu): Confirms the tag points to `main`, validates the tag version matches `Cargo.toml`, and verifies the locked workspace metadata. The Windows `build` job runs the workspace and production-owner integration tests.
    - **Build job** (Windows): Runs the workspace tests, including the already-required `hosted_hardware` integration tests, then builds only `spotter-svc.exe` and `spotter-cli.exe` with `cargo build --release --locked --target x86_64-pc-windows-msvc`, asserts exact `.exe` and underscore-named `.pdb` files exist, and uploads a closed artifact inventory. The experimental `spotter-hardware-service` host is not a release binary.
-   - **Package job** (Windows): Installs WiX 6, verifies `wix --version`, generates CycloneDX SBOMs, builds the MSI with explicit version/platform properties, renames it deterministically, validates the MSI lifecycle (install, service registration, start/stop, ACLs, PATH, uninstall), and uploads packaged artifacts. The MSI does not contain or register `spotter-hardware-service`.
-   - **Aggregate job** (Ubuntu): Downloads all artifacts, creates `SHA256SUMS`, generates SLSA provenance attestation, creates a draft GitHub Release, and uploads all assets (MSI, supplemental ZIP with exes + PDBs + SBOMs, checksums).
-   - **Publish job**: Flips the draft release to published only after all preceding jobs pass.
+   - **Package job** (Windows): Installs WiX 6, verifies `wix --version`, generates CycloneDX SBOMs, builds the MSI with explicit version/platform properties, renames it deterministically, and uploads packaged artifacts. The MSI does not contain or register `spotter-hardware-service`.
+   - **Lifecycle job** (separate reusable elevated gate): After packaging, invokes `elevated-windows.yml` to validate MSI installation/service behavior and the direct SCM lifecycle. Publication cannot proceed unless this gate succeeds.
+   - **Aggregate job** (Ubuntu): The `Generate checksums and inventory` step downloads the packaged MSI and symbols ZIP, creates `SHA256SUMS`, and asserts the closed three-file inventory before uploading that aggregate as `release-inventory`.
+   - **Attest job**: For a tag publication, attests every file in the aggregate release inventory.
+   - **Publish job**: The `Publish release assets` step directly creates the published release with `--draft=false` after aggregate inventory, lifecycle, and attestation succeed. There is no draft-promotion step.
 
 ### Dry run path (validation without publishing)
 
@@ -107,7 +114,7 @@ This runs every step except attestation and publish. Use it to validate the full
 
 ### Release-candidate path
 
-Before the first production release, create a release-candidate tag (`v0.1.0-rc1`) to exercise the end-to-end draft/publish path. Verify the GitHub Release is created as a draft, then published, with all expected assets.
+The automated tag trigger accepts stable `vX.Y.Z` tags only. Before the first production release, use the manual dry-run path above to exercise build, package, lifecycle, and aggregate inventory without publishing; then review the resulting artifacts before creating the stable tag. A stable tag directly creates the published release only after all gates pass.
 
 ## Manual MSI build
 

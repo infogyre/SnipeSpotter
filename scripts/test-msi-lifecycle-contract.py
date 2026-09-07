@@ -42,6 +42,33 @@ def _text_until(source: str, name: str, marker: str) -> str:
     return source[start:end]
 
 
+def test_documented_quickstart_fresh_msi() -> None:
+    readme = (ROOT.parent / "README.md").read_text(encoding="utf-8")
+    quick_start = readme[readme.index("## Quick start") : readme.index("## Documentation")]
+
+    install = quick_start.index("msiexec /i")
+    start = quick_start.index("Start-Service -Name SnipeSpotter", install)
+    service_ready = quick_start.index("Wait-ServiceState", start)
+    pipe_ready = quick_start.index("SnipeSpotter named pipe", service_ready)
+    status_ready = quick_start.index("SnipeSpotter status response", pipe_ready)
+    configure = quick_start.index("config set snipeit.url", status_ready)
+    assert install < start < service_ready < pipe_ready < status_ready < configure
+
+    assert "TimeoutSeconds" in quick_start
+    assert "Unconfigured" in quick_start
+    assert "%ProgramFiles%\\infogyre\\SnipeSpotter\\bin" in quick_start
+    assert "new shell" in quick_start
+    assert "already-open shell" in quick_start
+
+    harness_start = SCRIPT.index("Start-Service -Name $serviceName")
+    harness_service_ready = SCRIPT.index("Wait-ServiceState -Name $serviceName", harness_start)
+    harness_pipe_ready = SCRIPT.index("Wait-Condition -Description 'SnipeSpotter named pipe'", harness_service_ready)
+    harness_status_ready = SCRIPT.index("Wait-Condition -Description 'SnipeSpotter status response'", harness_pipe_ready)
+    harness_configure = SCRIPT.index("Invoke-InstalledCli -Arguments @('config', 'set'", harness_status_ready)
+    assert harness_start < harness_service_ready < harness_pipe_ready < harness_status_ready < harness_configure
+    assert "Get-MachinePathEntry" in SCRIPT
+
+
 def test_lifecycle_requires_sustained_running_service() -> None:
     assert "Running or Stopped" not in SCRIPT
     assert "Wait-ConditionStable" in SCRIPT
@@ -685,6 +712,7 @@ def test_msi_acl_replacement_uses_installed_atomic_config_writer_and_exact_cli_c
 
 
 def main() -> None:
+    test_documented_quickstart_fresh_msi()
     test_lifecycle_requires_sustained_running_service()
     test_lifecycle_imports_wait_helpers_after_scm_module()
     test_service_enters_runtime_before_fsm_spawn()

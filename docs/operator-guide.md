@@ -49,7 +49,7 @@ Configuration in `%ProgramData%` is preserved across upgrades (the settings comp
 
 ## Initial configuration
 
-After installation, configure the Snipe-IT connection from an elevated terminal:
+After installation, start the service and wait for bounded readiness from an elevated terminal before configuring it. The MSI adds the installed `bin\` directory to the system `PATH`, but an already-open shell may require a new shell, an explicit `$env:Path` refresh, or the full `%ProgramFiles%\infogyre\SnipeSpotter\bin\spotter-cli.exe` path. The README quick start gives the exact Start-Service, service-state, named-pipe, and `Unconfigured` status sequence exercised by the MSI lifecycle harness.
 
 ```powershell
 # Set the Snipe-IT instance URL
@@ -85,6 +85,8 @@ After setting the URL, status IDs, and token, the service transitions from `Unco
 ## Configuration reference
 
 All configuration is stored in `%ProgramData%\infogyre\SnipeSpotter\settings.toml`. Use `spotter-cli config set` to modify fields; do not edit the file directly while the service is running.
+
+Configuration loading is deliberately strict. Unknown keys are rejected both at the root and inside every nested table, so remove obsolete or misspelled keys before upgrading. The installer’s blank template remains valid and configurable. Snipe-IT identity is blank-or-complete: URL, checkout status ID, and check-in status ID must either all remain at their blank defaults or all be supplied with valid values. A token-only refresh remains allowed when recovery needs new credentials, but identity changes are refused while pending journal evidence exists.
 
 ### Snipe-IT settings
 
@@ -173,7 +175,7 @@ spotter-cli status [--full] [--json]
 
 Displays the current service state. Without `--full`, shows the FSM state, last sync time, next sync time, and Snipe-IT URL. With `--full`, also shows the matched computer asset and known monitor inventory.
 
-Use `--json` for machine-readable output.
+Use `--json` for machine-readable output. Named-pipe request reads and response writes/flushes each have a fixed five-second deadline. These transport deadlines do not cancel a command once the FSM has queued it: if the client times out, a mutation may still complete and be durably committed, so check status/recovery evidence before retrying.
 
 ### sync
 
@@ -181,7 +183,9 @@ Use `--json` for machine-readable output.
 spotter-cli sync
 ```
 
-Triggers an immediate synchronization. If a sync is already running, the request coalesces with the existing operation. Returns when the sync completes or fails.
+Triggers an immediate synchronization. If a sync is already running, the request coalesces with the existing operation. Returns when the sync completes or fails. Before accepting new synchronization or forced check-in work, the owner first recovers pending journal evidence; recovery failure prevents new remote mutations. A recovered candidate becomes the active in-memory state immediately after its durable signed-state save, even if the later terminal journal append or compaction fails.
+
+The HTTP client applies fixed safety limits: 30 seconds per request; no redirects followed; at most 1 MiB per success response and 16 KiB retained for error classification; page size 100; and at most 100 requests, 10,000 rows, or 60 seconds for one pagination operation. Exceeding a limit fails the operation rather than returning partial results. Production configuration still accepts HTTP URLs; HTTPS-only production enforcement remains deferred under SPOTR-8.
 
 ### checkin
 
@@ -249,6 +253,10 @@ Installs or removes the Windows service via the SCM. The MSI installer handles t
 1. Run `spotter-cli status --full` to see which assets and monitors are matched.
 2. Confirm that the manufacturer, category, and model records exist in Snipe-IT for the local system and each monitor.
 3. Confirm the records are unique (not duplicated). SnipeSpotter uses strict lookup and will not guess.
+
+### Duplicate monitor serial warning
+
+When more than one local monitor reports the same serial, SnipeSpotter treats that serial as present but ambiguous. It preserves existing assignment/absence state, plans no checkout, check-in, or asset update for that serial, and emits a bounded deterministic warning rather than guessing. Correct the local identity collision before expecting synchronization for those monitors.
 
 ### Monitor not checking in automatically
 
