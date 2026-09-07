@@ -2105,21 +2105,33 @@ impl spotter_svc::sync_engine::RemoteMutations for RemotePortUnavailable {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<spotter_core::snipeit::Asset>> + Send + 'a>,
     > {
-        Box::pin(async { anyhow::bail!("remote unavailable") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 
     fn checkout<'a>(
         &'a mut self,
         _operation: &'a spotter_core::snipeit::MonitorCheckout,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("remote unavailable") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 
     fn checkin<'a>(
         &'a mut self,
         _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("remote unavailable") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 }
 
