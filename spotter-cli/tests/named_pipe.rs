@@ -4,7 +4,9 @@
     reason = "Live named-pipe ACL inspection requires narrowly scoped Windows security descriptor calls"
 )]
 
-use std::{fs::OpenOptions, os::windows::io::AsRawHandle as _, sync::mpsc, time::Duration};
+use std::{
+    fs::OpenOptions, io::Write as _, os::windows::io::AsRawHandle as _, sync::mpsc, time::Duration,
+};
 
 use anyhow::{Context as _, Result};
 use spotter_cli::{IpcTransport, NamedPipeTransport};
@@ -30,7 +32,7 @@ use windows::{
             Threading::{GetCurrentThread, OpenThreadToken},
         },
     },
-    core::{Error as WindowsError, PCWSTR, PWSTR},
+    core::{PCWSTR, PWSTR},
 };
 
 // Windows canonicalizes generic-all from the authored SDDL to file-all on a pipe kernel object.
@@ -166,7 +168,7 @@ fn observe_client_impersonation_level(
         )
     });
     if pipe.0.is_invalid() {
-        return Err(std::io::Error::last_os_error().into())
+        return Err(anyhow::Error::new(std::io::Error::last_os_error()))
             .context("failed to create SQOS test named pipe");
     }
     ready
@@ -242,6 +244,113 @@ fn named_pipe_client_limits_impersonation_level() -> Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("SQOS server thread panicked"))??;
     assert_eq!(level, SecurityIdentification);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_timeout_does_not_cancel_handler() -> Result<()> {
+    let endpoint = unique_pipe_endpoint();
+    let marker_path = std::env::temp_dir().join(format!(
+        "SnipeSpotter-timeout-marker-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos()),
+    ));
+    struct MarkerGuard(std::path::PathBuf);
+    impl Drop for MarkerGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _marker = MarkerGuard(marker_path.clone());
+    let (accepted_sender, accepted_receiver) = tokio::sync::oneshot::channel();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+    let (completed_sender, completed_receiver) = tokio::sync::oneshot::channel();
+    let mut accepted_sender = Some(accepted_sender);
+    let mut release_receiver = Some(release_receiver);
+    let mut completed_sender = Some(completed_sender);
+    let handler_marker_path = marker_path.clone();
+    let fsm = spotter_svc::fsm::spawn(1, move |_| {
+        let accepted_sender = accepted_sender.take();
+        let release_receiver = release_receiver.take();
+        let completed_sender = completed_sender.take();
+        let marker_path = handler_marker_path.clone();
+        async move {
+            if let Some(sender) = accepted_sender {
+                let _ = sender.send(());
+            }
+            if let Some(receiver) = release_receiver {
+                let _ = receiver.await;
+            }
+            let durable = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&marker_path)
+                .and_then(|mut marker| {
+                    marker.write_all(b"durably committed")?;
+                    marker.sync_all()
+                });
+            match durable {
+                Ok(()) => {
+                    if let Some(sender) = completed_sender {
+                        let _ = sender.send(());
+                    }
+                    IpcResponse::Ok {
+                        message: String::from("durably committed"),
+                    }
+                }
+                Err(_) => IpcResponse::Error {
+                    message: String::from("durable mutation failed"),
+                },
+            }
+        }
+    })?;
+    let server = tokio::spawn(spotter_svc::ipc_server::run_named_pipe_at(
+        fsm,
+        endpoint.clone(),
+    ));
+    struct ServerGuard(tokio::task::JoinHandle<Result<()>>);
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut server = ServerGuard(server);
+
+    let client_endpoint = endpoint;
+    let client = tokio::task::spawn_blocking(move || {
+        let mut transport =
+            NamedPipeTransport::with_endpoint(Duration::from_millis(20), client_endpoint);
+        transport.send(&ServiceCommand::GetStatus)
+    });
+    tokio::time::timeout(Duration::from_secs(5), accepted_receiver)
+        .await
+        .context("named-pipe handler did not accept the request")?
+        .context("named-pipe handler acceptance was cancelled")?;
+    let send_result = tokio::time::timeout(Duration::from_secs(5), client)
+        .await
+        .context("named-pipe client timeout observation exceeded its bound")??;
+    let timeout_error = send_result.expect_err("short named-pipe client deadline must expire");
+    assert!(timeout_error.to_string().contains("timed out"));
+    assert!(!marker_path.exists());
+
+    release_sender
+        .send(())
+        .map_err(|()| anyhow::anyhow!("failed to release named-pipe handler"))?;
+    tokio::time::timeout(Duration::from_secs(5), completed_receiver)
+        .await
+        .context("durable mutation did not complete after client timeout")?
+        .context("durable mutation completion was cancelled")?;
+    assert_eq!(std::fs::read(&marker_path)?, b"durably committed");
+
+    server.0.abort();
+    tokio::time::timeout(Duration::from_secs(5), &mut server.0)
+        .await
+        .context("named-pipe server cleanup exceeded its bound")?
+        .context("named-pipe server task panicked")?
+        .context("named-pipe server exited unexpectedly")?;
     Ok(())
 }
 

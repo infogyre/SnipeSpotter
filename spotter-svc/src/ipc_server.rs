@@ -282,9 +282,22 @@ mod tests {
 
         let committed = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&committed);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        let mut started_sender = Some(started_sender);
+        let mut release_receiver = Some(release_receiver);
         let fsm = fsm::spawn(1, move |_| {
-            observed.store(true, Ordering::SeqCst);
-            async {
+            let started_sender = started_sender.take();
+            let release_receiver = release_receiver.take();
+            let observed = Arc::clone(&observed);
+            async move {
+                if let Some(sender) = started_sender {
+                    let _ = sender.send(());
+                }
+                if let Some(receiver) = release_receiver {
+                    let _ = receiver.await;
+                }
+                observed.store(true, Ordering::SeqCst);
                 IpcResponse::Ok {
                     message: String::from("committed"),
                 }
@@ -301,6 +314,16 @@ mod tests {
             .await
         });
         client.write_all(b"{\"cmd\":\"get_status\"}\n").await?;
+        started_receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("handler start observation was cancelled"))?;
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "commit marker must remain unset until the handler future completes"
+        );
+        release_sender
+            .send(())
+            .map_err(|()| anyhow::anyhow!("failed to release handler"))?;
 
         let error = server_task
             .await?
@@ -312,7 +335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_timeout_does_not_cancel_handler() -> Result<()> {
+    async fn client_disconnect_does_not_cancel_handler() -> Result<()> {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
