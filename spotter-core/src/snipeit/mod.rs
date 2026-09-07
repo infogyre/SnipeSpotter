@@ -108,6 +108,8 @@ pub enum SnipeItError {
     Validation { message: String },
     #[error("Snipe-IT server error {status}: {message}")]
     ServerError { status: u16, message: String },
+    #[error("Snipe-IT response is ambiguous")]
+    AmbiguousResponse,
     #[error("invalid Snipe-IT response: {message}")]
     InvalidResponse { message: String },
     #[error("Snipe-IT network error: {message}")]
@@ -187,8 +189,11 @@ pub fn parse_asset_by_serial(
         return Err(SnipeItError::NotFound);
     }
     if let Some(rows) = value.get("rows").and_then(Value::as_array) {
-        let first = rows.first().ok_or(SnipeItError::NotFound)?;
-        return decode_asset(first.clone());
+        return match rows.as_slice() {
+            [] => Err(SnipeItError::NotFound),
+            [asset] => decode_asset(asset.clone()),
+            [_, _, ..] => Err(SnipeItError::AmbiguousResponse),
+        };
     }
     decode_asset(value)
 }
@@ -362,10 +367,26 @@ mod tests {
             2
         );
         assert_eq!(
+            parse_asset_by_serial(200, r#"{"rows":[]}"#, None),
+            Err(SnipeItError::NotFound)
+        );
+        assert_eq!(
             parse_asset_by_serial(200, r#"{"message":"Asset not found"}"#, None),
             Err(SnipeItError::NotFound)
         );
         Ok(())
+    }
+
+    #[test]
+    fn ambiguous_remote_assets_rejected() {
+        assert_eq!(
+            parse_asset_by_serial(
+                200,
+                r#"{"rows":[{"id":2,"serial":"B"},{"id":3,"serial":"B"}]}"#,
+                None,
+            ),
+            Err(SnipeItError::AmbiguousResponse)
+        );
     }
 
     #[test]
