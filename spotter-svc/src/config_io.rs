@@ -106,6 +106,9 @@ mod tests {
         assert!(blank.snipeit.url.is_empty());
         let mut configured = blank;
         configured.snipeit.url = String::from("https://example.test");
+        configured.snipeit.api_token_encrypted = b"encrypted-token".to_vec();
+        configured.snipeit.checkout_status_id = 1;
+        configured.snipeit.checkin_status_id = 2;
         save_settings(&path, &configured)?;
         assert_eq!(load_settings(&path)?.snipeit.url, "https://example.test");
         Ok(())

@@ -94,6 +94,16 @@ pub struct MonitorCheckin {
     pub request: CheckinRequest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum NetworkErrorKind {
+    #[error("network request timed out")]
+    Timeout,
+    #[error("network connection failed")]
+    Connect,
+    #[error("network request failed")]
+    Other,
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SnipeItError {
     #[error("Snipe-IT resource not found")]
@@ -112,8 +122,8 @@ pub enum SnipeItError {
     AmbiguousResponse,
     #[error("invalid Snipe-IT response: {message}")]
     InvalidResponse { message: String },
-    #[error("Snipe-IT network error: {message}")]
-    NetworkError { message: String },
+    #[error("Snipe-IT network error: {kind}")]
+    NetworkError { kind: NetworkErrorKind },
 }
 
 #[must_use]

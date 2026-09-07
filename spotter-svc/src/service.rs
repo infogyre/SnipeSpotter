@@ -1276,7 +1276,7 @@ mod tests {
             crate::FsmState::Unconfigured
         );
         let network = anyhow::Error::new(spotter_core::snipeit::SnipeItError::NetworkError {
-            message: String::from("offline"),
+            kind: spotter_core::snipeit::NetworkErrorKind::Other,
         });
         assert_eq!(state_after_sync_error(&network), crate::FsmState::Error);
         assert_eq!(

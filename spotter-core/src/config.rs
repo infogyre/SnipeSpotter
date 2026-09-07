@@ -112,6 +112,8 @@ impl Default for MonitorSettings {
 pub enum SettingsValidationError {
     #[error("invalid Snipe-IT URL")]
     SnipeItUrl,
+    #[error("partial Snipe-IT identity")]
+    SnipeItPartialIdentity,
     #[error("invalid Snipe-IT status ID")]
     SnipeItStatusId,
     #[error("invalid polling interval")]
@@ -135,15 +137,19 @@ pub enum SettingsValidationError {
 /// Returns a fixed, value-free category for the first invalid setting.
 pub fn validate_settings(settings: &Settings) -> Result<(), SettingsValidationError> {
     let url = settings.snipeit.url.trim();
-    if !(url.is_empty() || url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(SettingsValidationError::SnipeItUrl);
+    let token_is_blank = settings.snipeit.api_token_encrypted.is_empty();
+    let statuses_are_blank =
+        settings.snipeit.checkout_status_id == 0 && settings.snipeit.checkin_status_id == 0;
+    let identity_is_blank = url.is_empty() && token_is_blank && statuses_are_blank;
+    let identity_is_complete = !url.is_empty()
+        && !token_is_blank
+        && settings.snipeit.checkout_status_id != 0
+        && settings.snipeit.checkin_status_id != 0;
+    if !identity_is_blank && !identity_is_complete {
+        return Err(SettingsValidationError::SnipeItPartialIdentity);
     }
-    let status_ids = [
-        settings.snipeit.checkout_status_id,
-        settings.snipeit.checkin_status_id,
-    ];
-    if status_ids.contains(&0) && status_ids.iter().any(|id| *id != 0) {
-        return Err(SettingsValidationError::SnipeItStatusId);
+    if identity_is_complete && !is_http_url(url) {
+        return Err(SettingsValidationError::SnipeItUrl);
     }
     if !(1..=168).contains(&settings.polling.interval_hours) {
         return Err(SettingsValidationError::PollingInterval);
@@ -164,6 +170,46 @@ pub fn validate_settings(settings: &Settings) -> Result<(), SettingsValidationEr
         return Err(SettingsValidationError::CheckinThreshold);
     }
     Ok(())
+}
+
+fn is_http_url(value: &str) -> bool {
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme, "http" | "https")
+        || remainder.is_empty()
+        || remainder
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return false;
+    }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let host_and_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host_and_port.is_empty() {
+        return false;
+    }
+    if let Some(host_and_port) = host_and_port.strip_prefix('[') {
+        let Some(closing_bracket) = host_and_port.find(']') else {
+            return false;
+        };
+        let port = &host_and_port[closing_bracket + 1..];
+        if !port.is_empty() && !port.strip_prefix(':').is_some_and(is_valid_port) {
+            return false;
+        }
+    } else if let Some((host, port)) = host_and_port.rsplit_once(':') {
+        if host.is_empty() || !is_valid_port(port) || host.contains(':') {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_valid_port(port: &str) -> bool {
+    !port.is_empty() && port.chars().all(|character| character.is_ascii_digit())
 }
 
 /// Convert a polling interval to a duration without overflowing.
@@ -371,6 +417,58 @@ interval_hours = 12
     #[test]
     fn blank_installer_settings_remain_configurable() {
         assert_eq!(validate_settings(&Settings::default()), Ok(()));
+    }
+
+    #[test]
+    fn settings_partial_identity_rejected() {
+        let mut cases = Vec::new();
+
+        let mut url_only = Settings::default();
+        url_only.snipeit.url = String::from("https://snipe-it.example.com");
+        cases.push(url_only);
+
+        let mut token_only = Settings::default();
+        token_only.snipeit.api_token_encrypted = b"secret".to_vec();
+        cases.push(token_only);
+
+        let mut status_only = Settings::default();
+        status_only.snipeit.checkout_status_id = 1;
+        status_only.snipeit.checkin_status_id = 2;
+        cases.push(status_only);
+
+        let mut url_and_token = Settings::default();
+        url_and_token.snipeit.url = String::from("https://snipe-it.example.com");
+        url_and_token.snipeit.api_token_encrypted = b"secret".to_vec();
+        cases.push(url_and_token);
+
+        for settings in cases {
+            assert_eq!(
+                validate_settings(&settings),
+                Err(SettingsValidationError::SnipeItPartialIdentity),
+                "accepted partial Snipe-IT identity: {settings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn settings_malformed_url_rejected() {
+        for url in [
+            "https://",
+            "http://",
+            "https:///missing-host",
+            "https://host with spaces",
+            "https://host:abc",
+            "https://host:",
+            "ftp://snipe-it.example.com",
+        ] {
+            let mut settings = complete_settings();
+            settings.snipeit.url = String::from(url);
+            assert_eq!(
+                validate_settings(&settings),
+                Err(SettingsValidationError::SnipeItUrl),
+                "accepted malformed Snipe-IT URL: {url:?}"
+            );
+        }
     }
 
     #[test]

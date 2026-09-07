@@ -811,7 +811,7 @@ async fn trigger_sync_classifies_typed_failures_and_persists_the_returned_cause(
         (
             "network",
             spotter_core::snipeit::SnipeItError::NetworkError {
-                message: String::from("connection reset"),
+                kind: spotter_core::snipeit::NetworkErrorKind::Other,
             },
             "Error",
         ),

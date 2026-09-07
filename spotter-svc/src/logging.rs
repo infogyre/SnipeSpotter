@@ -261,6 +261,50 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn network_errors_do_not_escape_to_ipc_state_logs() -> Result<()> {
+        use secrecy::SecretString;
+        use tokio::net::TcpListener;
+
+        let sentinel = "NETWORK_SENTINEL_SECRET";
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        drop(listener);
+        let client = crate::snipeit_client::SnipeItClient::new(
+            format!("http://user:{sentinel}@{address}/?query={sentinel}"),
+            SecretString::from(String::from("token")),
+        )?;
+        let capture = TestCapture::new(4096);
+        let error = capture
+            .run(async {
+                let error = client
+                    .get_asset(7)
+                    .await
+                    .expect_err("closed endpoint must fail");
+                tracing::warn!(%error, "remote request failed");
+                error
+            })
+            .await;
+        let display = error.to_string();
+        let ipc = serde_json::to_string(&spotter_core::ipc::IpcResponse::Error {
+            message: display.clone(),
+        })?;
+        let state = serde_json::to_string(&spotter_core::state::ServiceState {
+            last_sync_result: Some(spotter_core::state::SyncResult::Failed {
+                error: display.clone(),
+            }),
+            ..Default::default()
+        })?;
+        let logs = capture.finish()?;
+        for output in [&display, &ipc, &state, &logs] {
+            assert!(!output.contains(sentinel));
+            assert!(output.len() < 4096);
+        }
+        assert!(display.starts_with("Snipe-IT network error: network "));
+        assert!(logs.contains("remote request failed"));
+        Ok(())
+    }
+
     #[test]
     fn zero_retention_is_rejected() -> Result<()> {
         let directory = tempfile::tempdir()?;

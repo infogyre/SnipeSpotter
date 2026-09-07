@@ -265,12 +265,12 @@ async fn read_response(
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(body_limit_error(status.as_u16()));
+        return Err(body_limit_error(status.as_u16(), retry));
     }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(network)? {
         if body.len().saturating_add(chunk.len()) > limit {
-            return Err(body_limit_error(status.as_u16()));
+            return Err(body_limit_error(status.as_u16(), retry));
         }
         body.extend_from_slice(&chunk);
     }
@@ -297,11 +297,11 @@ fn classify_status(status: u16, retry: Option<u64>) -> SnipeItError {
     }
 }
 
-fn body_limit_error(status: u16) -> SnipeItError {
+fn body_limit_error(status: u16, retry: Option<u64>) -> SnipeItError {
     if (200..=299).contains(&status) {
         safe_invalid("response body exceeds limit")
     } else {
-        classify_status(status, None)
+        classify_status(status, retry)
     }
 }
 
@@ -335,9 +335,14 @@ fn retry_after(response: &Response) -> Option<u64> {
     reason = "reqwest map_err supplies an owned error"
 )]
 fn network(error: reqwest::Error) -> SnipeItError {
-    SnipeItError::NetworkError {
-        message: error.to_string(),
-    }
+    let kind = if error.is_timeout() {
+        spotter_core::snipeit::NetworkErrorKind::Timeout
+    } else if error.is_connect() {
+        spotter_core::snipeit::NetworkErrorKind::Connect
+    } else {
+        spotter_core::snipeit::NetworkErrorKind::Other
+    };
+    SnipeItError::NetworkError { kind }
 }
 
 #[cfg(test)]
@@ -420,6 +425,28 @@ mod tests {
             client.find_asset_by_serial("SLOW").await,
             Err(SnipeItError::NetworkError { .. })
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_rate_limit_preserves_retry_after() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hardware/byserial/OVERSIZED"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "17")
+                    .set_body_string("x".repeat(MAX_ERROR_BODY_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("token")))?;
+        assert_eq!(
+            client.find_asset_by_serial("OVERSIZED").await,
+            Err(SnipeItError::RateLimited {
+                retry_after: Some(17)
+            })
+        );
         Ok(())
     }
 
