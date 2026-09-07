@@ -887,7 +887,9 @@ async fn owner_failed_result_save_updates_fsm() -> Result<()> {
 async fn owner_recovery_failure_updates_fsm_auth() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
-    append_pending_checkin(&journal_path, "checkin:11:2")?;
+    // Evidence-free payload: recovery must replay the check-in remotely, and the
+    // typed auth failure from that replay fails recovery closed.
+    append_pending_checkin_with_evidence(&journal_path, "checkin:11:2", false)?;
     let fsm = spawn_owner(
         4,
         journal_path,
@@ -917,7 +919,9 @@ async fn owner_recovery_failure_updates_fsm_auth() -> Result<()> {
 async fn owner_recovery_failure_updates_fsm_error() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
-    append_pending_checkin(&journal_path, "checkin:11:2")?;
+    // Evidence-free payload: recovery must replay the check-in remotely, and the
+    // typed server failure from that replay fails recovery closed.
+    append_pending_checkin_with_evidence(&journal_path, "checkin:11:2", false)?;
     let fsm = spawn_owner(
         4,
         journal_path,
@@ -947,7 +951,10 @@ async fn owner_recovery_failure_updates_fsm_error() -> Result<()> {
 async fn owner_recovery_failure_then_success_recovers() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
-    append_pending_checkin(&journal_path, "checkin:11:2")?;
+    // Evidence-free payload: the first recovery replays the check-in remotely
+    // and fails with a typed server error; the later read succeeds so a second
+    // command replays successfully and recovers.
+    append_pending_checkin_with_evidence(&journal_path, "checkin:11:2", false)?;
     let fsm = spawn_owner(
         4,
         journal_path.clone(),
@@ -1212,30 +1219,45 @@ impl RemoteFactory for CountingFactory {
 }
 
 fn append_pending_checkin(path: &std::path::Path, operation_id: &str) -> Result<()> {
+    append_pending_checkin_with_evidence(path, operation_id, true)
+}
+
+/// Append a prepared check-in record; `with_evidence` controls whether the
+/// record carries complete candidate-state evidence (which makes recovery
+/// reconcile without a remote call) or evidence-free payload (which forces a
+/// remote mutation replay during recovery).
+fn append_pending_checkin_with_evidence(
+    path: &std::path::Path,
+    operation_id: &str,
+    with_evidence: bool,
+) -> Result<()> {
     let operation = spotter_core::snipeit::MonitorCheckin {
         operation_id: String::from(operation_id),
         source_asset_id: 11,
         request: spotter_core::snipeit::CheckinRequest { status_id: 2 },
     };
+    let mut operation_json = serde_json::json!({
+        "version": 1,
+        "operation": operation,
+    });
+    if with_evidence {
+        operation_json["candidate_state"] = serde_json::json!({
+            "version": 1,
+            "kind": "service_state",
+            "operation_id": operation_id,
+            "state": single_monitor_state(
+                "MON-1",
+                Some(11),
+                Some(DateTime::UNIX_EPOCH),
+                false,
+            ),
+        });
+    }
     spotter_svc::operation_journal::append(
         path,
         &spotter_svc::operation_journal::JournalRecord::Prepared {
             operation_id: String::from(operation_id),
-            operation: serde_json::json!({
-                "version": 1,
-                "operation": operation,
-                "candidate_state": {
-                    "version": 1,
-                    "kind": "service_state",
-                    "operation_id": operation_id,
-                    "state": single_monitor_state(
-                        "MON-1",
-                        Some(11),
-                        Some(DateTime::UNIX_EPOCH),
-                        false,
-                    ),
-                },
-            }),
+            operation: operation_json,
         },
     )?;
     Ok(())
