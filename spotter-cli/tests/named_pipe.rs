@@ -211,7 +211,7 @@ fn observe_client_impersonation_level(
     }
     .context("failed to query client impersonation level")?;
 
-    let response = b"{\"kind\":\"ok\",\"message\":\"observed\"}\n";
+    let response = b"{\"type\":\"ok\",\"data\":{\"message\":\"observed\"}}\n";
     let mut bytes_written = 0;
     // SAFETY: `response` remains readable and the byte-count out-parameter writable during this
     // synchronous write.
