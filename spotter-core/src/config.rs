@@ -209,7 +209,12 @@ fn is_http_url(value: &str) -> bool {
 }
 
 fn is_valid_port(port: &str) -> bool {
-    !port.is_empty() && port.chars().all(|character| character.is_ascii_digit())
+    // Reject empty ports and reject port 0; the remaining digits must parse as
+    // a u16 so ports like 65536 or 999999999 fail closed.
+    match port.parse::<u16>() {
+        Ok(parsed) => parsed != 0,
+        Err(_) => false,
+    }
 }
 
 /// Convert a polling interval to a duration without overflowing.
@@ -459,6 +464,9 @@ interval_hours = 12
             "https://host with spaces",
             "https://host:abc",
             "https://host:",
+            "https://host:0",
+            "https://host:65536",
+            "https://host:99999999999",
             "ftp://snipe-it.example.com",
         ] {
             let mut settings = complete_settings();
