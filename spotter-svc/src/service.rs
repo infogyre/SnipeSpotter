@@ -411,6 +411,11 @@ impl CommandOwner {
         let update = validate_config_field(field, value).map_err(anyhow::Error::msg)?;
         let settings = apply_settings_update(&self.controller.settings, &update);
         spotter_core::validate_settings(&settings).context("invalid settings values")?;
+        crate::operation_journal::guard_remote_identity_change(
+            &self.journal_path,
+            &self.controller.settings,
+            &settings,
+        )?;
         let remote = if config_status(&settings).is_empty() {
             Some(self.remote_factory.build(&settings)?)
         } else {
@@ -1005,6 +1010,100 @@ mod tests {
                 .is_err()
         );
         assert_eq!(owner.controller.settings, original);
+    }
+
+    #[test]
+    fn pending_journal_blocks_identity_changes() -> Result<()> {
+        use crate::operation_journal::JournalRecord;
+
+        let directory = tempfile::tempdir()?;
+        let journal_path = directory.path().join("operations.jsonl");
+        crate::operation_journal::append(
+            &journal_path,
+            &JournalRecord::Prepared {
+                operation_id: String::from("checkin:7:6"),
+                operation: serde_json::json!({"operation_id":"checkin:7:6"}),
+            },
+        )?;
+        let saves = Arc::new(Mutex::new(Vec::new()));
+        let token_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut settings = spotter_core::Settings::default();
+        settings.snipeit.url = String::from("https://old.example");
+        settings.snipeit.api_token_encrypted = vec![1];
+        settings.snipeit.checkout_status_id = 5;
+        settings.snipeit.checkin_status_id = 6;
+        let mut owner = CommandOwner {
+            journal_path: journal_path.clone(),
+            polling_sender: tokio::sync::watch::channel(4).0,
+            persisted_state: PersistedServiceState::default(),
+            controller: crate::ServiceController::new(settings.clone()),
+            secret_protector: Box::new(RecordingProtector {
+                encrypted: vec![9],
+                calls: Arc::clone(&token_calls),
+            }),
+            settings_store: Box::new(RecordingSettingsStore {
+                saved: Arc::clone(&saves),
+            }),
+            state_store: Box::new(MemoryStateStore {
+                saves: Arc::new(Mutex::new(Vec::new())),
+            }),
+            remote: Box::new(crate::owner_ports::UnavailableRemote),
+            remote_factory: Box::new(UnavailableFactory),
+            discovery: Box::new(crate::owner_ports::UnavailableRemote),
+            clock: Box::new(crate::owner_ports::SystemClock),
+            journal_finalization: Box::new(crate::sync_engine::ProductionJournalFinalization),
+        };
+        for (field, value) in [
+            ("snipeit.url", "https://new.example"),
+            ("snipeit.checkout_status_id", "7"),
+            ("snipeit.checkin_status_id", "8"),
+        ] {
+            assert!(owner.set_config(field, value).is_err());
+        }
+        assert_eq!(owner.controller.settings, settings);
+        assert!(saves.lock().expect("settings saves lock").is_empty());
+
+        assert!(owner.set_token(b"replacement").is_ok());
+        assert_eq!(token_calls.lock().expect("token calls lock").len(), 1);
+        assert_eq!(saves.lock().expect("settings saves lock").len(), 1);
+
+        std::fs::write(&journal_path, b"malformed\n")?;
+        assert!(
+            owner
+                .set_config("snipeit.url", "https://new.example")
+                .is_err()
+        );
+        assert_eq!(saves.lock().expect("settings saves lock").len(), 1);
+
+        std::fs::write(&journal_path, b"")?;
+        assert!(
+            owner
+                .set_config("snipeit.url", "https://new.example")
+                .is_ok()
+        );
+        crate::operation_journal::append(
+            &journal_path,
+            &JournalRecord::Prepared {
+                operation_id: String::from("x"),
+                operation: serde_json::json!({}),
+            },
+        )?;
+        crate::operation_journal::append(
+            &journal_path,
+            &JournalRecord::RemoteOutcomeObserved {
+                operation_id: String::from("x"),
+                outcome: serde_json::json!({}),
+                candidate_state: None,
+            },
+        )?;
+        crate::operation_journal::append(
+            &journal_path,
+            &JournalRecord::StateCommitted {
+                operation_id: String::from("x"),
+            },
+        )?;
+        assert!(owner.set_config("snipeit.checkout_status_id", "7").is_ok());
+        Ok(())
     }
 
     #[test]
