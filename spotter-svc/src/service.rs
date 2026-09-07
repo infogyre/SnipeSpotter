@@ -1191,6 +1191,92 @@ mod tests {
 
     struct FailBeforeTerminalAppend;
 
+    /// Recovery remote whose check-in replay succeeds, matching the reconciled
+    /// outcome the production recovery path records before state activation.
+    struct SuccessfulRecoveryRemote;
+
+    impl crate::ports::RemoteReads for SuccessfulRecoveryRemote {
+        fn find_asset_by_serial<'a>(
+            &'a self,
+            _serial: &'a str,
+        ) -> crate::ports::PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn resolve_taxonomy<'a>(
+            &'a self,
+            _manufacturer: &'a str,
+            _model: &'a str,
+        ) -> crate::ports::PortFuture<'a, spotter_core::sync::ResolvedTaxonomy> {
+            Box::pin(async {
+                Ok(spotter_core::sync::ResolvedTaxonomy {
+                    manufacturer: spotter_core::sync::TaxonomyResolution::Missing,
+                    category: spotter_core::sync::TaxonomyResolution::Missing,
+                    model: spotter_core::sync::TaxonomyResolution::Missing,
+                    normalized_manufacturer: String::new(),
+                    normalized_model: String::new(),
+                })
+            })
+        }
+    }
+
+    impl crate::ports::RemoteMutations for SuccessfulRecoveryRemote {
+        fn execute_plan<'a>(
+            &'a self,
+            _plan: spotter_core::sync::SyncPlan,
+            _computer_asset_id: Option<u64>,
+            _journal_path: &'a std::path::Path,
+        ) -> crate::ports::PortFuture<'a, crate::ports::SyncOutcome> {
+            Box::pin(async { anyhow::bail!("unexpected plan execution") })
+        }
+
+        fn recover_pending<'a>(
+            &'a self,
+            _journal_path: &'a std::path::Path,
+        ) -> crate::ports::PortFuture<'a, Vec<String>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn compact_after_state_commit<'a>(
+            &'a self,
+            _journal_path: &'a std::path::Path,
+        ) -> crate::ports::PortFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    impl crate::sync_engine::RemoteMutations for SuccessfulRecoveryRemote {
+        fn patch_asset<'a>(
+            &'a mut self,
+            _asset_id: u64,
+            _request: &'a spotter_core::snipeit::AssetPatchRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<spotter_core::snipeit::Asset>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { anyhow::bail!("unexpected asset patch") })
+        }
+
+        fn checkout<'a>(
+            &'a mut self,
+            _operation: &'a spotter_core::snipeit::MonitorCheckout,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            Box::pin(async { anyhow::bail!("unexpected checkout") })
+        }
+
+        fn checkin<'a>(
+            &'a mut self,
+            _operation: &'a spotter_core::snipeit::MonitorCheckin,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     impl crate::sync_engine::JournalFinalization for FailBeforeTerminalAppend {
         fn before_terminal_append(&self) -> Result<()> {
             anyhow::bail!("injected recovery finalization failure")
@@ -1229,7 +1315,12 @@ mod tests {
                         "version": 1,
                         "kind": "service_state",
                         "operation_id": operation_id,
-                        "state": recovered,
+                        "state": {
+                            "last_sync_time": "2026-01-01T00:00:00Z",
+                            "last_sync_result": null,
+                            "matched_asset": null,
+                            "known_monitors": [],
+                        },
                     },
                 }),
             },
@@ -1239,7 +1330,7 @@ mod tests {
             saves: Arc::clone(&saves),
         };
         let mut active = PersistedServiceState::default();
-        let mut remote = crate::owner_ports::UnavailableRemote;
+        let mut remote = SuccessfulRecoveryRemote;
 
         let error = recover_owner_state_with_finalization(
             &journal_path,
