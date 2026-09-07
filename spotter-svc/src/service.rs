@@ -98,6 +98,7 @@ pub(crate) struct CommandOwner {
     remote_factory: Box<dyn RemoteFactory>,
     discovery: Box<dyn HardwareDiscovery>,
     clock: Box<dyn Clock>,
+    journal_finalization: Box<dyn crate::sync_engine::JournalFinalization>,
 }
 
 impl CommandOwner {
@@ -108,6 +109,7 @@ impl CommandOwner {
         persisted_state: PersistedServiceState,
         polling_sender: tokio::sync::watch::Sender<u64>,
         ports: crate::test_support::OwnerPorts,
+        journal_finalization: Box<dyn crate::sync_engine::JournalFinalization>,
     ) -> Self {
         let mut controller = crate::ServiceController::new(settings);
         controller.state = if config_status(&controller.settings).is_empty() {
@@ -127,6 +129,7 @@ impl CommandOwner {
             remote_factory: ports.remote_factory,
             discovery: ports.discovery,
             clock: ports.clock,
+            journal_finalization,
         }
     }
 
@@ -163,7 +166,10 @@ impl CommandOwner {
         if !config_status(&self.controller.settings).is_empty() {
             anyhow::bail!("service is not configured")
         }
-        self.recover_before_new_work().await?;
+        if let Err(error) = self.recover_before_new_work().await {
+            self.controller.state = state_after_sync_error(&error);
+            return Err(error);
+        }
         self.controller.state = crate::FsmState::Syncing;
         let now = self.clock.now();
         let result = self.run_sync(now).await;
@@ -213,7 +219,10 @@ impl CommandOwner {
         if !config_status(&self.controller.settings).is_empty() {
             anyhow::bail!("service is not configured")
         }
-        self.recover_before_new_work().await?;
+        if let Err(error) = self.recover_before_new_work().await {
+            self.controller.state = state_after_sync_error(&error);
+            return Err(error);
+        }
         if requested_serial.is_some_and(|serial| serial.trim().is_empty()) {
             anyhow::bail!("monitor serial must not be empty")
         }
@@ -305,20 +314,22 @@ impl CommandOwner {
         candidate_state.known_monitors = outcome.next_monitor_state.entries;
         self.state_store.save(&mut candidate_state)?;
         self.persisted_state = candidate_state.clone();
-        crate::sync_engine::commit_after_state_save(
+        crate::sync_engine::commit_after_state_save_with(
             &self.journal_path,
             &outcome.confirmed_operations,
+            self.journal_finalization.as_ref(),
         )
         .map_err(|error| anyhow::Error::new(SavedCandidateError(error)))?;
         Ok(IpcResponse::CheckinResult { checked_in })
     }
 
     async fn recover_before_new_work(&mut self) -> Result<()> {
-        recover_owner_state(
+        recover_owner_state_with_finalization(
             &self.journal_path,
             self.state_store.as_ref(),
             self.remote.as_mut(),
             &mut self.persisted_state,
+            self.journal_finalization.as_ref(),
         )
         .await
     }
@@ -387,9 +398,10 @@ impl CommandOwner {
         candidate_state.matched_asset = outcome.matched_asset;
         self.state_store.save(&mut candidate_state)?;
         self.persisted_state = candidate_state.clone();
-        crate::sync_engine::commit_after_state_save(
+        crate::sync_engine::commit_after_state_save_with(
             &self.journal_path,
             &outcome.confirmed_operations,
+            self.journal_finalization.as_ref(),
         )
         .map_err(|error| anyhow::Error::new(SavedCandidateError(error)))?;
         Ok(outcome.warnings)
@@ -684,6 +696,7 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
         remote_factory: Box::new(crate::owner_ports::SnipeItRemoteFactory),
         discovery: Box::new(crate::discovery::WindowsHardwareDiscovery),
         clock: Box::new(crate::owner_ports::SystemClock),
+        journal_finalization: Box::new(crate::sync_engine::ProductionJournalFinalization),
     }));
     let fsm = crate::fsm::spawn(32, move |command| {
         let owner = std::sync::Arc::clone(&owner);
@@ -979,6 +992,7 @@ mod tests {
             remote_factory: Box::new(FailingFactory),
             discovery: Box::new(crate::owner_ports::UnavailableRemote),
             clock: Box::new(crate::owner_ports::SystemClock),
+            journal_finalization: Box::new(crate::sync_engine::ProductionJournalFinalization),
         };
         assert!(
             owner
@@ -1012,6 +1026,7 @@ mod tests {
             remote_factory: Box::new(UnavailableFactory),
             discovery: Box::new(crate::owner_ports::UnavailableRemote),
             clock: Box::new(crate::owner_ports::SystemClock),
+            journal_finalization: Box::new(crate::sync_engine::ProductionJournalFinalization),
         };
 
         let response = owner
@@ -1206,6 +1221,7 @@ mod tests {
             remote_factory: Box::new(UnavailableFactory),
             discovery: Box::new(crate::owner_ports::UnavailableRemote),
             clock: Box::new(crate::owner_ports::SystemClock),
+            journal_finalization: Box::new(crate::sync_engine::ProductionJournalFinalization),
         };
         let response = owner.status(true);
         assert!(matches!(response, IpcResponse::StatusFull { .. }));

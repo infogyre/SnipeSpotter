@@ -31,6 +31,35 @@ pub mod test_support {
         StateStore,
     };
 
+    /// Deterministic journal-finalization fault injection for owner tests.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum JournalFinalizationFault {
+        /// Fail immediately before the terminal journal append.
+        BeforeTerminalAppend,
+        /// Fail after the terminal append, before compaction.
+        AfterTerminalAppend,
+    }
+
+    struct FaultJournalFinalization {
+        fault: JournalFinalizationFault,
+    }
+
+    impl crate::sync_engine::JournalFinalization for FaultJournalFinalization {
+        fn before_terminal_append(&self) -> Result<()> {
+            if self.fault == JournalFinalizationFault::BeforeTerminalAppend {
+                anyhow::bail!("injected journal fault before terminal append");
+            }
+            Ok(())
+        }
+
+        fn after_terminal_append(&self) -> Result<()> {
+            if self.fault == JournalFinalizationFault::AfterTerminalAppend {
+                anyhow::bail!("injected journal fault after terminal append");
+            }
+            Ok(())
+        }
+    }
+
     /// Complete external dependency bundle used by [`spawn_owner`].
     pub struct OwnerPorts {
         pub secret_protector: Box<dyn SecretProtector>,
@@ -97,6 +126,54 @@ pub mod test_support {
         persisted_state: ServiceState,
         ports: OwnerPorts,
     ) -> Result<crate::fsm::FsmHandle> {
+        spawn_owner_inner_with_finalization(
+            capacity,
+            journal_path,
+            settings,
+            persisted_state,
+            ports,
+            None,
+        )
+    }
+
+    /// Construct the owner with deterministic journal-finalization fault injection.
+    ///
+    /// The fault applies to every owner path that finalizes the journal (recovery, normal sync,
+    /// and forced check-in), enabling integration tests to prove candidate retention and
+    /// recoverable evidence at both approved fault boundaries.
+    ///
+    /// # Errors
+    /// Returns an error when the FSM channel capacity is zero.
+    pub fn spawn_owner_with_finalization(
+        capacity: usize,
+        journal_path: impl Into<PathBuf>,
+        settings: Settings,
+        persisted_state: ServiceState,
+        ports: OwnerPorts,
+        fault: JournalFinalizationFault,
+    ) -> Result<crate::fsm::FsmHandle> {
+        spawn_owner_inner_with_finalization(
+            capacity,
+            journal_path.into(),
+            settings,
+            persisted_state,
+            ports,
+            Some(fault),
+        )
+    }
+
+    fn spawn_owner_inner_with_finalization(
+        capacity: usize,
+        journal_path: PathBuf,
+        settings: Settings,
+        persisted_state: ServiceState,
+        ports: OwnerPorts,
+        fault: Option<JournalFinalizationFault>,
+    ) -> Result<crate::fsm::FsmHandle> {
+        let finalization: Box<dyn crate::sync_engine::JournalFinalization> = match fault {
+            Some(fault) => Box::new(FaultJournalFinalization { fault }),
+            None => Box::new(crate::sync_engine::ProductionJournalFinalization),
+        };
         let (polling_sender, _polling_receiver) =
             tokio::sync::watch::channel(settings.polling.interval_hours);
         let owner = std::sync::Arc::new(Mutex::new(crate::service::CommandOwner::from_test_ports(
@@ -105,6 +182,7 @@ pub mod test_support {
             persisted_state,
             polling_sender,
             ports,
+            finalization,
         )));
         crate::fsm::spawn(capacity, move |command| {
             let owner = std::sync::Arc::clone(&owner);

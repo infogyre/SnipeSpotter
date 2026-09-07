@@ -373,7 +373,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byserial_collection_response_returns_first_row() -> Result<()> {
+    async fn byserial_collection_response_with_multiple_rows_is_ambiguous() -> Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/hardware/byserial/SER1"))
@@ -385,7 +385,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
-        assert_eq!(client.find_asset_by_serial("SER1").await?.id, 11);
+        assert_eq!(
+            client.find_asset_by_serial("SER1").await,
+            Err(SnipeItError::AmbiguousResponse)
+        );
         Ok(())
     }
 

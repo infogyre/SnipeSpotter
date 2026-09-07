@@ -15,8 +15,9 @@ use spotter_core::{
 use spotter_svc::{
     ports::{HardwareDiscovery, PortFuture, RemoteReads},
     test_support::{
-        Clock, OwnerPorts, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
-        enqueue_owner_request, spawn_owner, spawn_owner_with_recovery,
+        Clock, JournalFinalizationFault, OwnerPorts, RemoteFactory, RemotePort, SecretProtector,
+        SettingsStore, StateStore, enqueue_owner_request, spawn_owner,
+        spawn_owner_with_finalization, spawn_owner_with_recovery,
     },
 };
 
@@ -310,6 +311,14 @@ impl Clock for FixedClock {
 }
 
 struct RemotePortUnavailable;
+
+struct RecoveryAuthFailureRemote;
+
+struct RecoveryServerFailureRemote;
+
+struct RecoveryThenSuccessRemote {
+    recovered: Arc<Mutex<bool>>,
+}
 
 struct FixedFactory;
 
@@ -607,7 +616,7 @@ async fn sync_state_save_failure_returns_error_and_preserves_previous_status() -
     else {
         anyhow::bail!("expected full status response");
     };
-    assert_eq!(state, "Syncing");
+    assert_eq!(state, "Error");
     assert_eq!(last_sync.as_deref(), Some("before"));
     assert!(matched_asset.is_none());
     Ok(())
@@ -872,6 +881,173 @@ async fn owner_failed_result_save_updates_fsm() -> Result<()> {
 }
 
 #[tokio::test]
+async fn owner_recovery_failure_updates_fsm_auth() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let journal_path = directory.path().join("operations.jsonl");
+    append_pending_checkin(&journal_path, "checkin:11:2")?;
+    let fsm = spawn_owner(
+        4,
+        journal_path,
+        checkin_settings(),
+        single_monitor_state("MON-1", Some(11), Some(DateTime::UNIX_EPOCH), true),
+        checkin_owner_ports(
+            Box::new(MemoryStateStore {
+                saves: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Box::new(RecoveryAuthFailureRemote),
+        ),
+    )?;
+
+    let response = fsm.request(ServiceCommand::TriggerSync).await?;
+    assert!(matches!(
+        response,
+        IpcResponse::Error { ref message } if message.contains("Snipe-IT authentication failed")
+    ));
+    assert!(matches!(
+        fsm.request(ServiceCommand::GetStatus).await?,
+        IpcResponse::Status { ref state, .. } if state == "Unconfigured"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_recovery_failure_updates_fsm_error() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let journal_path = directory.path().join("operations.jsonl");
+    append_pending_checkin(&journal_path, "checkin:11:2")?;
+    let fsm = spawn_owner(
+        4,
+        journal_path,
+        checkin_settings(),
+        single_monitor_state("MON-1", Some(11), Some(DateTime::UNIX_EPOCH), true),
+        checkin_owner_ports(
+            Box::new(MemoryStateStore {
+                saves: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Box::new(RecoveryServerFailureRemote),
+        ),
+    )?;
+
+    let response = fsm.request(ServiceCommand::TriggerSync).await?;
+    assert!(matches!(
+        response,
+        IpcResponse::Error { ref message } if message.contains("Snipe-IT server error")
+    ));
+    assert!(matches!(
+        fsm.request(ServiceCommand::GetStatus).await?,
+        IpcResponse::Status { ref state, .. } if state == "Error"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_recovery_failure_then_success_recovers() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let journal_path = directory.path().join("operations.jsonl");
+    append_pending_checkin(&journal_path, "checkin:11:2")?;
+    let fsm = spawn_owner(
+        4,
+        journal_path.clone(),
+        checkin_settings(),
+        single_monitor_state("MON-1", Some(11), Some(DateTime::UNIX_EPOCH), true),
+        checkin_owner_ports(
+            Box::new(MemoryStateStore {
+                saves: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Box::new(RecoveryThenSuccessRemote {
+                recovered: Arc::new(Mutex::new(false)),
+            }),
+        ),
+    )?;
+
+    let first = fsm.request(ServiceCommand::TriggerSync).await?;
+    assert!(matches!(first, IpcResponse::Error { .. }));
+    assert!(matches!(
+        fsm.request(ServiceCommand::GetStatus).await?,
+        IpcResponse::Status { ref state, .. } if state == "Error"
+    ));
+    let second = fsm.request(ServiceCommand::TriggerSync).await?;
+    assert!(matches!(second, IpcResponse::Error { .. }));
+    assert!(matches!(
+        fsm.request(ServiceCommand::GetStatus).await?,
+        IpcResponse::Status { ref state, .. } if state == "Error"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_normal_sync_post_save_fault_retains_candidate_and_evidence() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let journal_path = directory.path().join("operations.jsonl");
+    let state_saves = Arc::new(Mutex::new(Vec::new()));
+    let fsm = spawn_owner_with_finalization(
+        4,
+        journal_path.clone(),
+        checkin_settings(),
+        ServiceState::default(),
+        OwnerPorts {
+            secret_protector: Box::new(FakeProtector),
+            settings_store: Box::new(MemorySettingsStore {
+                saves: Arc::new(Mutex::new(Vec::new())),
+            }),
+            state_store: Box::new(MemoryStateStore {
+                saves: Arc::clone(&state_saves),
+            }),
+            remote: Box::new(SuccessfulRemote),
+            remote_factory: Box::new(FixedFactory),
+            discovery: Box::new(FixedDiscovery),
+            clock: Box::new(FixedClock),
+        },
+        JournalFinalizationFault::AfterTerminalAppend,
+    )?;
+
+    let response = fsm.request(ServiceCommand::TriggerSync).await?;
+    assert!(matches!(
+        response,
+        IpcResponse::Error { ref message } if message.contains("state candidate saved")
+    ));
+    assert_eq!(state_saves.lock().expect("state saves lock").len(), 1);
+    assert!(!spotter_svc::operation_journal::load(&journal_path)?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn owner_forced_checkin_post_save_fault_retains_candidate_and_evidence() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let journal_path = directory.path().join("operations.jsonl");
+    let saved = Arc::new(Mutex::new(None));
+    let fsm = spawn_owner_with_finalization(
+        4,
+        journal_path.clone(),
+        checkin_settings(),
+        single_monitor_state("MON-1", Some(11), Some(DateTime::UNIX_EPOCH), true),
+        checkin_owner_ports(
+            Box::new(CandidateStateStore {
+                saved: Arc::clone(&saved),
+                journal_path: journal_path.clone(),
+            }),
+            Box::new(RecordingCheckinRemote {
+                checkins: Arc::new(Mutex::new(Vec::new())),
+            }),
+        ),
+        JournalFinalizationFault::AfterTerminalAppend,
+    )?;
+
+    let response = fsm
+        .request(ServiceCommand::CheckinSerial {
+            serial: String::from("MON-1"),
+        })
+        .await?;
+    assert!(matches!(
+        response,
+        IpcResponse::Error { ref message } if message.contains("state candidate saved")
+    ));
+    assert!(saved.lock().expect("candidate state lock").is_some());
+    assert!(!spotter_svc::operation_journal::load(&journal_path)?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
 async fn trigger_sync_persists_partial_success_warnings_and_returns_idle() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let state_saves = Arc::new(Mutex::new(Vec::new()));
@@ -935,6 +1111,36 @@ fn checkin_settings() -> Settings {
     settings.snipeit.checkout_status_id = 1;
     settings.snipeit.checkin_status_id = 2;
     settings
+}
+
+fn append_pending_checkin(path: &std::path::Path, operation_id: &str) -> Result<()> {
+    let operation = spotter_core::snipeit::MonitorCheckin {
+        operation_id: String::from(operation_id),
+        source_asset_id: 11,
+        request: spotter_core::snipeit::CheckinRequest { status_id: 2 },
+    };
+    spotter_svc::operation_journal::append(
+        path,
+        &spotter_svc::operation_journal::JournalRecord::Prepared {
+            operation_id: String::from(operation_id),
+            operation: serde_json::json!({
+                "version": 1,
+                "operation": operation,
+                "candidate_state": {
+                    "version": 1,
+                    "kind": "service_state",
+                    "operation_id": operation_id,
+                    "state": single_monitor_state(
+                        "MON-1",
+                        Some(11),
+                        Some(DateTime::UNIX_EPOCH),
+                        false,
+                    ),
+                },
+            }),
+        },
+    )?;
+    Ok(())
 }
 
 fn single_monitor_state(
@@ -1710,6 +1916,94 @@ impl RemoteReads for RemotePortUnavailable {
     }
 }
 
+impl RemoteReads for RecoveryAuthFailureRemote {
+    fn find_asset_by_serial<'a>(
+        &'a self,
+        _serial: &'a str,
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
+    }
+
+    fn resolve_taxonomy<'a>(
+        &'a self,
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
+    }
+}
+
+impl RemoteReads for RecoveryServerFailureRemote {
+    fn find_asset_by_serial<'a>(
+        &'a self,
+        _serial: &'a str,
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
+    }
+
+    fn resolve_taxonomy<'a>(
+        &'a self,
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
+    }
+}
+
+impl RemoteReads for RecoveryThenSuccessRemote {
+    fn find_asset_by_serial<'a>(
+        &'a self,
+        _serial: &'a str,
+    ) -> PortFuture<'a, Option<spotter_core::snipeit::Asset>> {
+        let recovered = Arc::clone(&self.recovered);
+        Box::pin(async move {
+            let mut recovered = recovered
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recovery state lock poisoned"))?;
+            if !*recovered {
+                *recovered = true;
+                return Err(anyhow::Error::from(
+                    spotter_core::snipeit::SnipeItError::ServerError {
+                        status: 503,
+                        message: String::from("temporarily unavailable"),
+                    },
+                ));
+            }
+            Ok(None)
+        })
+    }
+
+    fn resolve_taxonomy<'a>(
+        &'a self,
+        _manufacturer: &'a str,
+        _model: &'a str,
+    ) -> PortFuture<'a, ResolvedTaxonomy> {
+        Box::pin(async { Ok(missing_taxonomy()) })
+    }
+}
+
 impl spotter_svc::sync_engine::RemoteMutations for RemotePortUnavailable {
     fn patch_asset<'a>(
         &'a mut self,
@@ -1733,6 +2027,84 @@ impl spotter_svc::sync_engine::RemoteMutations for RemotePortUnavailable {
         _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async { anyhow::bail!("remote unavailable") })
+    }
+}
+
+impl spotter_svc::sync_engine::RemoteMutations for RecoveryServerFailureRemote {
+    fn patch_asset<'a>(
+        &'a mut self,
+        _asset_id: u64,
+        _request: &'a spotter_core::snipeit::AssetPatchRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<spotter_core::snipeit::Asset>> + Send + 'a>,
+    > {
+        Box::pin(async { anyhow::bail!("unexpected asset patch") })
+    }
+
+    fn checkout<'a>(
+        &'a mut self,
+        _operation: &'a spotter_core::snipeit::MonitorCheckout,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("unexpected checkout") })
+    }
+
+    fn checkin<'a>(
+        &'a mut self,
+        _operation: &'a spotter_core::snipeit::MonitorCheckin,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("unexpected check-in") })
+    }
+}
+
+impl spotter_svc::sync_engine::RemoteMutations for RecoveryAuthFailureRemote {
+    fn patch_asset<'a>(
+        &'a mut self,
+        _asset_id: u64,
+        _request: &'a spotter_core::snipeit::AssetPatchRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<spotter_core::snipeit::Asset>> + Send + 'a>,
+    > {
+        Box::pin(async { anyhow::bail!("unexpected asset patch") })
+    }
+
+    fn checkout<'a>(
+        &'a mut self,
+        _operation: &'a spotter_core::snipeit::MonitorCheckout,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("unexpected checkout") })
+    }
+
+    fn checkin<'a>(
+        &'a mut self,
+        _operation: &'a spotter_core::snipeit::MonitorCheckin,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("unexpected check-in") })
+    }
+}
+
+impl spotter_svc::sync_engine::RemoteMutations for RecoveryThenSuccessRemote {
+    fn patch_asset<'a>(
+        &'a mut self,
+        _asset_id: u64,
+        _request: &'a spotter_core::snipeit::AssetPatchRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<spotter_core::snipeit::Asset>> + Send + 'a>,
+    > {
+        Box::pin(async { anyhow::bail!("unexpected asset patch") })
+    }
+
+    fn checkout<'a>(
+        &'a mut self,
+        _operation: &'a spotter_core::snipeit::MonitorCheckout,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("unexpected checkout") })
+    }
+
+    fn checkin<'a>(
+        &'a mut self,
+        _operation: &'a spotter_core::snipeit::MonitorCheckin,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async { anyhow::bail!("unexpected check-in") })
     }
 }
 
