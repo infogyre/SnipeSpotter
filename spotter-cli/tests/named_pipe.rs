@@ -346,11 +346,19 @@ async fn client_timeout_does_not_cancel_handler() -> Result<()> {
     assert_eq!(std::fs::read(&marker_path)?, b"durably committed");
 
     server.0.abort();
-    tokio::time::timeout(Duration::from_secs(5), &mut server.0)
-        .await
-        .context("named-pipe server cleanup exceeded its bound")?
-        .context("named-pipe server task panicked")?
-        .context("named-pipe server exited unexpectedly")?;
+    // Cancellation is the expected terminal state for an aborted server task; any
+    // other outcome (timeout, panic, clean exit, other error) fails the test.
+    match tokio::time::timeout(Duration::from_secs(5), &mut server.0).await {
+        Ok(Err(error)) if error.is_cancelled() => {}
+        Ok(Err(error)) => {
+            return Err(anyhow::Error::new(error).context("named-pipe server task panicked"));
+        }
+        Ok(Ok(Ok(()))) => {
+            anyhow::bail!("named-pipe server exited unexpectedly without cancellation")
+        }
+        Ok(Ok(Err(error))) => return Err(error.context("named-pipe server exited with an error")),
+        Err(_elapsed) => anyhow::bail!("named-pipe server cleanup exceeded its bound"),
+    }
     Ok(())
 }
 
