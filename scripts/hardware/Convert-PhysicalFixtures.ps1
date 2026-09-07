@@ -22,8 +22,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $capture = Get-Content -LiteralPath $InputPath -Raw -Encoding UTF8 | ConvertFrom-Json
-if ($capture.schema_version -ne 2) { throw "unsupported schema version: $($capture.schema_version)" }
-if ($capture.capture_type -ne 'physical_hardware_fixture') { throw "unexpected capture type: $($capture.capture_type)" }
+if ($capture.schema_version -ne 2) { throw 'capture_schema_invalid' }
+if ($capture.capture_type -ne 'physical_hardware_fixture') { throw 'capture_type_invalid' }
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
@@ -41,10 +41,10 @@ $smbiosBytes = [Convert]::FromHexString($smbiosHex)
 # Check WMI monitors for unredacted serials
 foreach ($monitor in $capture.wmi_monitors) {
     if ($monitor.serial -notmatch '^SER\d' -and $monitor.serial -ne '') {
-        throw "unredacted monitor serial detected: $($monitor.serial)"
+        throw 'wmi_serial_not_redacted'
     }
     if ($monitor.manufacturer_name -notmatch '^MFR\d' -and $monitor.manufacturer_name -ne '') {
-        throw "unredacted manufacturer name detected: $($monitor.manufacturer_name)"
+        throw 'wmi_manufacturer_not_redacted'
     }
 }
 
@@ -139,8 +139,10 @@ $summary = [ordered]@{
 $summaryPath = Join-Path $OutputDir 'fixture_summary.json'
 [IO.File]::WriteAllText($summaryPath, ($summary | ConvertTo-Json -Depth 6), [Text.Encoding]::UTF8)
 
-Write-Output "Fixtures written to $OutputDir"
-Write-Output "  smbios_fixture.bin ($($smbiosBytes.Length) bytes, $($capture.smbios.summary.structure_count) structures)"
-Write-Output "  wmi_monitors.json ($($wmiFixtures.Count) monitors)"
-Write-Output "  chassis.json (types: $($capture.chassis.types -join ', '))"
-Write-Output "  fixture_summary.json"
+[pscustomobject]@{
+    status = 'ok'
+    smbios_bytes = $smbiosBytes.Length
+    structures = $capture.smbios.summary.structure_count
+    monitors = $wmiFixtures.Count
+    chassis_types = @($capture.chassis.types).Count
+} | ConvertTo-Json -Compress
