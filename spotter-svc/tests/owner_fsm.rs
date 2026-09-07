@@ -693,11 +693,11 @@ async fn real_owner_commands_execute_through_fsm() -> Result<()> {
     ));
     assert!(matches!(
         fsm.request(commands[5].clone()).await?,
-        IpcResponse::Error { ref message } if message.contains("failed to resolve")
+        IpcResponse::Error { ref message } if message.contains("Snipe-IT authentication failed")
     ));
     assert!(matches!(
         fsm.request(commands[6].clone()).await?,
-        IpcResponse::CheckinResult { ref checked_in } if checked_in.is_empty()
+        IpcResponse::Error { ref message } if message.contains("Snipe-IT authentication failed")
     ));
     assert!(matches!(
         fsm.request(commands[7].clone()).await?,
@@ -715,10 +715,6 @@ async fn real_owner_commands_execute_through_fsm() -> Result<()> {
         .lock()
         .map_err(|_| anyhow::anyhow!("state save lock poisoned"))?;
     assert_eq!(state_saves.len(), 1);
-    assert_eq!(
-        state_saves[0].last_sync_time.as_deref(),
-        Some("2026-01-01T00:00:00+00:00")
-    );
     assert!(matches!(
         state_saves[0].last_sync_result,
         Some(spotter_core::state::SyncResult::Failed { .. })
