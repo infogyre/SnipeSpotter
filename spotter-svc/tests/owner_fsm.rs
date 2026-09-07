@@ -836,6 +836,42 @@ async fn trigger_sync_classifies_typed_failures_and_persists_the_returned_cause(
 }
 
 #[tokio::test]
+async fn owner_failed_result_save_updates_fsm() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let fsm = spawn_owner(
+        4,
+        directory.path().join("operations.jsonl"),
+        checkin_settings(),
+        ServiceState::default(),
+        OwnerPorts {
+            secret_protector: Box::new(FakeProtector),
+            settings_store: Box::new(MemorySettingsStore {
+                saves: Arc::new(Mutex::new(Vec::new())),
+            }),
+            state_store: Box::new(FailingStateStore),
+            remote: Box::new(SuccessfulRemote),
+            remote_factory: Box::new(FixedFactory),
+            discovery: Box::new(FailingDiscovery),
+            clock: Box::new(FixedClock),
+        },
+    )?;
+
+    let response = fsm.request(ServiceCommand::TriggerSync).await?;
+    assert!(matches!(
+        response,
+        IpcResponse::Error { ref message }
+            if message.contains("hardware discovery failed")
+                && message.contains("failed to persist synchronization failure")
+                && message.contains("injected state save failure")
+    ));
+    assert!(matches!(
+        fsm.request(ServiceCommand::GetStatus).await?,
+        IpcResponse::Status { ref state, .. } if state == "Error"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
 async fn trigger_sync_persists_partial_success_warnings_and_returns_idle() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let state_saves = Arc::new(Mutex::new(Vec::new()));
@@ -1196,7 +1232,7 @@ async fn checkin_reports_state_save_failure_and_retains_remote_evidence() -> Res
     clippy::too_many_lines,
     reason = "this integration test verifies restart recovery and idempotence"
 )]
-async fn restart_recovers_observed_checkin_without_repeating_mutation() -> Result<()> {
+async fn owner_retry_reconciles_before_new_work() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
     let initial_state = single_monitor_state("MON-1", Some(11), Some(DateTime::UNIX_EPOCH), true);

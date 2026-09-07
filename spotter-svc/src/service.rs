@@ -163,6 +163,7 @@ impl CommandOwner {
         if !config_status(&self.controller.settings).is_empty() {
             anyhow::bail!("service is not configured")
         }
+        self.recover_before_new_work().await?;
         self.controller.state = crate::FsmState::Syncing;
         let now = self.clock.now();
         let result = self.run_sync(now).await;
@@ -185,15 +186,21 @@ impl CommandOwner {
                 Err(error)
             }
             Err(error) => {
+                self.controller.state = state_after_sync_error(&error);
                 let mut candidate_state = self.persisted_state.clone();
                 candidate_state.last_sync_time = Some(now.to_rfc3339());
                 candidate_state.last_sync_result = Some(spotter_core::state::SyncResult::Failed {
                     error: error.to_string(),
                 });
-                self.state_store.save(&mut candidate_state)?;
-                self.persisted_state = candidate_state;
-                self.controller.state = state_after_sync_error(&error);
-                Err(error)
+                match self.state_store.save(&mut candidate_state) {
+                    Ok(()) => {
+                        self.persisted_state = candidate_state;
+                        Err(error)
+                    }
+                    Err(save_error) => Err(error.context(format!(
+                        "failed to persist synchronization failure: {save_error}"
+                    ))),
+                }
             }
         }
     }
@@ -206,6 +213,7 @@ impl CommandOwner {
         if !config_status(&self.controller.settings).is_empty() {
             anyhow::bail!("service is not configured")
         }
+        self.recover_before_new_work().await?;
         if requested_serial.is_some_and(|serial| serial.trim().is_empty()) {
             anyhow::bail!("monitor serial must not be empty")
         }
@@ -303,6 +311,16 @@ impl CommandOwner {
         )
         .map_err(|error| anyhow::Error::new(SavedCandidateError(error)))?;
         Ok(IpcResponse::CheckinResult { checked_in })
+    }
+
+    async fn recover_before_new_work(&mut self) -> Result<()> {
+        recover_owner_state(
+            &self.journal_path,
+            self.state_store.as_ref(),
+            self.remote.as_mut(),
+            &mut self.persisted_state,
+        )
+        .await
     }
 
     async fn run_sync(&mut self, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<String>> {
@@ -453,6 +471,7 @@ fn state_after_sync_error(error: &anyhow::Error) -> crate::FsmState {
                 crate::FsmState::Unconfigured
             }
             spotter_core::snipeit::SnipeItError::NotFound
+            | spotter_core::snipeit::SnipeItError::AmbiguousResponse
             | spotter_core::snipeit::SnipeItError::RateLimited { .. }
             | spotter_core::snipeit::SnipeItError::Validation { .. }
             | spotter_core::snipeit::SnipeItError::ServerError { .. }
@@ -725,6 +744,23 @@ pub(crate) async fn recover_owner_state(
     remote: &mut dyn RemotePort,
     persisted_state: &mut PersistedServiceState,
 ) -> Result<()> {
+    recover_owner_state_with_finalization(
+        journal_path,
+        state_store,
+        remote,
+        persisted_state,
+        &crate::sync_engine::ProductionJournalFinalization,
+    )
+    .await
+}
+
+async fn recover_owner_state_with_finalization(
+    journal_path: &std::path::Path,
+    state_store: &dyn StateStore,
+    remote: &mut dyn RemotePort,
+    persisted_state: &mut PersistedServiceState,
+    finalization: &dyn crate::sync_engine::JournalFinalization,
+) -> Result<()> {
     let confirmed = crate::sync_engine::recover_pending(journal_path, remote).await?;
     if confirmed.is_empty() {
         return Ok(());
@@ -738,8 +774,9 @@ pub(crate) async fn recover_owner_state(
         &confirmed,
     )?;
     state_store.save(&mut candidate_state)?;
-    crate::sync_engine::commit_after_state_save(journal_path, &confirmed)?;
     *persisted_state = candidate_state;
+    crate::sync_engine::commit_after_state_save_with(journal_path, &confirmed, finalization)
+        .map_err(|error| anyhow::Error::new(SavedCandidateError(error)))?;
     tracing::info!(
         count = confirmed.len(),
         "recovered pending Snipe-IT operations"
@@ -1017,6 +1054,96 @@ mod tests {
     #[test]
     fn unconfigured_settings_are_detected() {
         assert!(!config_status(&spotter_core::Settings::default()).is_empty());
+    }
+
+    struct MemoryStateStore {
+        saves: Arc<Mutex<Vec<PersistedServiceState>>>,
+    }
+
+    impl StateStore for MemoryStateStore {
+        fn save(&self, state: &mut PersistedServiceState) -> Result<()> {
+            self.saves
+                .lock()
+                .expect("state saves lock")
+                .push(state.clone());
+            Ok(())
+        }
+    }
+
+    struct FailBeforeTerminalAppend;
+
+    impl crate::sync_engine::JournalFinalization for FailBeforeTerminalAppend {
+        fn before_terminal_append(&self) -> Result<()> {
+            anyhow::bail!("injected recovery finalization failure")
+        }
+
+        fn after_terminal_append(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_recovery_commit_failure_keeps_saved_candidate() -> Result<()> {
+        use crate::operation_journal::JournalRecord;
+        use spotter_core::snipeit::{CheckinRequest, MonitorCheckin};
+
+        let directory = tempfile::tempdir()?;
+        let journal_path = directory.path().join("operations.jsonl");
+        let operation_id = String::from("checkin:7:2");
+        let recovered = PersistedServiceState {
+            last_sync_time: Some(String::from("2026-01-01T00:00:00Z")),
+            ..PersistedServiceState::default()
+        };
+        let operation = MonitorCheckin {
+            operation_id: operation_id.clone(),
+            source_asset_id: 7,
+            request: CheckinRequest { status_id: 2 },
+        };
+        crate::operation_journal::append(
+            &journal_path,
+            &JournalRecord::Prepared {
+                operation_id: operation_id.clone(),
+                operation: serde_json::json!({
+                    "version": 1,
+                    "operation": operation,
+                    "candidate_state": {
+                        "version": 1,
+                        "kind": "service_state",
+                        "operation_id": operation_id,
+                        "state": recovered,
+                    },
+                }),
+            },
+        )?;
+        let saves = Arc::new(Mutex::new(Vec::new()));
+        let store = MemoryStateStore {
+            saves: Arc::clone(&saves),
+        };
+        let mut active = PersistedServiceState::default();
+        let mut remote = crate::owner_ports::UnavailableRemote;
+
+        let error = recover_owner_state_with_finalization(
+            &journal_path,
+            &store,
+            &mut remote,
+            &mut active,
+            &FailBeforeTerminalAppend,
+        )
+        .await
+        .expect_err("terminal append fault must be reported");
+
+        assert!(error.downcast_ref::<SavedCandidateError>().is_some());
+        assert_eq!(
+            active.last_sync_time.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert_eq!(saves.lock().expect("state saves lock").len(), 1);
+        let pending = crate::operation_journal::pending_with_evidence(
+            &crate::operation_journal::load(&journal_path)?,
+        )?;
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].remote_outcome.is_some());
+        Ok(())
     }
 
     #[test]

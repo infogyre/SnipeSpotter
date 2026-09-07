@@ -13,6 +13,23 @@ use spotter_core::{
 
 use crate::operation_journal::{self, JournalRecord};
 
+pub(crate) trait JournalFinalization: Send + Sync {
+    fn before_terminal_append(&self) -> Result<()>;
+    fn after_terminal_append(&self) -> Result<()>;
+}
+
+pub(crate) struct ProductionJournalFinalization;
+
+impl JournalFinalization for ProductionJournalFinalization {
+    fn before_terminal_append(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn after_terminal_append(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 pub trait RemoteMutations: Send + Sync {
     /// Reconcile and apply a computer asset patch.
     fn patch_asset<'a>(
@@ -184,6 +201,7 @@ async fn execute_plan_inner<R: RemoteMutations + ?Sized>(
     base_state: &spotter_core::state::ServiceState,
     final_state: &spotter_core::state::ServiceState,
 ) -> Result<ExecutionOutcome> {
+    validate_unique_operation_ids(&plan, computer_asset_id)?;
     let mut confirmed = Vec::new();
     let mut current_state = base_state.clone();
     current_state
@@ -280,6 +298,31 @@ async fn execute_plan_inner<R: RemoteMutations + ?Sized>(
         warnings: plan.warnings,
         confirmed_operations: confirmed,
     })
+}
+
+fn validate_unique_operation_ids(plan: &SyncPlan, computer_asset_id: Option<u64>) -> Result<()> {
+    let mut operation_ids = std::collections::HashSet::new();
+    if let (Some(request), Some(asset_id)) = (&plan.asset_update, computer_asset_id) {
+        let operation_id = format!("patch:{asset_id}:{}", serialize_operation(request)?);
+        if !operation_ids.insert(operation_id.clone()) {
+            anyhow::bail!("duplicate operation ID in synchronization plan: {operation_id}");
+        }
+    }
+    for operation_id in plan
+        .monitor_checkouts
+        .iter()
+        .map(|operation| &operation.operation_id)
+        .chain(
+            plan.monitor_checkins
+                .iter()
+                .map(|operation| &operation.operation_id),
+        )
+    {
+        if !operation_ids.insert(operation_id.clone()) {
+            anyhow::bail!("duplicate operation ID in synchronization plan: {operation_id}");
+        }
+    }
+    Ok(())
 }
 
 fn state_after_operation(
@@ -481,6 +524,15 @@ fn observe_remote_outcome(
 /// # Errors
 /// Returns an error when the journal cannot be loaded, appended, or atomically compacted.
 pub fn commit_after_state_save(journal_path: &Path, operation_ids: &[String]) -> Result<()> {
+    commit_after_state_save_with(journal_path, operation_ids, &ProductionJournalFinalization)
+}
+
+pub(crate) fn commit_after_state_save_with(
+    journal_path: &Path,
+    operation_ids: &[String],
+    finalization: &dyn JournalFinalization,
+) -> Result<()> {
+    finalization.before_terminal_append()?;
     for operation_id in operation_ids {
         operation_journal::append(
             journal_path,
@@ -489,6 +541,7 @@ pub fn commit_after_state_save(journal_path: &Path, operation_ids: &[String]) ->
             },
         )?;
     }
+    finalization.after_terminal_append()?;
     compact_after_state_commit(journal_path)
 }
 
@@ -963,6 +1016,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn duplicate_plan_ids_rejected_before_append() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("journal");
+        let mut plan = checkout_plan();
+        let mut duplicate = checkin_operation();
+        duplicate.operation_id = plan.monitor_checkouts[0].operation_id.clone();
+        plan.monitor_checkins.push(duplicate);
+        let mut remote = FakeRemote::default();
+
+        let error = execute_plan(plan, None, &path, &mut remote)
+            .await
+            .expect_err("duplicate operation IDs must be rejected");
+
+        assert!(error.to_string().contains("duplicate operation ID"));
+        assert!(remote.calls.is_empty());
+        assert!(operation_journal::load(&path)?.is_empty());
+        Ok(())
+    }
+
     fn prepared_record<T: serde::Serialize>(operation_id: &str, operation: &T) -> JournalRecord {
         JournalRecord::Prepared {
             operation_id: operation_id.to_owned(),
@@ -975,6 +1048,79 @@ mod tests {
                 ),
             }),
         }
+    }
+
+    struct FaultFinalization {
+        fail_before_append: bool,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl JournalFinalization for FaultFinalization {
+        fn before_terminal_append(&self) -> Result<()> {
+            self.calls.lock().expect("fault calls lock").push("before");
+            if self.fail_before_append {
+                anyhow::bail!("injected before terminal append")
+            }
+            Ok(())
+        }
+
+        fn after_terminal_append(&self) -> Result<()> {
+            self.calls.lock().expect("fault calls lock").push("after");
+            if !self.fail_before_append {
+                anyhow::bail!("injected after terminal append")
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn journal_finalization_fault_seam_self_test() -> Result<()> {
+        for fail_before_append in [true, false] {
+            let directory = tempfile::tempdir()?;
+            let path = directory.path().join("journal");
+            let operation = checkout_plan().monitor_checkouts.remove(0);
+            operation_journal::append(
+                &path,
+                &prepared_record(&operation.operation_id, &operation),
+            )?;
+            observe_remote_outcome(
+                &path,
+                &operation.operation_id,
+                serde_json::json!({"status":"applied"}),
+                Some(complete_candidate_state(
+                    &operation.operation_id,
+                    &spotter_core::state::ServiceState::default(),
+                )),
+            )?;
+            let finalization = FaultFinalization {
+                fail_before_append,
+                calls: std::sync::Mutex::new(Vec::new()),
+            };
+            let state_saved = true;
+
+            let error = commit_after_state_save_with(
+                &path,
+                std::slice::from_ref(&operation.operation_id),
+                &finalization,
+            )
+            .expect_err("fault must interrupt finalization");
+
+            assert!(state_saved);
+            let calls = finalization.calls.lock().expect("fault calls lock");
+            assert_eq!(calls.first(), Some(&"before"));
+            assert_eq!(calls.contains(&"after"), !fail_before_append);
+            let records = operation_journal::load(&path)?;
+            assert_eq!(
+                records.iter().any(|record| matches!(
+                    record,
+                    JournalRecord::StateCommitted { operation_id }
+                        if operation_id == &operation.operation_id
+                )),
+                !fail_before_append
+            );
+            assert!(error.to_string().contains("injected"));
+        }
+        Ok(())
     }
 
     #[test]
