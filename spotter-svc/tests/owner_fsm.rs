@@ -2131,21 +2131,42 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryServerFailureRemote {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<spotter_core::snipeit::Asset>> + Send + 'a>,
     > {
-        Box::pin(async { anyhow::bail!("unexpected asset patch") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
     }
 
     fn checkout<'a>(
         &'a mut self,
         _operation: &'a spotter_core::snipeit::MonitorCheckout,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("unexpected checkout") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
     }
 
     fn checkin<'a>(
         &'a mut self,
         _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("unexpected check-in") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
     }
 }
 
@@ -2157,21 +2178,33 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryAuthFailureRemote {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<spotter_core::snipeit::Asset>> + Send + 'a>,
     > {
-        Box::pin(async { anyhow::bail!("unexpected asset patch") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 
     fn checkout<'a>(
         &'a mut self,
         _operation: &'a spotter_core::snipeit::MonitorCheckout,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("unexpected checkout") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 
     fn checkin<'a>(
         &'a mut self,
         _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("unexpected check-in") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 }
 
@@ -2183,21 +2216,42 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryThenSuccessRemote {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<spotter_core::snipeit::Asset>> + Send + 'a>,
     > {
-        Box::pin(async { anyhow::bail!("unexpected asset patch") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
     }
 
     fn checkout<'a>(
         &'a mut self,
         _operation: &'a spotter_core::snipeit::MonitorCheckout,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("unexpected checkout") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
     }
 
     fn checkin<'a>(
         &'a mut self,
         _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async { anyhow::bail!("unexpected check-in") })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
     }
 }
 
