@@ -17,7 +17,7 @@ UUID_SENTINEL = bytes(16)
 ERROR_CATEGORIES = frozenset(
     {
         "fixture_not_directory",
-        "fixture_file_oversize",
+        "fixture_too_large",
         "fixture_read_failed",
         "json_invalid",
         "json_forbidden_pattern",
@@ -55,10 +55,28 @@ def _bounded(categories: list[str]) -> list[str]:
     return result[:MAX_DIAGNOSTICS]
 
 
+class FixtureTooLarge(ValueError):
+    """Signal that a fixture exceeded the bounded read size."""
+
+
+def _read_fixture_bytes(path: Path) -> bytes:
+    """Read at most the fixture byte cap from one open file handle."""
+    with path.open("rb") as fixture:
+        raw = fixture.read(MAX_FIXTURE_BYTES + 1)
+    if len(raw) > MAX_FIXTURE_BYTES:
+        raise FixtureTooLarge
+    return raw
+
+
+def _read_fixture_text(path: Path) -> str:
+    """Read and decode a bounded text fixture from one open file handle."""
+    return _read_fixture_bytes(path).decode("utf-8-sig")
+
+
 def validate_smbios(raw: bytes) -> list[str]:
     """Validate a complete RawSMBIOSData wrapper and redacted Type 1 UUIDs."""
     if len(raw) > MAX_FIXTURE_BYTES:
-        return ["fixture_file_oversize"]
+        return ["fixture_too_large"]
     if len(raw) < 8:
         return ["smbios_invalid_wrapper"]
     declared = int.from_bytes(raw[4:8], "little")
@@ -132,10 +150,9 @@ def validate_fixture_dir(fixture_dir: Path) -> list[str]:
         if not path.exists():
             continue
         try:
-            if path.stat().st_size > MAX_FIXTURE_BYTES:
-                errors.append("fixture_file_oversize")
-                continue
-            errors.extend(_check_json(path.read_text(encoding="utf-8-sig"), name))
+            errors.extend(_check_json(_read_fixture_text(path), name))
+        except FixtureTooLarge:
+            errors.append("fixture_too_large")
         except (OSError, UnicodeError):
             errors.append("fixture_read_failed")
     smbios_path = fixture_dir / "smbios_fixture.bin"
@@ -143,10 +160,9 @@ def validate_fixture_dir(fixture_dir: Path) -> list[str]:
         errors.append("smbios_missing")
     else:
         try:
-            if smbios_path.stat().st_size > MAX_FIXTURE_BYTES:
-                errors.append("fixture_file_oversize")
-            else:
-                errors.extend(validate_smbios(smbios_path.read_bytes()))
+            errors.extend(validate_smbios(_read_fixture_bytes(smbios_path)))
+        except FixtureTooLarge:
+            errors.append("fixture_too_large")
         except OSError:
             errors.append("fixture_read_failed")
     return _bounded(errors)

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 HARDWARE = ROOT / "scripts" / "hardware"
@@ -114,14 +116,26 @@ class PhysicalFixturePrivacyTests(unittest.TestCase):
             )
             self.assertEqual(converted.returncode, 0, "conversion must accept the redacted synthetic capture")
             self.assertEqual(validator.validate_fixture_dir(fixture_dir), [])
+            rust_environment = os.environ.copy()
+            rust_environment["SPOTTER_SMBIOS_FIXTURE"] = str(fixture_dir / "smbios_fixture.bin")
             parsed = subprocess.run(
-                ["cargo", "test", "-p", "spotter-core", "parses_real_physical_smbios_fixture", "--quiet"],
+                [
+                    "cargo",
+                    "test",
+                    "-p",
+                    "spotter-core",
+                    "smbios::tests::parses_physical_smbios_fixture_from_env",
+                    "--",
+                    "--exact",
+                ],
                 cwd=ROOT,
                 check=False,
                 capture_output=True,
                 text=True,
+                env=rust_environment,
             )
             self.assertEqual(parsed.returncode, 0, "the Rust physical fixture parser compatibility test must pass")
+            self.assertIn("1 passed", parsed.stdout, "the generated fixture must be parsed by exactly one Rust test")
 
     def test_physical_validator_rejects_binary_uuid(self) -> None:
         """physical_validator_rejects_binary_uuid"""
@@ -138,6 +152,15 @@ class PhysicalFixturePrivacyTests(unittest.TestCase):
 
         unterminated = wrapped_fixture(SENTINEL)[:-2] + b"XY"
         self.assertIn("smbios_unterminated_strings", validator.validate_smbios(unterminated))
+
+    def test_fixture_read_enforces_byte_cap_for_stale_metadata(self) -> None:
+        """fixture_read_enforces_byte_cap_for_stale_metadata"""
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "oversize.json"
+            path.write_bytes(b"x" * (validator.MAX_FIXTURE_BYTES + 1))
+            with patch.object(Path, "stat", side_effect=AssertionError("metadata must not be consulted")):
+                with self.assertRaises(validator.FixtureTooLarge):
+                    validator._read_fixture_bytes(path)
 
     def test_physical_validator_failures_are_value_free(self) -> None:
         """physical_validator_failures_are_value_free"""
