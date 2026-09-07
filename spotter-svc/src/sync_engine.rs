@@ -1096,7 +1096,17 @@ mod tests {
                 fail_before_append,
                 calls: std::sync::Mutex::new(Vec::new()),
             };
-            let state_saved = true;
+            // The state save the caller performed before finalization is observable
+            // through the journal: the Prepared + RemoteOutcomeObserved records above
+            // are exactly what a successful save precedes. The self-test asserts the
+            // fault boundaries relative to that observable evidence instead of a
+            // synthetic flag.
+            let records_before = operation_journal::load(&path)?;
+            assert!(
+                records_before
+                    .iter()
+                    .any(|record| matches!(record, JournalRecord::RemoteOutcomeObserved { .. }))
+            );
 
             let error = commit_after_state_save_with(
                 &path,
@@ -1105,7 +1115,6 @@ mod tests {
             )
             .expect_err("fault must interrupt finalization");
 
-            assert!(state_saved);
             let calls = finalization.calls.lock().expect("fault calls lock");
             assert_eq!(calls.first(), Some(&"before"));
             assert_eq!(calls.contains(&"after"), !fail_before_append);
