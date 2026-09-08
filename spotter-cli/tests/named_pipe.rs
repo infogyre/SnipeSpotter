@@ -145,7 +145,7 @@ impl Drop for ImpersonationGuard {
 
 fn observe_client_impersonation_level(
     endpoint: &str,
-    ready: mpsc::SyncSender<()>,
+    ready: &mpsc::SyncSender<()>,
 ) -> Result<SECURITY_IMPERSONATION_LEVEL> {
     let endpoint = endpoint
         .encode_utf16()
@@ -226,7 +226,7 @@ fn named_pipe_client_limits_impersonation_level() -> Result<()> {
     let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
     let server_endpoint = endpoint.clone();
     let server = std::thread::spawn(move || {
-        observe_client_impersonation_level(&server_endpoint, ready_sender)
+        observe_client_impersonation_level(&server_endpoint, &ready_sender)
     });
     ready_receiver
         .recv_timeout(Duration::from_secs(5))
