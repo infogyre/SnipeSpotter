@@ -248,7 +248,27 @@ fn named_pipe_client_limits_impersonation_level() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "client-timeout ordering needs explicit accept, release, and cleanup phases"
+)]
 async fn client_timeout_does_not_cancel_handler() -> Result<()> {
+    struct MarkerGuard(std::path::PathBuf);
+
+    impl Drop for MarkerGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    struct ServerGuard(tokio::task::JoinHandle<Result<()>>);
+
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     let endpoint = unique_pipe_endpoint();
     let marker_path = std::env::temp_dir().join(format!(
         "SnipeSpotter-timeout-marker-{}-{}.txt",
@@ -257,12 +277,6 @@ async fn client_timeout_does_not_cancel_handler() -> Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |duration| duration.as_nanos()),
     ));
-    struct MarkerGuard(std::path::PathBuf);
-    impl Drop for MarkerGuard {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
-    }
     let _marker = MarkerGuard(marker_path.clone());
     let (accepted_sender, accepted_receiver) = tokio::sync::oneshot::channel();
     let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
@@ -311,12 +325,6 @@ async fn client_timeout_does_not_cancel_handler() -> Result<()> {
         fsm,
         endpoint.clone(),
     ));
-    struct ServerGuard(tokio::task::JoinHandle<Result<()>>);
-    impl Drop for ServerGuard {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
     let mut server = ServerGuard(server);
 
     let client_endpoint = endpoint;
