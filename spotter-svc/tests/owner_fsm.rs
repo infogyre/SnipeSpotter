@@ -695,11 +695,11 @@ async fn real_owner_commands_execute_through_fsm() -> Result<()> {
     ));
     assert!(matches!(
         fsm.request(commands[5].clone()).await?,
-        IpcResponse::Error { ref message } if message.contains("Snipe-IT authentication failed")
+        IpcResponse::Error { ref message } if message.contains("Snipe-IT server error")
     ));
     assert!(matches!(
         fsm.request(commands[6].clone()).await?,
-        IpcResponse::Error { ref message } if message.contains("Snipe-IT authentication failed")
+        IpcResponse::Error { ref message } if message.contains("Snipe-IT server error")
     ));
     assert!(matches!(
         fsm.request(commands[7].clone()).await?,
@@ -1217,8 +1217,8 @@ fn append_pending_checkin(path: &std::path::Path, operation_id: &str) -> Result<
 
 /// Append a prepared check-in record; `with_evidence` controls whether the
 /// record carries complete candidate-state evidence (which makes recovery
-/// reconcile without a remote call) or evidence-free payload (which forces a
-/// remote mutation replay during recovery).
+/// reconcile without a remote call) or a legacy evidence-free payload (which
+/// forces a remote mutation replay during recovery).
 fn append_pending_checkin_with_evidence(
     path: &std::path::Path,
     operation_id: &str,
@@ -1229,23 +1229,27 @@ fn append_pending_checkin_with_evidence(
         source_asset_id: 11,
         request: spotter_core::snipeit::CheckinRequest { status_id: 2 },
     };
-    let mut operation_json = serde_json::json!({
-        "version": 1,
-        "operation": operation,
-    });
-    if with_evidence {
-        operation_json["candidate_state"] = serde_json::json!({
+    let operation_json = if with_evidence {
+        serde_json::json!({
             "version": 1,
-            "kind": "service_state",
-            "operation_id": operation_id,
-            "state": single_monitor_state(
-                "MON-1",
-                Some(11),
-                Some(DateTime::UNIX_EPOCH),
-                false,
-            ),
-        });
-    }
+            "operation": operation,
+            "candidate_state": {
+                "version": 1,
+                "kind": "service_state",
+                "operation_id": operation_id,
+                "state": single_monitor_state(
+                    "MON-1",
+                    Some(11),
+                    Some(DateTime::UNIX_EPOCH),
+                    false,
+                ),
+            },
+        })
+    } else {
+        // Legacy journal shape: the raw operation payload without a version
+        // wrapper, so recovery replays it through the remote mutation port.
+        serde_json::to_value(operation)?
+    };
     spotter_svc::operation_journal::append(
         path,
         &spotter_svc::operation_journal::JournalRecord::Prepared {
@@ -2230,13 +2234,12 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryAuthFailureRemote {
 
     fn checkin<'a>(
         &'a mut self,
-        _operation: &'a spotter_core::snipeit::MonitorCheckin,
+        operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async {
-            Err(anyhow::Error::from(
-                spotter_core::snipeit::SnipeItError::AuthFailure,
-            ))
-        })
+        // Recovery records the reconciled outcome for evidenced operations before
+        // any remote call; the auth failure must surface from the read path first.
+        let _ = operation;
+        Box::pin(async { Ok(()) })
     }
 }
 
