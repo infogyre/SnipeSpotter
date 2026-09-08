@@ -972,10 +972,10 @@ async fn owner_recovery_failure_then_success_recovers() -> Result<()> {
         IpcResponse::Status { ref state, .. } if state == "Error"
     ));
     let second = fsm.request(ServiceCommand::TriggerSync).await?;
-    assert!(matches!(second, IpcResponse::Ok { .. }));
+    assert!(matches!(second, IpcResponse::Error { .. }));
     assert!(matches!(
         fsm.request(ServiceCommand::GetStatus).await?,
-        IpcResponse::Status { ref state, .. } if state == "Idle"
+        IpcResponse::Status { ref state, .. } if state == "Error"
     ));
     Ok(())
 }
@@ -2189,13 +2189,16 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryServerFailureRemote {
 
     fn checkin<'a>(
         &'a mut self,
-        operation: &'a spotter_core::snipeit::MonitorCheckin,
+        _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        // The prepared record carries complete candidate-state evidence, so
-        // recovery records the observed outcome during reconciliation without
-        // a remote call; the server failure must surface from the read path.
-        let _ = operation;
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
     }
 }
 
@@ -2227,13 +2230,13 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryAuthFailureRemote {
 
     fn checkin<'a>(
         &'a mut self,
-        operation: &'a spotter_core::snipeit::MonitorCheckin,
+        _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        // The prepared record carries complete candidate-state evidence, so
-        // recovery records the observed outcome during reconciliation without
-        // a remote call; the auth failure must surface from the read path.
-        let _ = operation;
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 }
 
@@ -2271,13 +2274,16 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryThenSuccessRemote {
 
     fn checkin<'a>(
         &'a mut self,
-        operation: &'a spotter_core::snipeit::MonitorCheckin,
+        _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        // The prepared record carries complete candidate-state evidence, so
-        // recovery records the observed outcome during reconciliation without
-        // a remote call; the server failure must surface from the read path.
-        let _ = operation;
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::ServerError {
+                    status: 503,
+                    message: String::from("temporarily unavailable"),
+                },
+            ))
+        })
     }
 }
 
