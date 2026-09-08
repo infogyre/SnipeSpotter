@@ -11,7 +11,8 @@ pub mod sync;
 
 pub use config::{
     BLANK_SETTINGS_TOML, CheckinPolicy, LoggingSettings, MonitorSettings, PollingSettings,
-    Settings, SnipeItSettings, config_status,
+    Settings, SettingsValidationError, SnipeItSettings, config_status, poll_duration,
+    validate_settings,
 };
 
 pub use identity::{

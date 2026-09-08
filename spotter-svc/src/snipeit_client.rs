@@ -2,10 +2,17 @@
 
 //! Authenticated Snipe-IT HTTP transport.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use reqwest::{Client, Response, StatusCode};
+use anyhow::{Context as _, Result};
+use reqwest::{Client, Response, StatusCode, Url};
+
+const MAX_SUCCESS_BODY_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+const PAGE_SIZE: usize = 100;
+const MAX_PAGE_REQUESTS: usize = 100;
+const MAX_TOTAL_ROWS: usize = 10_000;
+const PAGINATION_DEADLINE: Duration = Duration::from_secs(60);
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::de::DeserializeOwned;
 use spotter_core::snipeit::{
@@ -16,7 +23,7 @@ use spotter_core::snipeit::{
 
 pub struct SnipeItClient {
     client: Client,
-    base_url: String,
+    base_url: Url,
     token: SecretString,
 }
 
@@ -34,12 +41,16 @@ impl SnipeItClient {
         token: SecretString,
         timeout: Duration,
     ) -> Result<Self> {
-        let base_url = base_url.into().trim_end_matches('/').to_owned();
-        if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+        let base_url = Url::parse(base_url.into().trim()).context("invalid Snipe-IT URL")?;
+        if !matches!(base_url.scheme(), "http" | "https") {
             anyhow::bail!("Snipe-IT URL must use HTTP or HTTPS")
         }
+        // SPOTR-8 defers production HTTPS enforcement; plain HTTP remains exposed to interception.
         Ok(Self {
-            client: Client::builder().timeout(timeout).build()?,
+            client: Client::builder()
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             base_url,
             token,
         })
@@ -50,13 +61,13 @@ impl SnipeItClient {
     /// # Errors
     /// Returns [`SnipeItError`] for network, HTTP, or response-classification failures.
     pub async fn find_asset_by_serial(&self, serial: &str) -> Result<Asset, SnipeItError> {
-        let response = self
-            .get(&format!("api/v1/hardware/byserial/{serial}"))
-            .await?;
-        let status = response.status().as_u16();
-        let retry = retry_after(&response);
-        let body = response.text().await.map_err(network)?;
-        parse_asset_by_serial(status, &body, retry)
+        validate_serial(serial)?;
+        let mut url = self.endpoint_url(&["api", "v1", "hardware", "byserial"])?;
+        url.path_segments_mut()
+            .map_err(|()| safe_invalid("base URL cannot contain path segments"))?
+            .push(serial);
+        let response = self.send(reqwest::Method::GET, url).await?;
+        decode_response(response, parse_asset_by_serial).await
     }
 
     /// Get one asset by numeric ID.
@@ -64,11 +75,9 @@ impl SnipeItClient {
     /// # Errors
     /// Returns [`SnipeItError`] for network, HTTP, or response-classification failures.
     pub async fn get_asset(&self, asset_id: u64) -> Result<Asset, SnipeItError> {
-        let response = self.get(&format!("api/v1/hardware/{asset_id}")).await?;
-        let status = response.status().as_u16();
-        let retry = retry_after(&response);
-        let body = response.text().await.map_err(network)?;
-        parse_asset_by_serial(status, &body, retry)
+        let url = self.endpoint_url(&["api", "v1", "hardware", &asset_id.to_string()])?;
+        let response = self.send(reqwest::Method::GET, url).await?;
+        decode_response(response, parse_asset_by_serial).await
     }
 
     /// Patch an existing asset.
@@ -80,19 +89,14 @@ impl SnipeItClient {
         asset_id: u64,
         request: &AssetPatchRequest,
     ) -> Result<Asset, SnipeItError> {
+        let url = self.endpoint_url(&["api", "v1", "hardware", &asset_id.to_string()])?;
         let response = self
-            .request(
-                reqwest::Method::PATCH,
-                &format!("api/v1/hardware/{asset_id}"),
-            )
+            .request(reqwest::Method::PATCH, url)
             .json(request)
             .send()
             .await
             .map_err(network)?;
-        let status = response.status().as_u16();
-        let retry = retry_after(&response);
-        let body = response.text().await.map_err(network)?;
-        parse_asset_patch(status, &body, retry)
+        decode_response(response, parse_asset_patch).await
     }
 
     /// Check out a monitor asset to a computer asset.
@@ -104,16 +108,15 @@ impl SnipeItClient {
         source_id: u64,
         request: &CheckoutRequest,
     ) -> Result<(), SnipeItError> {
+        let url =
+            self.endpoint_url(&["api", "v1", "hardware", &source_id.to_string(), "checkout"])?;
         let response = self
-            .request(
-                reqwest::Method::POST,
-                &format!("api/v1/hardware/{source_id}/checkout"),
-            )
+            .request(reqwest::Method::POST, url)
             .json(request)
             .send()
             .await
             .map_err(network)?;
-        classify_mutation(response, true).await
+        decode_response(response, parse_checkout_response).await
     }
 
     /// Check in a monitor asset.
@@ -125,16 +128,15 @@ impl SnipeItClient {
         source_id: u64,
         request: &CheckinRequest,
     ) -> Result<(), SnipeItError> {
+        let url =
+            self.endpoint_url(&["api", "v1", "hardware", &source_id.to_string(), "checkin"])?;
         let response = self
-            .request(
-                reqwest::Method::POST,
-                &format!("api/v1/hardware/{source_id}/checkin"),
-            )
+            .request(reqwest::Method::POST, url)
             .json(request)
             .send()
             .await
             .map_err(network)?;
-        classify_mutation(response, false).await
+        decode_response(response, parse_checkin_response).await
     }
 
     /// List manufacturers matching a name.
@@ -170,81 +172,152 @@ impl SnipeItClient {
         struct Rows<T> {
             rows: Vec<T>,
         }
-        let mut offset = 0_u64;
+        let endpoint = endpoint.split('/').collect::<Vec<_>>();
+        let started = Instant::now();
         let mut values = Vec::new();
-        loop {
-            let response = self
-                .request(reqwest::Method::GET, endpoint)
-                .query(&[
-                    ("search", search),
-                    ("limit", "100"),
-                    ("offset", &offset.to_string()),
-                ])
-                .send()
-                .await
-                .map_err(network)?;
-            let status = response.status();
-            if !status.is_success() {
-                return Err(classify_http_error(response).await);
+        for request_index in 0..MAX_PAGE_REQUESTS {
+            if started.elapsed() >= PAGINATION_DEADLINE {
+                return Err(safe_invalid("pagination deadline exceeded"));
             }
-            let page: Rows<T> =
-                response
-                    .json()
-                    .await
-                    .map_err(|error| SnipeItError::InvalidResponse {
-                        message: error.to_string(),
-                    })?;
-            let count = page.rows.len();
-            values.extend(page.rows);
-            if count < 100 {
-                break;
-            }
-            offset += 100;
-        }
-        Ok(values)
-    }
-
-    async fn get(&self, endpoint: &str) -> Result<Response, SnipeItError> {
-        self.request(reqwest::Method::GET, endpoint)
-            .send()
+            let mut url = self.endpoint_url(&endpoint)?;
+            url.query_pairs_mut()
+                .append_pair("search", search)
+                .append_pair("limit", &PAGE_SIZE.to_string())
+                .append_pair("offset", &(request_index * PAGE_SIZE).to_string());
+            let response = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(started + PAGINATION_DEADLINE),
+                self.send(reqwest::Method::GET, url),
+            )
             .await
-            .map_err(network)
+            .map_err(|_| safe_invalid("pagination deadline exceeded"))??;
+            let (status, retry, body) = read_response(response).await?;
+            if !StatusCode::from_u16(status).is_ok_and(|status| status.is_success()) {
+                return Err(classify_status(status, retry));
+            }
+            let page: Rows<T> = serde_json::from_slice(&body)
+                .map_err(|_| safe_invalid("response body is not valid JSON"))?;
+            let count = page.rows.len();
+            if count > PAGE_SIZE {
+                return Err(safe_invalid("pagination page exceeds requested limit"));
+            }
+            if values.len().saturating_add(count) > MAX_TOTAL_ROWS {
+                return Err(safe_invalid("pagination row limit exceeded"));
+            }
+            values.extend(page.rows);
+            if count < PAGE_SIZE {
+                return Ok(values);
+            }
+            if request_index + 1 == MAX_PAGE_REQUESTS {
+                return Err(safe_invalid("pagination request limit exceeded"));
+            }
+        }
+        Err(safe_invalid("pagination request limit exceeded"))
     }
 
-    fn request(&self, method: reqwest::Method, endpoint: &str) -> reqwest::RequestBuilder {
+    fn endpoint_url(&self, segments: &[&str]) -> Result<Url, SnipeItError> {
+        let mut url = self.base_url.clone();
+        url.set_query(None);
+        url.set_fragment(None);
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|()| safe_invalid("base URL cannot contain path segments"))?;
+        path.pop_if_empty();
+        for segment in segments {
+            path.push(segment);
+        }
+        drop(path);
+        Ok(url)
+    }
+
+    async fn send(&self, method: reqwest::Method, url: Url) -> Result<Response, SnipeItError> {
+        self.request(method, url).send().await.map_err(network)
+    }
+
+    fn request(&self, method: reqwest::Method, url: Url) -> reqwest::RequestBuilder {
         self.client
-            .request(method, format!("{}/{}", self.base_url, endpoint))
+            .request(method, url)
             .bearer_auth(self.token.expose_secret())
             .header("Accept", "application/json")
     }
 }
 
-async fn classify_mutation(response: Response, checkout: bool) -> Result<(), SnipeItError> {
-    let status = response.status().as_u16();
+async fn decode_response<T>(
+    response: Response,
+    parser: fn(u16, &str, Option<u64>) -> Result<T, SnipeItError>,
+) -> Result<T, SnipeItError> {
+    let (status, retry, body) = read_response(response).await?;
+    let body =
+        std::str::from_utf8(&body).map_err(|_| safe_invalid("response body is not valid UTF-8"))?;
+    parser(status, body, retry)
+}
+
+async fn read_response(
+    mut response: Response,
+) -> Result<(u16, Option<u64>, Vec<u8>), SnipeItError> {
+    let status = response.status();
     let retry = retry_after(&response);
-    let body = response.text().await.map_err(network)?;
-    if checkout {
-        parse_checkout_response(status, &body, retry)
+    let limit = if status.is_success() {
+        MAX_SUCCESS_BODY_BYTES
     } else {
-        parse_checkin_response(status, &body, retry)
+        MAX_ERROR_BODY_BYTES
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(body_limit_error(status.as_u16(), retry));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(network)? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(body_limit_error(status.as_u16(), retry));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(classify_status(status.as_u16(), retry));
+    }
+    Ok((status.as_u16(), retry, body))
+}
+
+fn classify_status(status: u16, retry: Option<u64>) -> SnipeItError {
+    match status {
+        401 => SnipeItError::AuthFailure,
+        403 => SnipeItError::PermissionDenied,
+        404 => SnipeItError::NotFound,
+        429 => SnipeItError::RateLimited { retry_after: retry },
+        500..=599 => SnipeItError::ServerError {
+            status,
+            message: String::from("upstream server rejected the request"),
+        },
+        400 | 409 | 422 => SnipeItError::Validation {
+            message: String::from("upstream rejected the request"),
+        },
+        _ => safe_invalid("unexpected HTTP status"),
     }
 }
 
-async fn classify_http_error(response: Response) -> SnipeItError {
-    let status = response.status();
-    let retry = retry_after(&response);
-    let body = response.text().await.unwrap_or_default();
-    match status {
-        StatusCode::UNAUTHORIZED => SnipeItError::AuthFailure,
-        StatusCode::FORBIDDEN => SnipeItError::PermissionDenied,
-        StatusCode::NOT_FOUND => SnipeItError::NotFound,
-        StatusCode::TOO_MANY_REQUESTS => SnipeItError::RateLimited { retry_after: retry },
-        status if status.is_server_error() => SnipeItError::ServerError {
-            status: status.as_u16(),
-            message: body,
-        },
-        _ => SnipeItError::Validation { message: body },
+fn body_limit_error(status: u16, retry: Option<u64>) -> SnipeItError {
+    if (200..=299).contains(&status) {
+        safe_invalid("response body exceeds limit")
+    } else {
+        classify_status(status, retry)
     }
+}
+
+fn safe_invalid(message: &str) -> SnipeItError {
+    SnipeItError::InvalidResponse {
+        message: String::from(message),
+    }
+}
+
+fn validate_serial(serial: &str) -> Result<(), SnipeItError> {
+    if matches!(serial, "." | "..") || serial.chars().any(char::is_control) {
+        return Err(SnipeItError::Validation {
+            message: String::from("serial is not a safe URL segment"),
+        });
+    }
+    Ok(())
 }
 
 fn retry_after(response: &Response) -> Option<u64> {
@@ -262,9 +335,14 @@ fn retry_after(response: &Response) -> Option<u64> {
     reason = "reqwest map_err supplies an owned error"
 )]
 fn network(error: reqwest::Error) -> SnipeItError {
-    SnipeItError::NetworkError {
-        message: error.to_string(),
-    }
+    let kind = if error.is_timeout() {
+        spotter_core::snipeit::NetworkErrorKind::Timeout
+    } else if error.is_connect() {
+        spotter_core::snipeit::NetworkErrorKind::Connect
+    } else {
+        spotter_core::snipeit::NetworkErrorKind::Other
+    };
+    SnipeItError::NetworkError { kind }
 }
 
 #[cfg(test)]
@@ -309,7 +387,7 @@ mod tests {
                 serde_json::json!({"message":"failed"}),
                 SnipeItError::ServerError {
                     status: 500,
-                    message: String::from("failed"),
+                    message: String::from("upstream server rejected the request"),
                 },
             ),
         ] {
@@ -351,6 +429,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_rate_limit_preserves_retry_after() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/hardware/byserial/OVERSIZED"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "17")
+                    .set_body_string("x".repeat(MAX_ERROR_BODY_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("token")))?;
+        assert_eq!(
+            client.find_asset_by_serial("OVERSIZED").await,
+            Err(SnipeItError::RateLimited {
+                retry_after: Some(17)
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn rate_limit_preserves_retry_after() -> Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -373,7 +473,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byserial_collection_response_returns_first_row() -> Result<()> {
+    async fn byserial_collection_response_with_multiple_rows_is_ambiguous() -> Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/hardware/byserial/SER1"))
@@ -385,7 +485,10 @@ mod tests {
             .mount(&server)
             .await;
         let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
-        assert_eq!(client.find_asset_by_serial("SER1").await?.id, 11);
+        assert_eq!(
+            client.find_asset_by_serial("SER1").await,
+            Err(SnipeItError::AmbiguousResponse)
+        );
         Ok(())
     }
 
@@ -432,7 +535,7 @@ mod tests {
                 None,
                 SnipeItError::ServerError {
                     status: 500,
-                    message: String::from("internal"),
+                    message: String::from("upstream server rejected the request"),
                 },
             ),
         ] {
@@ -557,7 +660,7 @@ mod tests {
                 None,
                 SnipeItError::ServerError {
                     status: 500,
-                    message: String::from("err"),
+                    message: String::from("upstream server rejected the request"),
                 },
             ),
         ] {
@@ -707,6 +810,174 @@ mod tests {
         client
             .checkin_asset(42, &CheckinRequest { status_id: 4 })
             .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn http_body_caps_all_routes() -> Result<()> {
+        let oversized = "x".repeat(1_048_576 + 1);
+        for endpoint in [
+            "/api/v1/hardware/byserial/CAP",
+            "/api/v1/hardware/7",
+            "/api/v1/manufacturers",
+            "/api/v1/categories",
+            "/api/v1/models",
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(endpoint))
+                .respond_with(ResponseTemplate::new(200).set_body_string(oversized.clone()))
+                .mount(&server)
+                .await;
+            let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let result = match endpoint {
+                "/api/v1/hardware/byserial/CAP" => {
+                    client.find_asset_by_serial("CAP").await.map(|_| ())
+                }
+                "/api/v1/hardware/7" => client.get_asset(7).await.map(|_| ()),
+                "/api/v1/manufacturers" => client.find_manufacturers("x").await.map(|_| ()),
+                "/api/v1/categories" => client.find_categories("x").await.map(|_| ()),
+                _ => client.find_models("x").await.map(|_| ()),
+            };
+            assert_eq!(
+                result,
+                Err(SnipeItError::InvalidResponse {
+                    message: String::from("response body exceeds limit")
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chunked_response_enforces_cumulative_cap() -> Result<()> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await?;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await?;
+            let chunk = vec![b'x'; 65_536];
+            for _ in 0..=16 {
+                stream.write_all(b"10000\r\n").await?;
+                stream.write_all(&chunk).await?;
+                stream.write_all(b"\r\n").await?;
+            }
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+            Ok::<_, std::io::Error>(())
+        });
+        let client = SnipeItClient::new(
+            format!("http://{address}"),
+            SecretString::from(String::from("t")),
+        )?;
+        assert_eq!(
+            client.get_asset(7).await,
+            Err(SnipeItError::InvalidResponse {
+                message: String::from("response body exceeds limit")
+            })
+        );
+        server.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pagination_limits_and_total_deadline() -> Result<()> {
+        let server = MockServer::start().await;
+        let rows: Vec<_> = (0..101)
+            .map(|id| serde_json::json!({"id":id + 1,"name":"x"}))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"rows":rows})),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        assert_eq!(
+            client.find_models("x").await,
+            Err(SnipeItError::InvalidResponse {
+                message: String::from("pagination page exceeds requested limit")
+            })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serial_url_segment_contract() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id":7,"serial":"value"})),
+            )
+            .mount(&server)
+            .await;
+        let client = SnipeItClient::new(
+            format!("{}/prefix/", server.uri()),
+            SecretString::from(String::from("t")),
+        )?;
+        for serial in ["a/b?c#d", "50%", "日本語"] {
+            assert_eq!(client.find_asset_by_serial(serial).await?.id, 7);
+        }
+        let requests = server
+            .received_requests()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("request recording is disabled"))?;
+        let paths = requests
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(paths[0], "/prefix/api/v1/hardware/byserial/a%2Fb%3Fc%23d");
+        assert_eq!(paths[1], "/prefix/api/v1/hardware/byserial/50%25");
+        assert!(paths[2].starts_with("/prefix/api/v1/hardware/byserial/%"));
+        assert!(requests.iter().all(|request| request.url.query().is_none()));
+        let client = SnipeItClient::new(
+            format!("{}/prefix/", server.uri()),
+            SecretString::from(String::from("t")),
+        )?;
+        for serial in [".", "..", "bad\nvalue"] {
+            assert!(matches!(
+                client.find_asset_by_serial(serial).await,
+                Err(SnipeItError::Validation { .. })
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redirects_never_forward_requests() -> Result<()> {
+        let destination = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"id":7})))
+            .mount(&destination)
+            .await;
+        let source = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(302)
+                    .insert_header("Location", format!("{}/stolen", destination.uri()).as_str())
+                    .set_body_string("redirect-secret"),
+            )
+            .mount(&source)
+            .await;
+        let client = SnipeItClient::new(source.uri(), SecretString::from(String::from("t")))?;
+        assert!(matches!(
+            client.get_asset(7).await,
+            Err(SnipeItError::InvalidResponse { .. })
+        ));
+        assert!(
+            destination
+                .received_requests()
+                .await
+                .is_some_and(|requests| requests.is_empty())
+        );
         Ok(())
     }
 

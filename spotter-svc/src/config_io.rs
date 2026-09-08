@@ -6,7 +6,7 @@ use std::{fs, path::Path};
 
 use anyhow::{Context as _, Result};
 use secrecy::SecretString;
-use spotter_core::config::{BLANK_SETTINGS_TOML, Settings};
+use spotter_core::config::{BLANK_SETTINGS_TOML, Settings, validate_settings};
 
 #[derive(Debug)]
 pub struct DecryptedConfig {
@@ -26,7 +26,15 @@ pub fn load_settings(path: &Path) -> Result<Settings> {
     }
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+    let settings: Settings = toml::from_str(&text).map_err(|error| {
+        let location = error.span().map_or_else(
+            || String::from("unknown location"),
+            |span| format!("byte {}", span.start),
+        );
+        anyhow::anyhow!("invalid settings schema at {location}")
+    })?;
+    validate_settings(&settings).context("invalid settings values")?;
+    Ok(settings)
 }
 
 /// Atomically replace the settings file with serialized settings.
@@ -34,6 +42,7 @@ pub fn load_settings(path: &Path) -> Result<Settings> {
 /// # Errors
 /// Returns an error when serialization or replacement fails.
 pub fn save_settings(path: &Path, settings: &Settings) -> Result<()> {
+    validate_settings(settings).context("invalid settings values")?;
     let text = toml::to_string_pretty(settings).context("failed to serialize settings")?;
     atomic_write(path, text.as_bytes())
 }
@@ -97,6 +106,9 @@ mod tests {
         assert!(blank.snipeit.url.is_empty());
         let mut configured = blank;
         configured.snipeit.url = String::from("https://example.test");
+        configured.snipeit.api_token_encrypted = b"encrypted-token".to_vec();
+        configured.snipeit.checkout_status_id = 1;
+        configured.snipeit.checkin_status_id = 2;
         save_settings(&path, &configured)?;
         assert_eq!(load_settings(&path)?.snipeit.url, "https://example.test");
         Ok(())

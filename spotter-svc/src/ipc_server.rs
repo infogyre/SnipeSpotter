@@ -15,6 +15,9 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 
 use crate::fsm::FsmHandle;
 
+const IPC_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const IPC_RESPONSE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Decode one bounded protocol line.
 ///
 /// # Errors
@@ -50,12 +53,33 @@ pub async fn serve_one<S>(stream: S, fsm: &FsmHandle) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    serve_one_with_deadlines(
+        stream,
+        fsm,
+        IPC_REQUEST_READ_TIMEOUT,
+        IPC_RESPONSE_WRITE_TIMEOUT,
+    )
+    .await
+}
+
+async fn serve_one_with_deadlines<S>(
+    stream: S,
+    fsm: &FsmHandle,
+    read_timeout: std::time::Duration,
+    write_timeout: std::time::Duration,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut stream = BufReader::new(stream);
     let mut line = Vec::new();
-    let read = {
-        let mut limited = (&mut stream).take(u64::try_from(IPC_MAX_LINE_BYTES)?);
-        limited.read_until(b'\n', &mut line).await?
-    };
+    let max_line_bytes = u64::try_from(IPC_MAX_LINE_BYTES)?;
+    let read = tokio::time::timeout(read_timeout, async {
+        let mut limited = (&mut stream).take(max_line_bytes);
+        limited.read_until(b'\n', &mut line).await
+    })
+    .await
+    .context("IPC request read timed out")??;
     if read == 0 {
         bail!("IPC client disconnected before request")
     }
@@ -67,11 +91,13 @@ where
         line.pop();
     }
     let response = fsm.request(decode_command(&line)?).await?;
-    stream
-        .get_mut()
-        .write_all(&encode_response(&response)?)
-        .await?;
-    stream.get_mut().flush().await?;
+    let response = encode_response(&response)?;
+    tokio::time::timeout(write_timeout, async {
+        stream.get_mut().write_all(&response).await?;
+        stream.get_mut().flush().await
+    })
+    .await
+    .context("IPC response write timed out")??;
     Ok(())
 }
 
@@ -209,6 +235,140 @@ mod tests {
             .await
             .expect_err("unterminated requests must be rejected");
         assert!(error.to_string().contains("unterminated"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_read_deadline_prevents_dispatch() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&dispatches);
+        let fsm = fsm::spawn(1, move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async {
+                IpcResponse::Ok {
+                    message: String::from("unexpected"),
+                }
+            }
+        })?;
+        let (_client, server) = tokio::io::duplex(16);
+
+        let error = serve_one_with_deadlines(
+            server,
+            &fsm,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("an idle connected client must hit the request-read deadline");
+
+        assert!(error.to_string().contains("read timed out"));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipc_write_deadline_preserves_commit() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+
+        let committed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&committed);
+        let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel();
+        let mut started_sender = Some(started_sender);
+        let mut release_receiver = Some(release_receiver);
+        let fsm = fsm::spawn(1, move |_| {
+            let started_sender = started_sender.take();
+            let release_receiver = release_receiver.take();
+            let observed = Arc::clone(&observed);
+            async move {
+                if let Some(sender) = started_sender {
+                    let _ = sender.send(());
+                }
+                if let Some(receiver) = release_receiver {
+                    let _ = receiver.await;
+                }
+                observed.store(true, Ordering::SeqCst);
+                IpcResponse::Ok {
+                    message: String::from("committed"),
+                }
+            }
+        })?;
+        let (mut client, server) = tokio::io::duplex(1);
+        let server_task = tokio::spawn(async move {
+            serve_one_with_deadlines(
+                server,
+                &fsm,
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+            )
+            .await
+        });
+        client.write_all(b"{\"cmd\":\"get_status\"}\n").await?;
+        started_receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("handler start observation was cancelled"))?;
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "commit marker must remain unset until the handler future completes"
+        );
+        release_sender
+            .send(())
+            .map_err(|()| anyhow::anyhow!("failed to release handler"))?;
+
+        let error = server_task
+            .await?
+            .expect_err("a deliberately blocked tiny-buffer write must time out");
+
+        assert!(error.to_string().contains("write timed out"));
+        assert!(committed.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_does_not_cancel_handler() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use std::time::Duration;
+
+        let committed = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&committed);
+        let fsm = fsm::spawn(1, move |_| {
+            let observed = Arc::clone(&observed);
+            async move {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                observed.store(true, Ordering::SeqCst);
+                IpcResponse::Ok {
+                    message: String::from("committed"),
+                }
+            }
+        })?;
+        let (mut client, server) = tokio::io::duplex(64);
+        client.write_all(b"{\"cmd\":\"get_status\"}\n").await?;
+        let server_task = tokio::spawn(async move {
+            serve_one_with_deadlines(
+                server,
+                &fsm,
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+            )
+            .await
+        });
+        drop(client);
+
+        let _ = server_task.await?;
+        assert!(committed.load(Ordering::SeqCst));
         Ok(())
     }
 

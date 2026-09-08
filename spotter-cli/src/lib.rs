@@ -324,9 +324,15 @@ impl IpcTransport for NamedPipeTransport {
 fn exchange_named_pipe(command: &ServiceCommand, endpoint: &str) -> Result<IpcResponse> {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+
+    // Identification SQOS limits a malicious pipe server's impersonation level. It does not
+    // authenticate the server or prevent token theft; SPOTR-5 therefore remains open.
     let pipe = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
+        .security_qos_flags(SECURITY_IDENTIFICATION.0)
         .open(endpoint)
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
     let mut request = serde_json::to_vec(command).context("failed to encode service request")?;
@@ -497,17 +503,25 @@ impl ServiceRegistrationOptions {
     }
 
     /// Return registration options for the fixed production service identity.
-    #[must_use]
-    pub fn production() -> Self {
-        let executable_path = std::env::current_exe().map_or_else(
-            |_| PathBuf::from("spotter-svc.exe"),
-            |path| path.with_file_name("spotter-svc.exe"),
-        );
-        Self::new(
-            spotter_core::identity::ServiceRuntimeOptions::production(),
-            executable_path,
-        )
+    ///
+    /// # Errors
+    /// Returns an error when the current executable cannot be resolved to an absolute path.
+    pub fn production() -> Result<Self> {
+        registration_options_from_current_exe(std::env::current_exe())
     }
+}
+
+fn registration_options_from_current_exe(
+    current_exe: std::io::Result<PathBuf>,
+) -> Result<ServiceRegistrationOptions> {
+    let current_exe = current_exe.context("failed to resolve current executable")?;
+    if !current_exe.is_absolute() {
+        bail!("current executable path must be absolute")
+    }
+    Ok(ServiceRegistrationOptions::new(
+        spotter_core::identity::ServiceRuntimeOptions::production(),
+        current_exe.with_file_name("spotter-svc.exe"),
+    ))
 }
 
 /// Build the service registration identity selected by the parsed CLI.
@@ -533,7 +547,7 @@ pub fn registration_options(cli: &Cli) -> Result<ServiceRegistrationOptions> {
         && values.3.is_none()
         && values.4.is_none()
     {
-        return Ok(ServiceRegistrationOptions::production());
+        return ServiceRegistrationOptions::production();
     }
     let (
         Some(service_name),
@@ -597,9 +611,9 @@ pub const fn transport_timeout(_cli: &Cli) -> Duration {
 /// Return the fixed production registration identity.
 ///
 /// # Errors
-/// This fallback never fails; the `Result` preserves the test-support API shape.
+/// Returns an error when the current executable cannot be resolved to an absolute path.
 pub fn registration_options(_cli: &Cli) -> Result<ServiceRegistrationOptions> {
-    Ok(ServiceRegistrationOptions::production())
+    ServiceRegistrationOptions::production()
 }
 
 /// Production Windows Service Control Manager adapter.
@@ -651,21 +665,17 @@ impl WindowsServiceRegistrar {
     }
 
     /// Construct a registrar using the fixed production service identity.
-    #[must_use]
-    pub fn production() -> Self {
-        Self::default()
+    ///
+    /// # Errors
+    /// Returns an error when production registration options cannot be resolved safely.
+    pub fn production() -> Result<Self> {
+        Ok(Self::new(ServiceRegistrationOptions::production()?))
     }
 
     /// Return the registration options used by this registrar.
     #[must_use]
     pub const fn options(&self) -> &ServiceRegistrationOptions {
         &self.options
-    }
-}
-
-impl Default for WindowsServiceRegistrar {
-    fn default() -> Self {
-        Self::new(ServiceRegistrationOptions::production())
     }
 }
 
@@ -1141,6 +1151,34 @@ mod tests {
         let runtime = spotter_core::ServiceRuntimeOptions::production();
         let options = ServiceRegistrationOptions::new(runtime, PathBuf::new());
         assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn registration_path_fail_closed() {
+        let resolution_error = registration_options_from_current_exe(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "injected current executable failure",
+        )))
+        .expect_err("current executable resolution failure must be fatal");
+        assert!(resolution_error.to_string().contains("current executable"));
+
+        let relative_error =
+            registration_options_from_current_exe(Ok(PathBuf::from("relative/spotter-cli.exe")))
+                .expect_err("relative current executable paths must be rejected");
+        assert!(relative_error.to_string().contains("absolute"));
+
+        let absolute = if cfg!(windows) {
+            PathBuf::from(r"C:\Program Files\SnipeSpotter\spotter-cli.exe")
+        } else {
+            PathBuf::from("/opt/snipe-spotter/spotter-cli")
+        };
+        let options = registration_options_from_current_exe(Ok(absolute))
+            .expect("absolute current executable path must resolve");
+        assert!(options.executable_path.is_absolute());
+        assert_eq!(
+            options.executable_path.file_name(),
+            Some(std::ffi::OsStr::new("spotter-svc.exe"))
+        );
     }
 
     #[test]

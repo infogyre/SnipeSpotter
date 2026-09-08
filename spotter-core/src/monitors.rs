@@ -88,17 +88,35 @@ pub fn apply_forced_checkin_serials(
 
 /// Diff current monitors by serial and produce the next persisted state.
 ///
-/// Duplicate current serials are deterministically collapsed to the first
-/// lexicographically sorted record.
+/// Duplicate current serials are represented by the lexicographically smallest complete monitor
+/// record for that serial. Presence is tracked once per serial; callers decide whether ambiguity
+/// suppresses other work.
 #[must_use]
 pub fn diff_monitors(
     current: &[MonitorInfo],
     previous: &MonitorSyncState,
     now: DateTime<Utc>,
 ) -> MonitorDiff {
-    let current_by_serial: BTreeMap<_, _> = current
-        .iter()
-        .cloned()
+    let mut ordered_current = current.to_vec();
+    ordered_current.sort_by(|left, right| {
+        (
+            &left.serial,
+            &left.manufacturer_code,
+            &left.product_code,
+            left.manufacture_year,
+            left.manufacture_week,
+        )
+            .cmp(&(
+                &right.serial,
+                &right.manufacturer_code,
+                &right.product_code,
+                right.manufacture_year,
+                right.manufacture_week,
+            ))
+    });
+    let current_by_serial: BTreeMap<_, _> = ordered_current
+        .into_iter()
+        .rev()
         .map(|monitor| (monitor.serial.clone(), monitor))
         .collect();
     let previous_by_serial: BTreeMap<_, _> = previous

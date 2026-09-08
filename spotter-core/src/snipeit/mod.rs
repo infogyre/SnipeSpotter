@@ -94,6 +94,16 @@ pub struct MonitorCheckin {
     pub request: CheckinRequest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum NetworkErrorKind {
+    #[error("network request timed out")]
+    Timeout,
+    #[error("network connection failed")]
+    Connect,
+    #[error("network request failed")]
+    Other,
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SnipeItError {
     #[error("Snipe-IT resource not found")]
@@ -108,10 +118,12 @@ pub enum SnipeItError {
     Validation { message: String },
     #[error("Snipe-IT server error {status}: {message}")]
     ServerError { status: u16, message: String },
+    #[error("Snipe-IT response is ambiguous")]
+    AmbiguousResponse,
     #[error("invalid Snipe-IT response: {message}")]
     InvalidResponse { message: String },
-    #[error("Snipe-IT network error: {message}")]
-    NetworkError { message: String },
+    #[error("Snipe-IT network error: {kind}")]
+    NetworkError { kind: NetworkErrorKind },
 }
 
 #[must_use]
@@ -187,8 +199,11 @@ pub fn parse_asset_by_serial(
         return Err(SnipeItError::NotFound);
     }
     if let Some(rows) = value.get("rows").and_then(Value::as_array) {
-        let first = rows.first().ok_or(SnipeItError::NotFound)?;
-        return decode_asset(first.clone());
+        return match rows.as_slice() {
+            [] => Err(SnipeItError::NotFound),
+            [asset] => decode_asset(asset.clone()),
+            [_, _, ..] => Err(SnipeItError::AmbiguousResponse),
+        };
     }
     decode_asset(value)
 }
@@ -251,7 +266,7 @@ fn parse_mutation_response(
         .and_then(Value::as_str)
         .is_some_and(|status| status.eq_ignore_ascii_case("error"))
     {
-        return Err(validation(&message_text(&value)));
+        return Err(validation("upstream rejected the request"));
     }
     if value.get("rows").is_none() && value.get("status").is_none() {
         return Err(invalid("mutation response has neither rows nor status"));
@@ -260,17 +275,18 @@ fn parse_mutation_response(
 }
 
 fn parse_success(status: u16, body: &str, retry_after: Option<u64>) -> Result<Value, SnipeItError> {
-    let value: Value = serde_json::from_str(body).map_err(|error| invalid(&error.to_string()))?;
+    let value: Value =
+        serde_json::from_str(body).map_err(|_| invalid("response body is not valid JSON"))?;
     match status {
         200..=299 => Ok(value),
         401 => Err(SnipeItError::AuthFailure),
         403 => Err(SnipeItError::PermissionDenied),
         404 => Err(SnipeItError::NotFound),
         429 => Err(SnipeItError::RateLimited { retry_after }),
-        400 | 409 | 422 => Err(validation(&message_text(&value))),
+        400 | 409 | 422 => Err(validation("upstream rejected the request")),
         500..=599 => Err(SnipeItError::ServerError {
             status,
-            message: message_text(&value),
+            message: String::from("upstream server rejected the request"),
         }),
         _ => Err(invalid(&format!("unexpected HTTP status {status}"))),
     }
@@ -295,7 +311,7 @@ fn validate_operation(
 
 fn decode_asset(value: Value) -> Result<Asset, SnipeItError> {
     let asset: Asset =
-        serde_json::from_value(value).map_err(|error| invalid(&error.to_string()))?;
+        serde_json::from_value(value).map_err(|_| invalid("asset response schema is invalid"))?;
     if asset.id == 0 {
         return Err(invalid("asset response has zero ID"));
     }
@@ -362,10 +378,26 @@ mod tests {
             2
         );
         assert_eq!(
+            parse_asset_by_serial(200, r#"{"rows":[]}"#, None),
+            Err(SnipeItError::NotFound)
+        );
+        assert_eq!(
             parse_asset_by_serial(200, r#"{"message":"Asset not found"}"#, None),
             Err(SnipeItError::NotFound)
         );
         Ok(())
+    }
+
+    #[test]
+    fn ambiguous_remote_assets_rejected() {
+        assert_eq!(
+            parse_asset_by_serial(
+                200,
+                r#"{"rows":[{"id":2,"serial":"B"},{"id":3,"serial":"B"}]}"#,
+                None,
+            ),
+            Err(SnipeItError::AmbiguousResponse)
+        );
     }
 
     #[test]
@@ -391,7 +423,7 @@ mod tests {
                 None
             ),
             Err(SnipeItError::Validation {
-                message: String::from("required; invalid")
+                message: String::from("upstream rejected the request")
             })
         );
     }

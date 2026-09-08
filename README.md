@@ -30,24 +30,36 @@ The workspace contains exactly six packages: `spotter-core`, `spotter-win32`, `s
 
 ## Quick start
 
-```powershell
-# Install the MSI from an elevated terminal
-msiexec /i SnipeSpotter-<version>-x64.msi /qn
+Run this sequence from an elevated PowerShell terminal. The MSI updates the system `PATH`, but an already-open shell does not automatically inherit that update. Open a new shell, or explicitly use `%ProgramFiles%\infogyre\SnipeSpotter\bin\spotter-cli.exe` (or refresh `$env:Path`) until `spotter-cli` is available.
 
-# Configure the Snipe-IT connection
+```powershell
+# Install the MSI; it registers but intentionally does not start the service.
+msiexec /i SnipeSpotter-<version>-x64.msi /qn /norestart
+Start-Service -Name SnipeSpotter
+
+# Wait at most 30 seconds for Running, then for the pipe and Unconfigured status.
+Import-Module .\scripts\TestSupport\Scm.psm1
+Import-Module .\scripts\TestSupport\Wait.psm1
+Wait-ServiceState -Name SnipeSpotter -State Running -TimeoutSeconds 30
+Wait-Condition -Description 'SnipeSpotter named pipe' -TimeoutSeconds 30 -Condition {
+    Test-Path -LiteralPath '\\.\pipe\SnipeSpotter'
+} | Out-Null
+Wait-Condition -Description 'SnipeSpotter status response' -TimeoutSeconds 30 -Condition {
+    try { (spotter-cli --json status | ConvertFrom-Json).state -eq 'Unconfigured' } catch { $false }
+} | Out-Null
+
+# Configure only after bounded readiness succeeds.
 spotter-cli config set snipeit.url https://snipe.example.test
 spotter-cli config set snipeit.checkout_status_id 5
 spotter-cli config set snipeit.checkin_status_id 6
 spotter-cli config set-token
-
-# Trigger the first synchronization
 spotter-cli sync
-
-# Verify status
 spotter-cli status --full
 ```
 
-SnipeSpotter does not create Snipe-IT assets, manufacturers, categories, or models. The computer and monitor assets must already exist in Snipe-IT and be findable by serial number.
+The repository’s elevated MSI lifecycle harness exercises this same fresh-install order: install, explicit start, bounded sustained service/pipe/status readiness, then CLI configuration. On Linux, `documented_quickstart_fresh_msi` validates this documentation-to-harness wiring rather than executing Windows runtime behavior.
+
+SnipeSpotter does not create Snipe-IT assets, manufacturers, categories, or models. Duplicate local monitor serials are treated as present but ambiguous: no mutations are planned for them and only bounded warnings are emitted. The computer and monitor assets must already exist in Snipe-IT and be uniquely findable by serial number.
 
 ## Documentation
 

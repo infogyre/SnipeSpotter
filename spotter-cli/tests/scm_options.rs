@@ -24,7 +24,9 @@ fn registration_options_preserve_isolated_runtime_identity() {
     let registrar = spotter_cli::WindowsServiceRegistrar::new(options.clone());
     assert_eq!(registrar.options(), &options);
     assert_eq!(
-        ServiceRegistrationOptions::production().runtime,
+        ServiceRegistrationOptions::production()
+            .expect("production registration must resolve")
+            .runtime,
         ServiceRuntimeOptions::production()
     );
 }
@@ -159,6 +161,9 @@ fn test_support_without_overrides_preserves_production_registration() {
         .expect("production registration must remain available in test-support builds");
 
     assert_eq!(options.runtime, ServiceRuntimeOptions::production());
-    assert_eq!(options, ServiceRegistrationOptions::production());
+    assert_eq!(
+        options,
+        ServiceRegistrationOptions::production().expect("production registration must resolve")
+    );
     assert_eq!(spotter_cli::transport_endpoint(&cli), None);
 }

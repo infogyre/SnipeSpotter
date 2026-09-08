@@ -168,6 +168,8 @@ fn fill_if_empty(destination: &mut String, fallback: String) {
 
 #[cfg(test)]
 mod tests {
+    use std::{env, fs};
+
     use super::*;
 
     fn structure(kind: u8, mut formatted: Vec<u8>, strings: &[&str]) -> Vec<u8> {
@@ -242,6 +244,35 @@ mod tests {
     /// SMBIOS 3.6, chassis type 3). All identifiers redacted to deterministic
     /// PLACEHOLDER_* strings. Proves the production parser handles real
     /// multi-structure tables with correct string indexing.
+    #[test]
+    fn parses_physical_smbios_fixture_from_env() {
+        let Some(path) = env::var_os("SPOTTER_SMBIOS_FIXTURE") else {
+            // Invoked without the harness environment: fall back to the
+            // committed physical fixture so the test remains deterministic
+            // for plain `cargo test` runs.
+            let raw = include_bytes!("../../tests/fixtures/physical/smbios_fixture.bin").as_slice();
+            let parsed = parse_smbios_tables(raw).expect("committed fixture must parse");
+            assert!(!parsed.manufacturer.is_empty());
+            return;
+        };
+        let raw = fs::read(path).expect("SPOTTER_SMBIOS_FIXTURE must be readable");
+        let parsed = parse_smbios_tables(&raw).expect("fixture under test must parse");
+
+        assert!(
+            !parsed.manufacturer.is_empty(),
+            "manufacturer must be populated"
+        );
+        assert!(!parsed.model.is_empty(), "model must be populated");
+        assert!(!parsed.serial.is_empty(), "serial must be populated");
+        assert_eq!(parsed.chassis_type, ChassisType(3));
+        assert!(!parsed.chassis_type.is_portable());
+        assert!(
+            parsed.manufacturer.starts_with("PLACEHOLDER")
+                || parsed.manufacturer.starts_with("PLAC")
+        );
+        assert!(parsed.serial.starts_with("PLACEHOLDER") || parsed.serial.starts_with("PLAC"));
+    }
+
     #[test]
     fn parses_real_physical_smbios_fixture() {
         let raw = include_bytes!("../../tests/fixtures/physical/smbios_fixture.bin");

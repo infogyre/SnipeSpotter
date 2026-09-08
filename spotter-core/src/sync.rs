@@ -2,7 +2,11 @@
 
 //! Deterministic synchronization planning.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use chrono::{DateTime, Duration, Utc};
+
+const MAX_DUPLICATE_SERIAL_WARNINGS: usize = 16;
 
 use crate::{
     config::{CheckinPolicy, MonitorSettings},
@@ -75,6 +79,7 @@ pub fn plan_sync(
 ) -> SyncPlan {
     let mut warnings = Vec::new();
     let asset_update = plan_system_update(system, system_taxonomy, snipeit_asset, &mut warnings);
+    let duplicate_serials = duplicate_serials_with_warnings(monitors, &mut warnings);
     let current: Vec<_> = monitors
         .iter()
         .map(|resolved| resolved.monitor.clone())
@@ -84,6 +89,9 @@ pub fn plan_sync(
     let mut checkouts = Vec::new();
 
     for resolved in monitors {
+        if duplicate_serials.contains(resolved.monitor.serial.as_str()) {
+            continue;
+        }
         let Some(source_id) = resolved.asset_id.filter(|id| *id != 0) else {
             warnings.push(format!(
                 "monitor {} has no matching Snipe-IT asset",
@@ -144,12 +152,38 @@ pub fn plan_sync(
     }
 
     let mut next_monitor_state = diff.next_state;
+    apply_planned_monitor_state(
+        &mut next_monitor_state,
+        monitors,
+        &duplicate_serials,
+        &checkouts,
+        &checkins,
+    );
+
+    SyncPlan {
+        asset_update,
+        monitor_checkouts: checkouts,
+        monitor_checkins: checkins,
+        next_monitor_state,
+        warnings,
+    }
+}
+
+fn apply_planned_monitor_state(
+    next_monitor_state: &mut MonitorSyncState,
+    monitors: &[ResolvedMonitor],
+    duplicate_serials: &BTreeSet<&str>,
+    checkouts: &[MonitorCheckout],
+    checkins: &[MonitorCheckin],
+) {
     for entry in &mut next_monitor_state.entries {
-        if let Some(resolved) = monitors
-            .iter()
-            .find(|resolved| resolved.monitor.serial == entry.serial)
-        {
-            entry.snipeit_asset_id = resolved.asset_id;
+        if !duplicate_serials.contains(entry.serial.as_str()) {
+            if let Some(resolved) = monitors
+                .iter()
+                .find(|resolved| resolved.monitor.serial == entry.serial)
+            {
+                entry.snipeit_asset_id = resolved.asset_id;
+            }
         }
         if checkouts
             .iter()
@@ -164,14 +198,34 @@ pub fn plan_sync(
             entry.checked_out = false;
         }
     }
+}
 
-    SyncPlan {
-        asset_update,
-        monitor_checkouts: checkouts,
-        monitor_checkins: checkins,
-        next_monitor_state,
-        warnings,
+fn duplicate_serials_with_warnings<'a>(
+    monitors: &'a [ResolvedMonitor],
+    warnings: &mut Vec<String>,
+) -> BTreeSet<&'a str> {
+    let mut serial_counts = BTreeMap::new();
+    for resolved in monitors {
+        *serial_counts
+            .entry(resolved.monitor.serial.as_str())
+            .or_insert(0_usize) += 1;
     }
+    let duplicate_serials: BTreeSet<_> = serial_counts
+        .into_iter()
+        .filter_map(|(serial, count)| (count > 1).then_some(serial))
+        .collect();
+    for serial in duplicate_serials.iter().take(MAX_DUPLICATE_SERIAL_WARNINGS) {
+        warnings.push(format!(
+            "monitor serial {serial} is duplicated locally; mutations suppressed"
+        ));
+    }
+    if duplicate_serials.len() > MAX_DUPLICATE_SERIAL_WARNINGS {
+        warnings.push(format!(
+            "{} additional duplicated monitor serial(s) suppressed",
+            duplicate_serials.len() - MAX_DUPLICATE_SERIAL_WARNINGS
+        ));
+    }
+    duplicate_serials
 }
 
 fn plan_system_update(
@@ -291,6 +345,52 @@ mod tests {
             asset_id,
             taxonomy: taxonomy(4),
         }
+    }
+
+    #[test]
+    fn duplicate_serials_preserve_presence_without_mutations() {
+        let previous = MonitorSyncState {
+            entries: vec![MonitorSyncEntry {
+                serial: String::from("DUPLICATE"),
+                snipeit_asset_id: Some(41),
+                last_seen: DateTime::<Utc>::UNIX_EPOCH,
+                absent_since: Some(DateTime::<Utc>::UNIX_EPOCH),
+                checked_out: true,
+            }],
+        };
+        let plan = plan_sync(
+            &system(3),
+            &taxonomy(4),
+            &[
+                resolved_monitor("DUPLICATE", Some(41)),
+                resolved_monitor("DUPLICATE", Some(42)),
+            ],
+            Some(&matching_asset()),
+            &previous,
+            &MonitorSettings::default(),
+            &ResolvedStatusIds {
+                checkout: 5,
+                checkin: 6,
+            },
+            now(),
+        );
+
+        assert!(plan.monitor_checkouts.is_empty());
+        assert!(plan.monitor_checkins.is_empty());
+        assert_eq!(plan.next_monitor_state.entries.len(), 1);
+        assert_eq!(plan.next_monitor_state.entries[0].serial, "DUPLICATE");
+        assert_eq!(
+            plan.next_monitor_state.entries[0].snipeit_asset_id,
+            Some(41)
+        );
+        assert!(plan.next_monitor_state.entries[0].absent_since.is_none());
+        assert!(plan.next_monitor_state.entries[0].checked_out);
+        assert_eq!(
+            plan.warnings,
+            vec![String::from(
+                "monitor serial DUPLICATE is duplicated locally; mutations suppressed"
+            )]
+        );
     }
 
     #[test]

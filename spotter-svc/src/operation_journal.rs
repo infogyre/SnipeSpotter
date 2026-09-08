@@ -48,6 +48,41 @@ pub struct PendingOperation {
     pub candidate_state: Option<serde_json::Value>,
 }
 
+/// Return whether a settings candidate changes the remote operation identity.
+#[must_use]
+pub fn remote_identity_changed(
+    current: &spotter_core::Settings,
+    candidate: &spotter_core::Settings,
+) -> bool {
+    current.snipeit.url != candidate.snipeit.url
+        || current.snipeit.checkout_status_id != candidate.snipeit.checkout_status_id
+        || current.snipeit.checkin_status_id != candidate.snipeit.checkin_status_id
+}
+
+/// Reject a remote identity change while valid pending evidence exists.
+///
+/// # Errors
+/// Returns a fixed fail-closed error for malformed/invalid journal phases or pending evidence.
+pub fn guard_remote_identity_change(
+    path: &Path,
+    current: &spotter_core::Settings,
+    candidate: &spotter_core::Settings,
+) -> Result<()> {
+    if !remote_identity_changed(current, candidate) {
+        return Ok(());
+    }
+    let records = load(path).map_err(|_| {
+        anyhow::anyhow!("cannot change remote identity while operation journal is invalid")
+    })?;
+    let pending = pending_with_evidence(&records).map_err(|_| {
+        anyhow::anyhow!("cannot change remote identity while operation journal is invalid")
+    })?;
+    if !pending.is_empty() {
+        anyhow::bail!("cannot change remote identity while operations are pending")
+    }
+    Ok(())
+}
+
 /// Append and flush one journal record.
 ///
 /// # Errors
@@ -190,6 +225,80 @@ pub fn compact(path: &Path, records: &[JournalRecord]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pending_journal_blocks_identity_changes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("operations.jsonl");
+        let mut current = spotter_core::Settings::default();
+        current.snipeit.url = String::from("https://old.example");
+        current.snipeit.checkout_status_id = 5;
+        current.snipeit.checkin_status_id = 6;
+        let mut token_only = current.clone();
+        token_only.snipeit.api_token_encrypted = vec![9];
+        assert!(!remote_identity_changed(&current, &token_only));
+
+        append(
+            &path,
+            &JournalRecord::Prepared {
+                operation_id: String::from("x"),
+                operation: serde_json::json!({}),
+            },
+        )?;
+        for candidate in [
+            {
+                let mut value = current.clone();
+                value.snipeit.url = String::from("https://new.example");
+                value
+            },
+            {
+                let mut value = current.clone();
+                value.snipeit.checkout_status_id = 7;
+                value
+            },
+            {
+                let mut value = current.clone();
+                value.snipeit.checkin_status_id = 8;
+                value
+            },
+        ] {
+            assert!(remote_identity_changed(&current, &candidate));
+            assert!(guard_remote_identity_change(&path, &current, &candidate).is_err());
+        }
+        guard_remote_identity_change(&path, &current, &token_only)?;
+
+        fs::write(&path, b"")?;
+        let mut changed = current.clone();
+        changed.snipeit.url = String::from("https://new.example");
+        guard_remote_identity_change(&path, &current, &changed)?;
+
+        append(
+            &path,
+            &JournalRecord::Prepared {
+                operation_id: String::from("x"),
+                operation: serde_json::json!({}),
+            },
+        )?;
+        append(
+            &path,
+            &JournalRecord::RemoteOutcomeObserved {
+                operation_id: String::from("x"),
+                outcome: serde_json::json!({}),
+                candidate_state: None,
+            },
+        )?;
+        append(
+            &path,
+            &JournalRecord::StateCommitted {
+                operation_id: String::from("x"),
+            },
+        )?;
+        guard_remote_identity_change(&path, &current, &changed)?;
+
+        fs::write(&path, b"malformed\n")?;
+        assert!(guard_remote_identity_change(&path, &current, &changed).is_err());
+        Ok(())
+    }
+
     #[test]
     fn durable_replay_and_compaction() -> Result<()> {
         let dir = tempfile::tempdir()?;

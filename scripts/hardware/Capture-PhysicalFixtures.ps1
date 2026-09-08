@@ -89,10 +89,11 @@ function Convert-PlaceholderString {
     return $placeholder
 }
 
-# We need to walk and redact the string tables.
-# Make a working copy so we can replace string bytes.
-$redacted = [byte[]]::new($actualLength)
-[Array]::Copy($data, $redacted, $actualLength)
+# Apply the same strict structural redaction routine used by the synthetic harness.
+# The all-zero Type 1 UUID sentinel preserves field shape without retaining identity.
+Import-Module (Join-Path $PSScriptRoot 'SmbiosFixture.psm1') -Force
+$protected = Protect-SmbiosFixture -Data $data
+$redacted = $protected.Bytes
 
 $structureCount = 0
 $typeHistogram = [ordered]@{}
