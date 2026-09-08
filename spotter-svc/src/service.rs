@@ -1295,10 +1295,6 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let journal_path = directory.path().join("operations.jsonl");
         let operation_id = String::from("checkin:7:2");
-        let recovered = PersistedServiceState {
-            last_sync_time: Some(String::from("2026-01-01T00:00:00Z")),
-            ..PersistedServiceState::default()
-        };
         let operation = MonitorCheckin {
             operation_id: operation_id.clone(),
             source_asset_id: 7,

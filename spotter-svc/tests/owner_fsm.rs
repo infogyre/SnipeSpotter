@@ -1212,6 +1212,7 @@ impl RemoteFactory for CountingFactory {
     }
 }
 
+#[expect(dead_code, reason = "kept for future evidence-shaped fixtures")]
 fn append_pending_checkin(path: &std::path::Path, operation_id: &str) -> Result<()> {
     append_pending_checkin_with_evidence(path, operation_id, true)
 }
