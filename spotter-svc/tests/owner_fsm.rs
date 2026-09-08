@@ -590,12 +590,7 @@ async fn sync_state_save_failure_returns_error_and_preserves_previous_status() -
             saves: Arc::new(Mutex::new(Vec::new())),
         }),
         state_store: Box::new(FailingStateStore),
-        remote: Box::new(TypedFailureRemote {
-            error: spotter_core::snipeit::SnipeItError::ServerError {
-                status: 503,
-                message: String::from("temporarily unavailable"),
-            },
-        }),
+        remote: Box::new(SuccessfulRemote),
         remote_factory: Box::new(FixedFactory),
         discovery: Box::new(FixedDiscovery),
         clock: Box::new(FixedClock),
@@ -1003,9 +998,7 @@ async fn owner_normal_sync_post_save_fault_retains_candidate_and_evidence() -> R
             state_store: Box::new(MemoryStateStore {
                 saves: Arc::clone(&state_saves),
             }),
-            remote: Box::new(TypedFailureRemote {
-                error: spotter_core::snipeit::SnipeItError::AuthFailure,
-            }),
+            remote: Box::new(SuccessfulRemote),
             remote_factory: Box::new(FixedFactory),
             discovery: Box::new(FixedDiscovery),
             clock: Box::new(FixedClock),
