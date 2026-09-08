@@ -887,8 +887,8 @@ async fn owner_failed_result_save_updates_fsm() -> Result<()> {
 async fn owner_recovery_failure_updates_fsm_auth() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
-    // Evidence-free payload: recovery must replay the check-in remotely, and the
-    // typed auth failure from that replay fails recovery closed.
+    // Legacy evidence-free payload: recovery must replay the check-in remotely,
+    // and the typed auth failure from that replay fails recovery closed.
     append_pending_checkin_with_evidence(&journal_path, "checkin:11:2", false)?;
     let fsm = spawn_owner(
         4,
@@ -919,8 +919,8 @@ async fn owner_recovery_failure_updates_fsm_auth() -> Result<()> {
 async fn owner_recovery_failure_updates_fsm_error() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
-    // Evidence-free payload: recovery must replay the check-in remotely, and the
-    // typed server failure from that replay fails recovery closed.
+    // Legacy evidence-free payload: recovery must replay the check-in remotely,
+    // and the typed server failure from that replay fails recovery closed.
     append_pending_checkin_with_evidence(&journal_path, "checkin:11:2", false)?;
     let fsm = spawn_owner(
         4,
@@ -977,10 +977,10 @@ async fn owner_recovery_failure_then_success_recovers() -> Result<()> {
         IpcResponse::Status { ref state, .. } if state == "Error"
     ));
     let second = fsm.request(ServiceCommand::TriggerSync).await?;
-    assert!(matches!(second, IpcResponse::Error { .. }));
+    assert!(matches!(second, IpcResponse::Ok { .. }));
     assert!(matches!(
         fsm.request(ServiceCommand::GetStatus).await?,
-        IpcResponse::Status { ref state, .. } if state == "Error"
+        IpcResponse::Status { ref state, .. } if state == "Idle"
     ));
     Ok(())
 }
