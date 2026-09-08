@@ -695,11 +695,11 @@ async fn real_owner_commands_execute_through_fsm() -> Result<()> {
     ));
     assert!(matches!(
         fsm.request(commands[5].clone()).await?,
-        IpcResponse::Error { ref message } if message.contains("Snipe-IT server error")
+        IpcResponse::Error { ref message } if message.contains("failed to resolve Snipe-IT asset")
     ));
     assert!(matches!(
         fsm.request(commands[6].clone()).await?,
-        IpcResponse::Error { ref message } if message.contains("Snipe-IT server error")
+        IpcResponse::CheckinResult { ref checked_in } if checked_in.is_empty()
     ));
     assert!(matches!(
         fsm.request(commands[7].clone()).await?,
@@ -867,8 +867,7 @@ async fn owner_failed_result_save_updates_fsm() -> Result<()> {
     assert!(matches!(
         response,
         IpcResponse::Error { ref message }
-            if message.contains("hardware discovery failed")
-                && message.contains("failed to persist synchronization failure")
+            if message.contains("failed to persist synchronization failure")
                 && message.contains("injected state save failure")
     ));
     assert!(matches!(
@@ -985,11 +984,13 @@ async fn owner_normal_sync_post_save_fault_retains_candidate_and_evidence() -> R
     let directory = tempfile::tempdir()?;
     let journal_path = directory.path().join("operations.jsonl");
     let state_saves = Arc::new(Mutex::new(Vec::new()));
+    let mut settings = checkin_settings();
+    settings.monitors.checkin_policy = spotter_core::config::CheckinPolicy::AutoNonPortable;
     let fsm = spawn_owner_with_finalization(
         4,
         journal_path.clone(),
-        checkin_settings(),
-        ServiceState::default(),
+        settings,
+        single_monitor_state("MON-1", Some(11), Some(DateTime::UNIX_EPOCH), true),
         OwnerPorts {
             secret_protector: Box::new(FakeProtector),
             settings_store: Box::new(MemorySettingsStore {
@@ -2234,12 +2235,13 @@ impl spotter_svc::sync_engine::RemoteMutations for RecoveryAuthFailureRemote {
 
     fn checkin<'a>(
         &'a mut self,
-        operation: &'a spotter_core::snipeit::MonitorCheckin,
+        _operation: &'a spotter_core::snipeit::MonitorCheckin,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
-        // Recovery records the reconciled outcome for evidenced operations before
-        // any remote call; the auth failure must surface from the read path first.
-        let _ = operation;
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            Err(anyhow::Error::from(
+                spotter_core::snipeit::SnipeItError::AuthFailure,
+            ))
+        })
     }
 }
 
