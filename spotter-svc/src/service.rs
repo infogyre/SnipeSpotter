@@ -624,7 +624,10 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     let settings = crate::config_io::load_settings(&settings_path).inspect_err(
         |e| tracing::error!(%e, path = %settings_path.display(), "failed to load settings"),
     )?;
-    tracing::info!(url = %settings.snipeit.url, "settings loaded");
+    tracing::info!(
+        configured = !settings.snipeit.url.is_empty(),
+        "settings loaded"
+    );
     let state_key = crate::state_io::load_or_create_key(&root.join("state-hmac-key.bin"))
         .inspect_err(|e| tracing::error!(%e, "failed to load state key"))?;
     tracing::info!("state key loaded");
