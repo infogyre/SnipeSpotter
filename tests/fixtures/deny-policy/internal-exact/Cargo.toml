@@ -1,0 +1,9 @@
+[package]
+name = "fixture-internal-exact"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fixture-internal = { path = "fixture-internal", version = "=0.1.0" }
+
+[workspace]

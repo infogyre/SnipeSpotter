@@ -10,7 +10,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-spotter-core = { path = "../spotter-core" }
+spotter-core = { path = "../spotter-core", version = "=0.1.0" }
 
 [target.'cfg(windows)'.dependencies]
 anyhow = { workspace = true }

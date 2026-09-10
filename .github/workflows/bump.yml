@@ -49,16 +49,7 @@ jobs:
           print(f'{major}.{minor}.{patch}')
           PY
           )
-          python3 - "$current" "$next" <<'PY'
-          from pathlib import Path
-          import sys
-          path = Path('Cargo.toml')
-          text = path.read_text()
-          old = f'version = "{sys.argv[1]}"'
-          new = f'version = "{sys.argv[2]}"'
-          if text.count(old) != 1: raise SystemExit('workspace version occurrence is not unique')
-          path.write_text(text.replace(old, new))
-          PY
+          python3 scripts/bump-version.py --set "$next"
           cargo update --workspace
           cargo metadata --locked --no-deps --format-version 1 >/dev/null
           printf 'version=%s\n' "$next" >> "$GITHUB_OUTPUT"

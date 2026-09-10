@@ -16,16 +16,42 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-# Multiple versions arise from transitive platform-specific crates
-# (windows-targets, windows_*_msvc, winnow) that we cannot control.
-# These are build-time or target-specific and do not affect the runtime
-# binary. Allow duplicates rather than blocking on transitive conflicts.
-multiple-versions = "allow"
-# Wildcard dependencies are workspace-internal path dependencies
-# (spotter-core, spotter-win32, spotter-build) that inherit the workspace
-# version. Allow them since they are not external registry dependencies.
-wildcards = "allow"
+# Keep dependency resolution finite and require every dependency version to be explicit.
+multiple-versions = "deny"
+wildcards = "deny"
 highlight = "all"
+
+# PROVISIONAL for this branch's pre-parent TLS lock. Recompute against the
+# parent's final Cargo.lock and remove or revise any no-longer-present entry.
+[[bans.skip]]
+name = "base64"
+version = "=0.22.1"
+reason = "hyper-util requires base64 0.22.1 while workspace crates use 0.23.1"
+
+[[bans.skip]]
+name = "getrandom"
+version = "=0.3.3"
+reason = "rand 0.9 and ring compatibility paths retain getrandom 0.3.3 alongside workspace 0.4.3"
+
+[[bans.skip]]
+name = "r-efi"
+version = "=5.3.0"
+reason = "getrandom 0.3.3 retains r-efi 5.3.0 while getrandom 0.4.3 uses r-efi 6.0.0"
+
+[[bans.skip]]
+name = "syn"
+version = "=2.0.119"
+reason = "openssl-macros requires syn 2.0.119 while rcgen compatibility retains syn 3.0.3"
+
+[[bans.skip]]
+name = "wasi"
+version = "=0.11.1+wasi-snapshot-preview1"
+reason = "getrandom 0.2 and mio compatibility paths retain wasi 0.11.1 alongside wasi 0.14.7"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.59.0"
+reason = "rpassword and embed-resource require windows-sys 0.59.0 while current Windows dependencies use 0.61.2"
 
 [sources]
 unknown-registry = "deny"
