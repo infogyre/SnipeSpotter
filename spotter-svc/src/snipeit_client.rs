@@ -94,14 +94,64 @@ impl SnipeItClient {
         {
             anyhow::bail!("Snipe-IT URL must be a valid HTTPS endpoint")
         }
+        let client = Self::build_https_client(base_url.clone(), timeout, None)?;
         Ok(Self {
-            client: Client::builder()
-                .timeout(timeout)
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?,
+            client,
             base_url,
             token,
         })
+    }
+
+    /// Test-only construction sharing the production builder and HTTPS
+    /// validation, adding `ca_pem` as the sole request-level trust root via
+    /// the native-tls backend so hostname/CA verification stays on the
+    /// production path.
+    ///
+    /// # Errors
+    /// Returns the same errors as production when the URL or builder is
+    /// invalid; never relaxes validation.
+    #[cfg(test)]
+    pub(crate) fn with_timeout_custom_trust(
+        base_url: impl Into<String>,
+        token: SecretString,
+        timeout: Duration,
+        ca_pem: &str,
+    ) -> Result<Self> {
+        let base_url_text = base_url.into();
+        validate_snipeit_url(&base_url_text)
+            .map_err(|_| anyhow::anyhow!("Snipe-IT URL must use HTTPS"))?;
+        let base_url = Url::parse(base_url_text.trim()).context("invalid Snipe-IT URL")?;
+        if base_url.scheme() != "https"
+            || base_url.username() != ""
+            || base_url.password().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+            || base_url.host().is_none()
+        {
+            anyhow::bail!("Snipe-IT URL must be a valid HTTPS endpoint")
+        }
+        let client = Self::build_https_client(base_url.clone(), timeout, Some(ca_pem))?;
+        Ok(Self {
+            client,
+            base_url,
+            token,
+        })
+    }
+
+    fn build_https_client(
+        _base_url: Url,
+        timeout: Duration,
+        additional_ca_pem: Option<&str>,
+    ) -> Result<Client> {
+        let mut builder = Client::builder()
+            .timeout(timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .use_native_tls();
+        if let Some(ca_pem) = additional_ca_pem {
+            let certificate = reqwest::Certificate::from_pem(ca_pem.as_bytes())?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        Ok(builder.build()?)
     }
 
     /// Find an asset by exact serial.
@@ -287,6 +337,27 @@ impl SnipeItClient {
             .bearer_auth(self.token.expose_secret())
             .header("Accept", "application/json")
     }
+
+    /// Test-only bounded probe: performs a GET against `path` and reports
+    /// whether the transport completed, exercising real TLS/handshake paths
+    /// through the production client construction.
+    ///
+    /// # Errors
+    /// Returns the transport error text for classification in tests.
+    #[cfg(test)]
+    pub(crate) async fn request_json_for_test(&self, path: &str) -> Result<()> {
+        let url = self
+            .endpoint_url(&[path])
+            .map_err(|error| anyhow::anyhow!("test probe URL construction failed: {error}"))?;
+        let response = self
+            .send(reqwest::Method::GET, url)
+            .await
+            .map_err(|error| anyhow::anyhow!("test probe transport error: {error}"))?;
+        let (_status, _retry, _body) = read_response(response)
+            .await
+            .map_err(|error| anyhow::anyhow!("test probe response error: {error}"))?;
+        Ok(())
+    }
 }
 
 async fn decode_response<T>(
@@ -414,6 +485,109 @@ mod tests {
             panic!("custom-timeout constructor must reject HTTP");
         };
         assert!(error.to_string().contains("HTTPS"));
+    }
+
+    #[tokio::test]
+    async fn tls_fixture_self_test() -> anyhow::Result<()> {
+        let server = crate::tls_test_fixture::TlsLoopbackServer::start().await?;
+        assert_eq!(server.connection_count(), 0);
+        let base = server.base_url.clone();
+        let ca = server.ca_pem.clone();
+        let client = crate::tls_test_fixture::client_trusting_ca(
+            format!("{base}/ok"),
+            SecretString::from(String::from("token")),
+            &ca,
+            Duration::from_secs(5),
+        )?;
+        crate::tls_test_fixture::request_bounded(&client, "/ok", Duration::from_secs(5))
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        assert_eq!(server.connection_count(), 1);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn https_client_accepts_trusted_localhost() -> anyhow::Result<()> {
+        let server = crate::tls_test_fixture::TlsLoopbackServer::start().await?;
+        let client = crate::tls_test_fixture::client_trusting_ca(
+            format!("{}/ok", server.base_url),
+            SecretString::from(String::from("token")),
+            &server.ca_pem,
+            Duration::from_secs(5),
+        )?;
+        // The fixture answers /ok with 200 JSON through the full production
+        // TLS construction: native-tls handshake, hostname verification, and
+        // bounded response reading.
+        crate::tls_test_fixture::request_bounded(&client, "/ok", Duration::from_secs(5))
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        assert_eq!(server.connection_count(), 1);
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn https_client_rejects_untrusted_ca() -> anyhow::Result<()> {
+        let server = crate::tls_test_fixture::TlsLoopbackServer::start().await?;
+        let client = crate::tls_test_fixture::client_trusting_ca(
+            format!("{}/ok", server.base_url),
+            SecretString::from(String::from("token")),
+            &crate::tls_test_fixture::TlsLoopbackServer::start()
+                .await?
+                .ca_pem,
+            Duration::from_secs(5),
+        )?;
+        let outcome =
+            crate::tls_test_fixture::request_bounded(&client, "/ok", Duration::from_secs(5)).await;
+        assert!(outcome.is_err(), "untrusted CA must fail the handshake");
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn https_client_rejects_hostname_mismatch() -> anyhow::Result<()> {
+        // The fixture leaf carries only the DNS SAN "localhost"; connecting
+        // by IP address exercises the hostname-verification failure path on
+        // the production native-tls backend.
+        let server = crate::tls_test_fixture::TlsLoopbackServer::start().await?;
+        let mismatched = server
+            .base_url
+            .replace("https://localhost:", "https://127.0.0.1:");
+        let client = crate::tls_test_fixture::client_trusting_ca(
+            format!("{mismatched}/ok"),
+            SecretString::from(String::from("token")),
+            &server.ca_pem,
+            Duration::from_secs(5),
+        )?;
+        let outcome =
+            crate::tls_test_fixture::request_bounded(&client, "/ok", Duration::from_secs(5)).await;
+        assert!(
+            outcome.is_err(),
+            "IP-address host against DNS-only leaf must fail hostname verification"
+        );
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn https_redirect_and_body_bounds() -> anyhow::Result<()> {
+        let server = crate::tls_test_fixture::TlsLoopbackServer::start().await?;
+        let client = crate::tls_test_fixture::client_trusting_ca(
+            format!("{}/redirect", server.base_url),
+            SecretString::from(String::from("token")),
+            &server.ca_pem,
+            Duration::from_secs(5),
+        )?;
+        let outcome =
+            crate::tls_test_fixture::request_bounded(&client, "/redirect", Duration::from_secs(5))
+                .await;
+        assert!(
+            outcome.is_err(),
+            "redirects must be refused by production policy"
+        );
+        server.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

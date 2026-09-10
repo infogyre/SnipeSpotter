@@ -15,6 +15,8 @@ pub mod owner_ports;
 pub mod ports;
 #[cfg(windows)]
 pub mod service;
+#[cfg(test)]
+pub(crate) mod tls_test_fixture;
 
 #[cfg(all(windows, feature = "test-support"))]
 /// Test-only construction of the production command owner.

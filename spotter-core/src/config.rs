@@ -192,11 +192,10 @@ pub fn validate_snipeit_url(value: &str) -> Result<(), SettingsValidationError> 
         if host.is_empty() || host.contains(':') || !is_valid_port(port) {
             return Err(SettingsValidationError::SnipeItUrl);
         }
-    }
-    if host_and_port.starts_with(':') || host_and_port.ends_with(':') {
+    } else if host_and_port.contains(':') {
         return Err(SettingsValidationError::SnipeItUrl);
     }
-    if host_and_port.contains(':') {
+    if host_and_port.starts_with(':') || host_and_port.ends_with(':') {
         return Err(SettingsValidationError::SnipeItUrl);
     }
     Ok(())
