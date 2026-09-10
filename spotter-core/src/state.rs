@@ -1,7 +1,7 @@
 //! Signed, serializable state shared by the service and its clients.
 // pattern: Functional Core
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use thiserror::Error;

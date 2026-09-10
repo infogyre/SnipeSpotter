@@ -49,5 +49,8 @@ windows-service = { workspace = true }
 spotter-build = { path = "../spotter-build" }
 
 [dev-dependencies]
+native-tls = "=0.2.18"
+tokio-native-tls = "=0.3.1"
+rcgen = "=0.14.10"
 tempfile = { workspace = true }
 wiremock = { workspace = true }
