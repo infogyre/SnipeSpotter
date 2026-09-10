@@ -404,18 +404,14 @@ mod tests {
     #[test]
     fn production_constructors_reject_http_before_client_creation() {
         let token = SecretString::from(String::from("token"));
-        let error = match SnipeItClient::new("http://127.0.0.1:1", token.clone()) {
-            Ok(_) => panic!("production constructor must reject HTTP"),
-            Err(error) => error,
+        let Err(error) = SnipeItClient::new("http://127.0.0.1:1", token.clone()) else {
+            panic!("production constructor must reject HTTP");
         };
         assert!(error.to_string().contains("HTTPS"));
-        let error = match SnipeItClient::with_timeout(
-            "http://127.0.0.1:1",
-            token,
-            Duration::from_millis(1),
-        ) {
-            Ok(_) => panic!("custom-timeout constructor must reject HTTP"),
-            Err(error) => error,
+        let Err(error) =
+            SnipeItClient::with_timeout("http://127.0.0.1:1", token, Duration::from_millis(1))
+        else {
+            panic!("custom-timeout constructor must reject HTTP");
         };
         assert!(error.to_string().contains("HTTPS"));
     }
