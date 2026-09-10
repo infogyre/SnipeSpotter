@@ -39,6 +39,14 @@ trait FaultController: Send + Sync {
     fn before_replace(&self) -> Result<()>;
     fn after_replace(&self) -> Result<()>;
     fn before_directory_flush(&self) -> Result<()>;
+
+    fn open_directory(&self, parent: &Path) -> std::io::Result<File> {
+        File::open(parent)
+    }
+
+    fn sync_directory(&self, directory: &File) -> std::io::Result<()> {
+        directory.sync_all()
+    }
 }
 
 struct NoopFaultController;
@@ -267,6 +275,14 @@ impl FaultController for Arc<tests::AtomicFaultController> {
     fn before_directory_flush(&self) -> Result<()> {
         self.as_ref().before_directory_flush()
     }
+
+    fn open_directory(&self, parent: &Path) -> std::io::Result<File> {
+        self.as_ref().open_directory(parent)
+    }
+
+    fn sync_directory(&self, directory: &File) -> std::io::Result<()> {
+        self.as_ref().sync_directory(directory)
+    }
 }
 
 fn write_with_controller(
@@ -300,12 +316,7 @@ fn write_with_controller(
             .context("failed to preserve destination ACL after atomic replacement")?;
         controller.after_replace()?;
         controller.before_directory_flush()?;
-        if let Ok(directory) = File::open(parent) {
-            directory
-                .sync_all()
-                .with_context(|| format!("failed to flush directory {}", parent.display()))?;
-        }
-        Ok(())
+        flush_parent_directory(parent, controller)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -319,6 +330,54 @@ fn write_with_controller(
         })?;
     }
     result
+}
+
+fn flush_parent_directory(parent: &Path, controller: &impl FaultController) -> Result<()> {
+    let directory = match controller.open_directory(parent) {
+        Ok(directory) => directory,
+        Err(error) => {
+            tracing::debug!(
+                operation = "atomic_write",
+                stage = "directory_open",
+                outcome = "best_effort",
+                error_kind = bounded_error_kind(error.kind()),
+                "directory flush skipped"
+            );
+            return Ok(());
+        }
+    };
+    controller.sync_directory(&directory).map_err(|_| {
+        anyhow::anyhow!(
+            "failed to flush parent directory after atomic replacement; destination bytes were already replaced"
+        )
+    })
+}
+
+fn bounded_error_kind(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::NotFound => "not_found",
+        ErrorKind::PermissionDenied => "permission_denied",
+        ErrorKind::ConnectionRefused => "connection_refused",
+        ErrorKind::ConnectionReset => "connection_reset",
+        ErrorKind::HostUnreachable => "host_unreachable",
+        ErrorKind::NetworkUnreachable => "network_unreachable",
+        ErrorKind::ConnectionAborted => "connection_aborted",
+        ErrorKind::NotConnected => "not_connected",
+        ErrorKind::AddrInUse => "address_in_use",
+        ErrorKind::AddrNotAvailable => "address_not_available",
+        ErrorKind::BrokenPipe => "broken_pipe",
+        ErrorKind::AlreadyExists => "already_exists",
+        ErrorKind::WouldBlock => "would_block",
+        ErrorKind::InvalidInput => "invalid_input",
+        ErrorKind::InvalidData => "invalid_data",
+        ErrorKind::TimedOut => "timed_out",
+        ErrorKind::WriteZero => "write_zero",
+        ErrorKind::Interrupted => "interrupted",
+        ErrorKind::Unsupported => "unsupported",
+        ErrorKind::UnexpectedEof => "unexpected_eof",
+        ErrorKind::OutOfMemory => "out_of_memory",
+        _ => "other",
+    }
 }
 
 fn create_temporary_identity(path: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -622,9 +681,185 @@ fn replace(temporary: &Path, destination: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::{
-        sync::{Arc, Barrier},
+        io,
+        sync::{Arc, Barrier, Mutex},
         thread,
     };
+
+    const SENTINEL_ERROR: &str = "directory sentinel raw error";
+
+    struct DirectoryFaultController {
+        fail_open: bool,
+        fail_sync: bool,
+    }
+
+    impl FaultController for DirectoryFaultController {
+        fn before_temporary_creation(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn after_temporary_write(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn before_temporary_flush(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn before_replace(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn after_replace(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn before_directory_flush(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn open_directory(&self, _parent: &Path) -> io::Result<File> {
+            if self.fail_open {
+                Err(io::Error::new(ErrorKind::PermissionDenied, SENTINEL_ERROR))
+            } else {
+                File::open(".")
+            }
+        }
+
+        fn sync_directory(&self, _directory: &File) -> io::Result<()> {
+            if self.fail_sync {
+                Err(io::Error::other(SENTINEL_ERROR))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for TraceCapture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("trace capture lock poisoned"))?
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TraceCapture {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn directory_open_failure_is_best_effort() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let parent = directory.path().join("directory-open-sentinel");
+        let path = parent.join("state.toml");
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(TraceCapture(Arc::new(Mutex::new(Vec::new()))))
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            write_with_controller(
+                &path,
+                b"new-state",
+                &DirectoryFaultController {
+                    fail_open: true,
+                    fail_sync: false,
+                },
+            )
+        });
+
+        assert!(result.is_ok(), "directory open is best effort");
+        assert_eq!(fs::read(&path)?, b"new-state");
+        Ok(())
+    }
+
+    #[test]
+    fn directory_diagnostics_are_bounded_and_value_free() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let parent = directory.path().join("directory-open-sentinel");
+        let path = parent.join("state.toml");
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .without_time()
+            .with_ansi(false)
+            .with_target(false)
+            .with_writer(TraceCapture(Arc::clone(&captured)))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            write_with_controller(
+                &path,
+                b"new-state",
+                &DirectoryFaultController {
+                    fail_open: true,
+                    fail_sync: false,
+                },
+            )
+        })?;
+
+        let output = String::from_utf8(
+            captured
+                .lock()
+                .map_err(|_| anyhow::anyhow!("trace capture lock poisoned"))?
+                .clone(),
+        )?;
+        assert_eq!(output.matches("directory flush skipped").count(), 1);
+        assert!(output.len() < 512, "diagnostic output must remain bounded");
+        assert!(output.contains("operation=\"atomic_write\""));
+        assert!(output.contains("stage=\"directory_open\""));
+        assert!(output.contains("outcome=\"best_effort\""));
+        assert!(output.contains("error_kind=\"permission_denied\""));
+        assert!(!output.contains("directory-open-sentinel"));
+        assert!(!output.contains(SENTINEL_ERROR));
+        Ok(())
+    }
+
+    #[test]
+    fn directory_sync_failure_is_propagated_after_replace() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let parent = directory.path().join("directory-sync-sentinel");
+        let path = parent.join("state.toml");
+        write(&path, b"old-state")?;
+
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(TraceCapture(Arc::new(Mutex::new(Vec::new()))))
+            .finish();
+        let error = tracing::subscriber::with_default(subscriber, || {
+            write_with_controller(
+                &path,
+                b"new-state",
+                &DirectoryFaultController {
+                    fail_open: false,
+                    fail_sync: true,
+                },
+            )
+        })
+        .expect_err("directory sync failure must propagate");
+
+        assert_eq!(fs::read(&path)?, b"new-state");
+        assert_eq!(
+            error.to_string(),
+            "failed to flush parent directory after atomic replacement; destination bytes were already replaced"
+        );
+        assert!(!error.to_string().contains("directory-sync-sentinel"));
+        assert!(!error.to_string().contains(SENTINEL_ERROR));
+        Ok(())
+    }
 
     #[test]
     fn owner_is_dead_closes_open_process_handle() {
