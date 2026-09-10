@@ -226,11 +226,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(500).set_body_string(sentinel))
             .mount(&server)
             .await;
-        let client = crate::snipeit_client::SnipeItClient::new(
-            format!(
-                "http://user:{sentinel}@127.0.0.1:{}/api?token={sentinel}",
-                server.address().port()
-            ),
+        let client = crate::snipeit_client::SnipeItClient::new_loopback_http_for_test(
+            format!("http://127.0.0.1:{}/api", server.address().port()),
             SecretString::from(String::from("token")),
         )?;
         let capture = TestCapture::new(4096);
@@ -270,8 +267,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         drop(listener);
-        let client = crate::snipeit_client::SnipeItClient::new(
-            format!("http://user:{sentinel}@{address}/?query={sentinel}"),
+        let client = crate::snipeit_client::SnipeItClient::new_loopback_http_for_test(
+            format!("http://{address}/"),
             SecretString::from(String::from("token")),
         )?;
         let capture = TestCapture::new(4096);

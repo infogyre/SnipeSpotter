@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{CheckinPolicy, Settings},
+    config::{CheckinPolicy, Settings, SettingsValidationError, validate_snipeit_url},
     state::AssetSummary,
 };
 
@@ -184,17 +184,12 @@ pub fn redact_settings(settings: &Settings) -> Settings {
 }
 
 fn validate_url(value: &str) -> Result<(), String> {
-    let authority = value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))
-        .ok_or_else(|| String::from("snipeit.url must use http or https"))?;
-    if authority.is_empty()
-        || authority.starts_with('/')
-        || authority.chars().any(char::is_whitespace)
-    {
-        return Err(String::from("snipeit.url must include a valid host"));
-    }
-    Ok(())
+    validate_snipeit_url(value).map_err(|error| match error {
+        SettingsValidationError::SnipeItUrl => String::from(
+            "snipeit.url must be a valid HTTPS endpoint without credentials, query, or fragment",
+        ),
+        _ => String::from("snipeit.url is invalid"),
+    })
 }
 
 fn parse_u64(value: &str, minimum: u64, maximum: u64) -> Result<u64, String> {
@@ -258,6 +253,18 @@ mod tests {
     #[test]
     fn validates_boundaries_and_rejects_secret_field() {
         assert!(validate_config_field("snipeit.url", "https://example.test").is_ok());
+        for invalid_url in [
+            "http://example.test",
+            "https://user:password@example.test",
+            "https://example.test/path?query=secret",
+            "https://example.test/path#fragment",
+            "https://example.test:0",
+        ] {
+            assert!(
+                validate_config_field("snipeit.url", invalid_url).is_err(),
+                "accepted invalid URL {invalid_url:?}"
+            );
+        }
         assert!(validate_config_field("snipeit.url", "ftp://example.test").is_err());
         assert!(validate_config_field("polling.interval_hours", "1").is_ok());
         assert!(validate_config_field("polling.interval_hours", "168").is_ok());

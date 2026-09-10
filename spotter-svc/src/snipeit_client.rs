@@ -15,10 +15,13 @@ const MAX_TOTAL_ROWS: usize = 10_000;
 const PAGINATION_DEADLINE: Duration = Duration::from_secs(60);
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::de::DeserializeOwned;
-use spotter_core::snipeit::{
-    Asset, AssetModel, AssetPatchRequest, Category, CheckinRequest, CheckoutRequest, Manufacturer,
-    SnipeItError, parse_asset_by_serial, parse_asset_patch, parse_checkin_response,
-    parse_checkout_response,
+use spotter_core::{
+    snipeit::{
+        Asset, AssetModel, AssetPatchRequest, Category, CheckinRequest, CheckoutRequest,
+        Manufacturer, SnipeItError, parse_asset_by_serial, parse_asset_patch,
+        parse_checkin_response, parse_checkout_response,
+    },
+    validate_snipeit_url,
 };
 
 pub struct SnipeItClient {
@@ -36,16 +39,61 @@ impl SnipeItClient {
         Self::with_timeout(base_url, token, Duration::from_secs(30))
     }
 
-    fn with_timeout(
+    #[cfg(test)]
+    pub(crate) fn new_loopback_http_for_test(
+        base_url: impl Into<String>,
+        token: SecretString,
+    ) -> Result<Self> {
+        Self::with_timeout_and_loopback_http_for_test(base_url, token, Duration::from_secs(30))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_timeout_and_loopback_http_for_test(
         base_url: impl Into<String>,
         token: SecretString,
         timeout: Duration,
     ) -> Result<Self> {
         let base_url = Url::parse(base_url.into().trim()).context("invalid Snipe-IT URL")?;
-        if !matches!(base_url.scheme(), "http" | "https") {
-            anyhow::bail!("Snipe-IT URL must use HTTP or HTTPS")
+        if base_url.scheme() != "http"
+            || base_url.username() != ""
+            || base_url.password().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+            || !base_url
+                .host_str()
+                .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+                .is_some_and(|ip| ip.is_loopback())
+        {
+            anyhow::bail!("test HTTP URL must target loopback without credentials or query")
         }
-        // SPOTR-8 defers production HTTPS enforcement; plain HTTP remains exposed to interception.
+        Ok(Self {
+            client: Client::builder()
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
+            base_url,
+            token,
+        })
+    }
+
+    fn with_timeout(
+        base_url: impl Into<String>,
+        token: SecretString,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let base_url_text = base_url.into();
+        validate_snipeit_url(&base_url_text)
+            .map_err(|_| anyhow::anyhow!("Snipe-IT URL must use HTTPS"))?;
+        let base_url = Url::parse(base_url_text.trim()).context("invalid Snipe-IT URL")?;
+        if base_url.scheme() != "https"
+            || base_url.username() != ""
+            || base_url.password().is_some()
+            || base_url.query().is_some()
+            || base_url.fragment().is_some()
+            || base_url.host().is_none()
+        {
+            anyhow::bail!("Snipe-IT URL must be a valid HTTPS endpoint")
+        }
         Ok(Self {
             client: Client::builder()
                 .timeout(timeout)
@@ -353,6 +401,26 @@ mod tests {
         matchers::{body_json, header, method, path, query_param},
     };
 
+    #[test]
+    fn production_constructors_reject_http_before_client_creation() {
+        let token = SecretString::from(String::from("token"));
+        let error =
+            match SnipeItClient::new("http://127.0.0.1:1", token.clone()) {
+                Ok(_) => panic!("production constructor must reject HTTP"),
+                Err(error) => error,
+            };
+        assert!(error.to_string().contains("HTTPS"));
+        let error = match SnipeItClient::with_timeout(
+            "http://127.0.0.1:1",
+            token,
+            Duration::from_millis(1),
+        ) {
+            Ok(_) => panic!("custom-timeout constructor must reject HTTP"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("HTTPS"));
+    }
+
     #[tokio::test]
     async fn lookup_and_error_classification() -> Result<()> {
         let server = MockServer::start().await;
@@ -364,7 +432,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("token")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("token")),
+        )?;
         assert_eq!(client.find_asset_by_serial("ABC").await?.id, 7);
         Ok(())
     }
@@ -397,8 +468,10 @@ mod tests {
                 .respond_with(ResponseTemplate::new(status).set_body_json(body))
                 .mount(&server)
                 .await;
-            let client =
-                SnipeItClient::new(server.uri(), SecretString::from(String::from("token")))?;
+            let client = SnipeItClient::new_loopback_http_for_test(
+                server.uri(),
+                SecretString::from(String::from("token")),
+            )?;
             assert_eq!(client.find_asset_by_serial("ABC").await, Err(expected));
         }
         Ok(())
@@ -416,7 +489,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::with_timeout(
+        let client = SnipeItClient::with_timeout_and_loopback_http_for_test(
             server.uri(),
             SecretString::from(String::from("token")),
             Duration::from_millis(100),
@@ -440,7 +513,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("token")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("token")),
+        )?;
         assert_eq!(
             client.find_asset_by_serial("OVERSIZED").await,
             Err(SnipeItError::RateLimited {
@@ -462,7 +538,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("token")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("token")),
+        )?;
         assert_eq!(
             client.find_asset_by_serial("ABC").await,
             Err(SnipeItError::RateLimited {
@@ -484,7 +563,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         assert_eq!(
             client.find_asset_by_serial("SER1").await,
             Err(SnipeItError::AmbiguousResponse)
@@ -504,7 +586,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         let request = AssetPatchRequest {
             serial: Some(String::from("NEW")),
             ..Default::default()
@@ -550,7 +635,10 @@ mod tests {
                 .respond_with(template)
                 .mount(&server)
                 .await;
-            let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let client = SnipeItClient::new_loopback_http_for_test(
+                server.uri(),
+                SecretString::from(String::from("t")),
+            )?;
             assert_eq!(client.patch_asset(7, &request).await, Err(expected));
         }
         Ok(())
@@ -566,7 +654,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         let request = CheckoutRequest {
             checkout_to_type: String::from("asset"),
             assigned_asset: 100,
@@ -599,7 +690,10 @@ mod tests {
                 .respond_with(template)
                 .mount(&server)
                 .await;
-            let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let client = SnipeItClient::new_loopback_http_for_test(
+                server.uri(),
+                SecretString::from(String::from("t")),
+            )?;
             let request = CheckoutRequest {
                 checkout_to_type: String::from("asset"),
                 assigned_asset: 1,
@@ -621,7 +715,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         let request = CheckinRequest { status_id: 4 };
         client.checkin_asset(300, &request).await?;
         Ok(())
@@ -637,7 +734,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         let request = CheckinRequest { status_id: 4 };
         client.checkin_asset(301, &request).await?;
         Ok(())
@@ -675,7 +775,10 @@ mod tests {
                 .respond_with(template)
                 .mount(&server)
                 .await;
-            let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let client = SnipeItClient::new_loopback_http_for_test(
+                server.uri(),
+                SecretString::from(String::from("t")),
+            )?;
             let request = CheckinRequest { status_id: 1 };
             assert_eq!(client.checkin_asset(9, &request).await, Err(expected));
         }
@@ -693,7 +796,10 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         let results = client.find_manufacturers("Dell").await?;
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].id, 1);
@@ -728,7 +834,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         let results = client.find_models("ThinkPad").await?;
         assert_eq!(results.len(), 102);
         assert_eq!(results[100].id, 101);
@@ -746,7 +855,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         assert_eq!(
             client.find_categories("Monitor").await,
             Err(SnipeItError::AuthFailure)
@@ -791,7 +903,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("token")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("token")),
+        )?;
         let patch = AssetPatchRequest {
             serial: Some(String::from("NEW")),
             ..Default::default()
@@ -829,7 +944,10 @@ mod tests {
                 .respond_with(ResponseTemplate::new(200).set_body_string(oversized.clone()))
                 .mount(&server)
                 .await;
-            let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+            let client = SnipeItClient::new_loopback_http_for_test(
+                server.uri(),
+                SecretString::from(String::from("t")),
+            )?;
             let result = match endpoint {
                 "/api/v1/hardware/byserial/CAP" => {
                     client.find_asset_by_serial("CAP").await.map(|_| ())
@@ -872,7 +990,7 @@ mod tests {
             let _ = stream.write_all(b"0\r\n\r\n").await;
             Ok::<_, std::io::Error>(())
         });
-        let client = SnipeItClient::new(
+        let client = SnipeItClient::new_loopback_http_for_test(
             format!("http://{address}"),
             SecretString::from(String::from("t")),
         )?;
@@ -899,7 +1017,10 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(server.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            server.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         assert_eq!(
             client.find_models("x").await,
             Err(SnipeItError::InvalidResponse {
@@ -919,7 +1040,7 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let client = SnipeItClient::new(
+        let client = SnipeItClient::new_loopback_http_for_test(
             format!("{}/prefix/", server.uri()),
             SecretString::from(String::from("t")),
         )?;
@@ -938,7 +1059,7 @@ mod tests {
         assert_eq!(paths[1], "/prefix/api/v1/hardware/byserial/50%25");
         assert!(paths[2].starts_with("/prefix/api/v1/hardware/byserial/%"));
         assert!(requests.iter().all(|request| request.url.query().is_none()));
-        let client = SnipeItClient::new(
+        let client = SnipeItClient::new_loopback_http_for_test(
             format!("{}/prefix/", server.uri()),
             SecretString::from(String::from("t")),
         )?;
@@ -967,7 +1088,10 @@ mod tests {
             )
             .mount(&source)
             .await;
-        let client = SnipeItClient::new(source.uri(), SecretString::from(String::from("t")))?;
+        let client = SnipeItClient::new_loopback_http_for_test(
+            source.uri(),
+            SecretString::from(String::from("t")),
+        )?;
         assert!(matches!(
             client.get_asset(7).await,
             Err(SnipeItError::InvalidResponse { .. })
@@ -998,7 +1122,7 @@ mod tests {
                 )
                 .mount(&server)
                 .await;
-            let client = SnipeItClient::with_timeout(
+            let client = SnipeItClient::with_timeout_and_loopback_http_for_test(
                 server.uri(),
                 SecretString::from(String::from("token")),
                 Duration::from_millis(100),
