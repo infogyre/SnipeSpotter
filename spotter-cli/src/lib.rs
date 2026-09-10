@@ -12,6 +12,10 @@ use clap::{Args, Parser, Subcommand};
 use spotter_core::ipc::IPC_MAX_LINE_BYTES;
 use spotter_core::ipc::{IpcResponse, ServiceCommand, validate_config_field};
 
+use cli_output::{render_config, render_status, validate_selector};
+
+mod cli_output;
+
 /// Exit status used when the Windows service IPC endpoint is unavailable.
 pub const EXIT_SERVICE_UNAVAILABLE: i32 = 2;
 
@@ -186,7 +190,12 @@ pub fn dispatch(
                     value: value.clone(),
                 })?)
             }
-            ConfigCommand::Get { .. } => Some(transport.send(&ServiceCommand::GetConfig)?),
+            ConfigCommand::Get { field } => {
+                if let Some(field) = field {
+                    validate_selector(field)?;
+                }
+                Some(transport.send(&ServiceCommand::GetConfig)?)
+            }
             ConfigCommand::SetToken => Some(transport.send(&ServiceCommand::SetToken {
                 value: tokens.read_token()?,
             })?),
@@ -224,9 +233,21 @@ pub fn dispatch(
             None
         }
     };
+    let selector = match &cli.command {
+        Command::Config(ConfigArgs {
+            command: ConfigCommand::Get { field },
+        }) => field.as_deref(),
+        _ => None,
+    };
     match response {
         None => Ok(String::from("ok")),
         Some(IpcResponse::Error { message }) => bail!(message),
+        Some(IpcResponse::Config { settings, missing }) => {
+            render_config(&settings, &missing, selector, cli.json)
+        }
+        Some(response @ (IpcResponse::Status { .. } | IpcResponse::StatusFull { .. })) => {
+            render_status(&response, cli.json)
+        }
         Some(response) => render(&response, cli.json),
     }
 }
@@ -236,18 +257,14 @@ fn render(response: &IpcResponse, json: bool) -> Result<String> {
         return serde_json::to_string_pretty(response).map_err(Into::into);
     }
     Ok(match response {
-        IpcResponse::Status {
-            state, snipeit_url, ..
-        }
-        | IpcResponse::StatusFull {
-            state, snipeit_url, ..
-        } => format!("State: {state}\nSnipe-IT Instance: {snipeit_url}"),
         IpcResponse::Ok { message } | IpcResponse::Error { message } => message.clone(),
-        IpcResponse::Config { missing, .. } => {
-            format!("Configuration loaded; missing: {}", missing.join(", "))
-        }
         IpcResponse::CheckinResult { checked_in } => {
             format!("Checked in {} monitor(s)", checked_in.len())
+        }
+        IpcResponse::Config { .. }
+        | IpcResponse::Status { .. }
+        | IpcResponse::StatusFull { .. } => {
+            unreachable!("special responses are rendered before the generic renderer")
         }
     })
 }
@@ -1231,6 +1248,66 @@ mod tests {
         .expect_err("invalid setting must be rejected before transport");
         assert!(error.to_string().contains("between 1 and 168"));
         assert_eq!(transport.sent.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_output_redaction_and_control_escaping() -> Result<()> {
+        for field in [
+            "snipeit.api_token_encrypted",
+            "logging.level\\u{1b}[31m-arbitrary-input",
+        ] {
+            let cli = Cli::try_parse_from(["spotter-cli", "config", "get", field])?;
+            let mut transport = Fake { sent: Vec::new() };
+            let mut tokens = Fake { sent: Vec::new() };
+            let mut registrar = Fake { sent: Vec::new() };
+            let mut confirmation = Confirmation {
+                answer: true,
+                prompts: 0,
+            };
+            let error = dispatch(
+                &cli,
+                &mut transport,
+                &mut tokens,
+                &mut registrar,
+                &Elevated(true),
+                &mut confirmation,
+            )
+            .expect_err("invalid selector must fail locally");
+            assert!(!error.to_string().contains(field));
+            assert!(transport.sent.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn config_get_selector_is_rendered_as_one_typed_scalar() -> Result<()> {
+        let mut settings = spotter_core::Settings::default();
+        settings.polling.interval_hours = 7;
+        let mut transport = ResponseTransport {
+            sent: Vec::new(),
+            response: IpcResponse::Config {
+                settings,
+                missing: Vec::new(),
+            },
+        };
+        let mut tokens = Fake { sent: Vec::new() };
+        let mut registrar = Fake { sent: Vec::new() };
+        let mut confirmation = Confirmation {
+            answer: true,
+            prompts: 0,
+        };
+        let cli = Cli::try_parse_from(["spotter-cli", "config", "get", "polling.interval_hours"])?;
+        let output = dispatch(
+            &cli,
+            &mut transport,
+            &mut tokens,
+            &mut registrar,
+            &Elevated(true),
+            &mut confirmation,
+        )?;
+        assert_eq!(output, "polling.interval_hours: 7");
+        assert_eq!(transport.sent, vec![ServiceCommand::GetConfig]);
         Ok(())
     }
 
