@@ -202,6 +202,13 @@ pub fn validate_snipeit_url(value: &str) -> Result<(), SettingsValidationError> 
     Ok(())
 }
 
+/// Validates loaded settings, rejecting non-HTTPS endpoints and incomplete
+/// identity fields.
+///
+/// # Errors
+///
+/// Returns [`SettingsValidationError`] when the Snipe-IT URL is not a valid
+/// HTTPS endpoint or identity fields are inconsistent with activation state.
 pub fn validate_settings(settings: &Settings) -> Result<(), SettingsValidationError> {
     let url = settings.snipeit.url.trim();
     let token_is_blank = settings.snipeit.api_token_encrypted.is_empty();
