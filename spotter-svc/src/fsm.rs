@@ -41,6 +41,20 @@ pub struct FsmHandle {
     attached_schedule_sender: Arc<std::sync::Mutex<Option<watch::Sender<ScheduleInput>>>>,
 }
 
+/// Clears the pending-generation slot when dropped, unless disarmed after a
+/// durable submit outcome.
+struct ClaimGuard {
+    slot: Arc<std::sync::Mutex<Option<u64>>>,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = None;
+        }
+    }
+}
+
 /// Result of accepting or coalescing a synchronization request.
 #[derive(Debug)]
 pub(crate) struct SyncEnqueue {
@@ -134,6 +148,7 @@ impl FsmHandle {
 
     async fn enqueue_with_generation(&self, command: ServiceCommand) -> Result<SyncEnqueue> {
         let is_sync = command == ServiceCommand::TriggerSync;
+        let mut claim_guard: Option<ClaimGuard> = None;
         let target_generation = if is_sync {
             // The claim lock orders allocation: a caller allocates only while
             // holding the slot mutex, so generations are assigned in claim
@@ -158,21 +173,31 @@ impl FsmHandle {
             }
             let allocated = self.next_sync_generation.fetch_add(1, Ordering::AcqRel) + 1;
             *claim = Some(allocated);
+            // Cancellation safety: if this future is dropped while the
+            // bounded send is still waiting, the claim guard clears the slot
+            // so later syncs cannot coalesce onto work that was never
+            // submitted.
+            claim_guard = Some(ClaimGuard {
+                slot: std::sync::Arc::clone(&self.pending_generation),
+            });
             allocated
         } else {
             0
         };
         let (response, receiver) = oneshot::channel();
-        if self
+        let send_outcome = self
             .sender
             .send(FsmRequest {
                 command,
                 response,
                 sync_generation: is_sync.then_some(target_generation),
             })
-            .await
-            .is_err()
-        {
+            .await;
+        if send_outcome.is_ok() {
+            // Durable submit: the FSM loop owns the claim lifecycle now.
+            std::mem::forget(claim_guard.take());
+        }
+        if send_outcome.is_err() {
             if is_sync {
                 self.sync_pending.store(false, Ordering::Release);
                 // The claim died with the failed send: clear the stored
