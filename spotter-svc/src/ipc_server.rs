@@ -209,6 +209,9 @@ pub(crate) async fn run_named_pipe_bounded(
             _ = shutdown.cancelled() => break,
         }
         let fsm = fsm.clone();
+        // Clone per iteration: the closure consumes its own token; the
+        // loop-owned token remains for subsequent sessions.
+        let session_token = session_token.clone();
         sessions.spawn(async move {
             // Abandonment is bounded: the session wind-down happens during the
             // fixed drain window, then leftovers abort — the owner never sees

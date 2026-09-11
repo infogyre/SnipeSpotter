@@ -140,6 +140,13 @@ impl FsmHandle {
             // Only the accepted caller writes pending_generation, and it does
             // so immediately after claiming pending, so the slot always holds
             // the in-flight sync's generation when coalesced callers read it.
+            //
+            // Ordering argument: the accepted caller's Release store lands
+            // before any coalesced caller can observe the Acquire load of
+            // sync_pending=true (the CAS published it); a coalesced caller
+            // therefore reads this generation or a later accepted one —
+            // never a stale pre-claim value. Only accepted callers store,
+            // so no rejected claimer can overwrite the in-flight value.
             let accepted = self
                 .sync_pending
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
