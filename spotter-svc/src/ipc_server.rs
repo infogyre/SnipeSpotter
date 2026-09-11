@@ -228,17 +228,11 @@ pub async fn run_named_pipe_bounded(
             _ = shutdown.cancelled() => break,
         }
         let fsm = fsm.clone();
-        // Clone per iteration: the closure consumes its own token; the
-        // loop-owned token remains for subsequent sessions.
-        let session_token = session_token.clone();
         sessions.spawn(async move {
-            // Abandonment is bounded: the session wind-down happens during the
-            // fixed drain window, then leftovers abort — the owner never sees
-            // a cancellation.
-            tokio::select! {
-                outcome = serve_one(server, &fsm) => outcome,
-                _ = session_token.cancelled() => Ok(()),
-            }
+            // Shutdown never cancels an in-flight session: sessions finish
+            // during the bounded drain window and only the deadline aborts
+            // leftovers. This ends response observation, not the owner.
+            serve_one(server, &fsm).await
         });
     }
     // Cooperative shutdown: stop accepting, drain active sessions under a

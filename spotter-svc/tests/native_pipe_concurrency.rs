@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use anyhow::Result;
-use spotter_core::ipc::{IpcResponse, ServiceCommand};
+use spotter_core::ipc::{IPC_MAX_LINE_BYTES, IpcResponse, ServiceCommand};
 use spotter_svc::ipc_server::{MAX_ACTIVE_PIPE_SESSIONS, PipeServerGuard, run_named_pipe_bounded};
 
 fn unique_pipe_endpoint(label: &str) -> String {
@@ -77,12 +77,33 @@ fn client_roundtrip(endpoint: &str, command: &ServiceCommand) -> Result<IpcRespo
     file.write_all(&request)?;
     file.flush()?;
     let mut response = Vec::new();
-    file.read_to_end(&mut response)?;
+    let mut limited = file.take((IPC_MAX_LINE_BYTES + 1) as u64);
+    let read = limited
+        .read_until(b'\n', &mut response)
+        .context("named-pipe client read failed")?;
+    drop(limited);
+    if read == 0 {
+        anyhow::bail!("named-pipe response was empty or the server closed the session");
+    }
     if !response.ends_with(b"\n") {
         anyhow::bail!("named-pipe response was unterminated");
     }
     response.pop();
     Ok(serde_json::from_slice(&response)?)
+}
+
+/// Hard per-call timecap: the blocking roundtrip runs on a separate thread and
+/// a stuck server fails the test at the deadline instead of hanging CI.
+fn bounded_roundtrip(endpoint: &str, command: &ServiceCommand) -> Result<IpcResponse> {
+    let endpoint = endpoint.to_owned();
+    let command = command.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(client_roundtrip(&endpoint, &command));
+    });
+    receiver
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| anyhow::anyhow!("named-pipe roundtrip exceeded its 10-second timecap"))?
 }
 
 #[tokio::test]
@@ -133,7 +154,7 @@ async fn native_session_capacity_and_reaccept() -> Result<()> {
     for _ in 0..MAX_ACTIVE_PIPE_SESSIONS + 4 {
         let endpoint = endpoint.clone();
         handles.push(tokio::task::spawn_blocking(move || {
-            client_roundtrip(&endpoint, &ServiceCommand::GetStatus)
+            bounded_roundtrip(&endpoint, &ServiceCommand::GetStatus)
         }));
     }
     let mut accepted = 0usize;
@@ -156,7 +177,7 @@ async fn native_session_capacity_and_reaccept() -> Result<()> {
     );
 
     // Reaccept: after the burst, a fresh client must still get service.
-    let final_response = client_roundtrip(&endpoint, &ServiceCommand::GetStatus)?;
+    let final_response = bounded_roundtrip(&endpoint, &ServiceCommand::GetStatus)?;
     assert!(matches!(final_response, IpcResponse::Ok { .. }));
 
     // Bound: the loop must never have exceeded 16 concurrently active
@@ -213,7 +234,7 @@ async fn native_pipe_shutdown_drains_or_boundedly_observes_sessions() -> Result<
     let blocker = {
         let endpoint = endpoint.clone();
         tokio::task::spawn_blocking(move || {
-            client_roundtrip(&endpoint, &ServiceCommand::TriggerSync)
+            bounded_roundtrip(&endpoint, &ServiceCommand::TriggerSync)
         })
     };
     tokio::time::timeout(Duration::from_secs(2), started_rx)
