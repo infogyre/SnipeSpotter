@@ -226,8 +226,7 @@ async fn native_pipe_shutdown_drains_or_boundedly_observes_sessions() -> Result<
     let guard = PipeServerGuard::new();
     let shutdown_guard = guard.clone_token();
     let session_token = guard.subscribe();
-    let server_task =
-        tokio::spawn(run_named_pipe_bounded(fsm, endpoint.clone(), session_token));
+    let server_task = tokio::spawn(run_named_pipe_bounded(fsm, endpoint.clone(), session_token));
 
     // Drive a gated session: connect, send the sync that blocks the handler.
     let blocker = {
