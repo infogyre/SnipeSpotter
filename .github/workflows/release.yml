@@ -125,7 +125,7 @@ jobs:
           dotnet tool install --global wix --version 6.0.0
           if ((wix --version) -notmatch '^6\.0\.0') { throw "unexpected WiX version: $(wix --version)" }
           cargo install cargo-cyclonedx --version 0.5.9 --locked
-          if ((cargo cyclonedx --version) -ne 'cargo-cyclonedx 0.5.9') { throw "unexpected cargo-cyclonedx version: $(cargo cyclonedx --version)" }
+          if ((cargo cyclonedx --version) -notmatch 'cargo(-cyclonedx)?-cyclonedx 0\.5\.9$') { throw "unexpected cargo-cyclonedx version: $(cargo cyclonedx --version)" }
       - name: Generate SBOMs
         shell: pwsh
         run: |

@@ -96,7 +96,7 @@ jobs:
           Copy-Item target/x86_64-pc-windows-msvc/release/spotter_svc.pdb $stage
           Copy-Item target/x86_64-pc-windows-msvc/release/spotter_cli.pdb $stage
           cargo install cargo-cyclonedx --version 0.5.9 --locked
-          if ((cargo cyclonedx --version) -ne 'cargo-cyclonedx 0.5.9') { throw "unexpected cargo-cyclonedx version: $(cargo cyclonedx --version)" }
+          if ((cargo cyclonedx --version) -notmatch 'cargo(-cyclonedx)?-cyclonedx 0\.5\.9$') { throw "unexpected cargo-cyclonedx version: $(cargo cyclonedx --version)" }
           cargo cyclonedx --manifest-path spotter-svc/Cargo.toml --format json
           cargo cyclonedx --manifest-path spotter-cli/Cargo.toml --format json
           Move-Item spotter-svc/spotter-svc.cdx.json (Join-Path $stage 'sbom/spotter-svc.cdx.json')

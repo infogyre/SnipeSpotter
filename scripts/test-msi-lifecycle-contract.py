@@ -543,7 +543,7 @@ def test_elevated_source_artifact_contains_complete_msi_stage() -> None:
     build = workflow[workflow.index("- name: Build source MSI") : workflow.index("- name: Validate MSI lifecycle")]
     assert "Remove-Item -LiteralPath installer/bin" in build
     assert "cargo install cargo-cyclonedx --version 0.5.9 --locked" in build
-    assert "cargo-cyclonedx 0.5.9" in build
+    assert "cargo-cyclonedx 0.5.9" in build or "cargo(-cyclonedx)?-cyclonedx 0\\.5\\.9" in build
     assert "cargo cyclonedx --manifest-path spotter-svc/Cargo.toml --format json" in build
     assert "cargo cyclonedx --manifest-path spotter-cli/Cargo.toml --format json" in build
     assert "Join-Path $stage 'sbom/spotter-svc.cdx.json'" in build
