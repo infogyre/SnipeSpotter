@@ -92,7 +92,7 @@ Configuration loading is deliberately strict. Unknown keys are rejected both at 
 
 | Field | Default | Valid range | Notes |
 |---|---|---|---|
-| `snipeit.url` | empty | HTTP(S) URL | Required. Base URL of the Snipe-IT instance. |
+| `snipeit.url` | empty | HTTPS URL | Required. Base URL of the Snipe-IT instance. Nonblank HTTP URLs are rejected; blank stays valid while configuration is staged. |
 | `snipeit.checkout_status_id` | 0 | positive integer | Required. Snipe-IT status label ID for monitor checkout. |
 | `snipeit.checkin_status_id` | 0 | positive integer | Required. Snipe-IT status label ID for monitor check-in. |
 | `snipeit.api_token_encrypted` | empty | -- | Set via `config set-token`, not `config set`. DPAPI-encrypted. |
@@ -102,6 +102,8 @@ Configuration loading is deliberately strict. Unknown keys are rejected both at 
 | Field | Default | Valid range | Notes |
 |---|---|---|---|
 | `polling.interval_hours` | 4 | 1--168 | Hours between automatic sync cycles. |
+
+**Automatic scheduling semantics.** The service reports `next_sync` in status output as the next *automatic enqueue attempt*, not a guaranteed remote execution time. Activation (first valid configuration) arms one full interval from activation. Saving an actual interval change re-arms from the accepted change; saving unrelated settings or the same value again never resets the deadline. A manual `sync` does not reset the automatic schedule. After each automatic sync completes (success or failure), the next interval arms from that completion, so a slow sync shifts the next attempt rather than causing catch-up bursts. While an automatic sync is in flight, `next_sync` is absent; it reappears after completion. If the endpoint becomes unconfigured, `next_sync` disappears until configuration is reactivated.
 
 ### Logging settings
 
@@ -157,7 +159,9 @@ spotter-cli config set logging.level debug
 spotter-cli config get [dotted.path]
 ```
 
-Without a path, displays all configuration with secrets redacted. With a path, displays a single field.
+Without a path, displays all nine nonsecret settable fields in a fixed order plus any missing-configuration names, with secrets redacted. With a path, displays one `field: value` line. Selectable fields are the exact dotted names documented in the configuration reference (for example `snipeit.url`, `polling.interval_hours`); selection is validated locally before any transport call.
+
+With `--json`, selector-free output preserves the complete redacted configuration envelope exactly as the service returns it; a selected field returns a typed scalar (string or number). The encrypted token is not selectable: use `config set-token` to change it, and unknown fields are rejected locally without echoing input.
 
 ### config set-token
 
@@ -173,7 +177,7 @@ Prompts for the Snipe-IT API token with no echo. The service encrypts it with ma
 spotter-cli status [--full] [--json]
 ```
 
-Displays the current service state. Without `--full`, shows the FSM state, last sync time, next sync time, and Snipe-IT URL. With `--full`, also shows the matched computer asset and known monitor inventory.
+Displays the current service state. Without `--full`, shows the transient state, configured endpoint, and last/next sync times. With `--full`, additionally shows the matched asset and every tracked monitor with assignment, check-out, and absence details. Status reads return committed data only — a sync currently in flight appears as the transient `Syncing` state, while all inventory fields keep their last committed values — and they never touch disk, the journal, or the network. `next_sync` is the next automatic enqueue attempt (see [Polling settings](#polling-settings)); it is suppressed while unconfigured or while an automatic sync is in flight.
 
 Use `--json` for machine-readable output. Named-pipe request reads and response writes/flushes each have a fixed five-second deadline. These transport deadlines do not cancel a command once the FSM has queued it: if the client times out, a mutation may still complete and be durably committed, so check status/recovery evidence before retrying.
 
@@ -185,7 +189,15 @@ spotter-cli sync
 
 Triggers an immediate synchronization. If a sync is already running, the request coalesces with the existing operation. Returns when the sync completes or fails. Before accepting new synchronization or forced check-in work, the owner first recovers pending journal evidence; recovery failure prevents new remote mutations. A recovered candidate becomes the active in-memory state immediately after its durable signed-state save, even if the later terminal journal append or compaction fails.
 
-The HTTP client applies fixed safety limits: 30 seconds per request; no redirects followed; at most 1 MiB per success response and 16 KiB retained for error classification; page size 100; and at most 100 requests, 10,000 rows, or 60 seconds for one pagination operation. Exceeding a limit fails the operation rather than returning partial results. Production configuration still accepts HTTP URLs; HTTPS-only production enforcement remains deferred under SPOTR-8.
+The HTTP client applies fixed safety limits to its HTTPS requests: 30 seconds per request; no redirects followed; at most 1 MiB per success response and 16 KiB retained for error classification; page size 100; and at most 100 requests, 10,000 rows, or 60 seconds for one pagination operation. Exceeding a limit fails the operation rather than returning partial results.
+
+## HTTPS-only production endpoints
+
+Production requires HTTPS. Every entry point that accepts a Snipe-IT URL — loaded settings, dotted IPC updates, and both production client constructors — rejects any nonblank `http://` URL, URLs with embedded credentials, query strings, fragments, control characters, malformed authorities, or out-of-range ports before any network I/O. Blank URLs remain valid while configuration is staged. There is no opt-out.
+
+Existing HTTP installations fail closed with a bounded, actionable message; the service never rewrites persisted URLs or contacts the old HTTP endpoint automatically. If the service still holds unresolved mutation evidence (pending journal records), endpoint changes stay blocked by the pending-journal identity guard; operator-assisted recovery resolves the evidence first, then reconfigures the endpoint manually.
+
+The client uses the OS certificate trust store (Windows machine trust). Install your CA chain through normal machine administration; no insecure bypass exists.
 
 ### checkin
 
@@ -247,6 +259,19 @@ Installs or removes the Windows service via the SCM. The MSI installer handles t
 2. Re-enter the API token: `spotter-cli config set-token`.
 3. Verify the token has permissions to read hardware, update assets, and perform checkout/check-in.
 4. Check that the Snipe-IT API version is compatible (v8.2 or later).
+
+### Sync fails with HTTPS or certificate error
+
+The service requires HTTPS and validates the endpoint against the OS certificate trust store.
+
+1. Confirm the URL starts with `https://`: `spotter-cli config get snipeit.url`.
+2. Confirm the Snipe-IT server presents a certificate chain that is trusted on this machine (corporate CA: install the chain through normal machine administration).
+3. Confirm the certificate matches the hostname exactly; IP-address or mismatched-name endpoints fail verification.
+4. A rejected certificate never falls back to HTTP; there is no bypass.
+
+### Changing the endpoint while mutation evidence is pending
+
+If recovery still holds unresolved mutation evidence, endpoint changes are blocked by the pending-journal identity guard, and the service will not rewrite URLs automatically. Resolve the evidence first (see recovery below), then update the endpoint with `config set`.
 
 ### Sync fails with "taxonomy unresolved"
 
