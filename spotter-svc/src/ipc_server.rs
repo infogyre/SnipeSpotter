@@ -176,10 +176,16 @@ pub(crate) async fn run_named_pipe_bounded(
         // slot while awaiting an unaccepted connection.
         if sessions.len() >= MAX_ACTIVE_PIPE_SESSIONS {
             // Capacity full: reap completed sessions, then accept and promptly
-            // close any excess connection rather than queueing it.
+            // close any excess connection rather than queueing it. The connect
+            // wait stays interruptible by shutdown.
             while sessions.try_join_next().is_some() {}
             let server = create_secured_server(&pipe_name)?;
-            server.connect().await?;
+            tokio::select! {
+                connected = server.connect() => {
+                    connected.context("named-pipe client connect failed")?;
+                }
+                _ = shutdown.cancelled() => break,
+            }
             drop(server);
             continue;
         }

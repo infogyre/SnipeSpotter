@@ -152,13 +152,17 @@ pub(crate) async fn run_scheduler(
             }
             continue;
         };
-        if tokio::time::timeout_at(deadline, schedule_input.changed())
-            .await
-            .is_err()
-        {
-            // Deadline elapsed: fall through to the next enqueue.
-        } else if !schedule_input.has_changed().unwrap_or(true) {
-            // Input changed before the deadline; handled at loop top.
+        let wait_outcome = tokio::time::timeout_at(deadline, schedule_input.changed()).await;
+        match wait_outcome {
+            // Deadline elapsed: arm the next automatic enqueue immediately.
+            Err(_) => {}
+            // Input changed first: re-evaluate configuration at the loop top.
+            // A closed channel terminates the scheduler cleanly.
+            Ok(changed) => {
+                if changed.is_err() {
+                    return;
+                }
+            }
         }
     }
 }
