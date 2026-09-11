@@ -117,16 +117,18 @@ pub async fn run_named_pipe(fsm: FsmHandle) -> Result<()> {
 /// Fixed bound on concurrently active pipe sessions; excess connections are
 /// accepted and promptly closed so saturation cannot queue unbounded tasks.
 #[cfg(windows)]
-pub(crate) const MAX_ACTIVE_PIPE_SESSIONS: usize = 16;
+#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
+pub const MAX_ACTIVE_PIPE_SESSIONS: usize = 16;
 
 /// Cooperative shutdown signal for the native accept loop.
 #[cfg(windows)]
-#[derive(Default)]
-pub(crate) struct PipeServerGuard {
+#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
+pub struct PipeServerGuard {
     shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[cfg(windows)]
+#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
 impl PipeServerGuard {
     pub(crate) fn new() -> Self {
         Self {
@@ -134,16 +136,16 @@ impl PipeServerGuard {
         }
     }
 
-    pub(crate) fn request_shutdown(&self) {
+    pub fn request_shutdown(&self) {
         self.shutdown.cancel();
     }
 
-    pub(crate) fn subscribe(&self) -> tokio_util::sync::CancellationToken {
+    pub fn subscribe(&self) -> tokio_util::sync::CancellationToken {
         self.shutdown.clone()
     }
 
     /// Alias kept for test readability: yields an independent token handle.
-    pub(crate) fn clone_token(&self) -> Self {
+    pub fn clone_token(&self) -> Self {
         Self {
             shutdown: self.shutdown.clone(),
         }
@@ -186,7 +188,8 @@ pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> 
 }
 
 #[cfg(windows)]
-pub(crate) async fn run_named_pipe_bounded(
+#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
+pub async fn run_named_pipe_bounded(
     fsm: FsmHandle,
     pipe_name: impl Into<String>,
     session_token: tokio_util::sync::CancellationToken,
