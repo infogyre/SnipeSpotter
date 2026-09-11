@@ -39,6 +39,9 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
 base64 = { workspace = true }
 tokio-util = { workspace = true }
+rsa = { workspace = true }
+rand_core = { workspace = true }
+rustls-pki-types = "=1.15.1"
 toml = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
