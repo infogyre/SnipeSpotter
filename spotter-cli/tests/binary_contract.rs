@@ -293,11 +293,34 @@ async fn actual_binary_config_selection_and_status_outputs_match_contract() {
     assert!(complete.status.success());
     let complete_json: serde_json::Value =
         serde_json::from_slice(&complete.stdout).expect("config envelope JSON");
-    assert_eq!(complete_json["type"], "config");
-    assert_eq!(complete_json["data"]["missing"][0], "snipeit.url");
     assert_eq!(
-        complete_json["data"]["settings"]["snipeit"]["api_token_encrypted"],
-        ""
+        complete_json,
+        serde_json::json!({
+            "type": "config",
+            "data": {
+                "settings": {
+                    "snipeit": {
+                        "url": "https://example.test/\u{1b}[31m",
+                        "api_token_encrypted": "",
+                        "checkout_status_id": 11,
+                        "checkin_status_id": 12,
+                    },
+                    "polling": {
+                        "interval_hours": 7,
+                    },
+                    "logging": {
+                        "level": "debug\nnext",
+                        "max_size_mb": 20,
+                        "max_files": 4,
+                    },
+                    "monitors": {
+                        "checkin_policy": "auto_non_portable",
+                        "checkin_threshold_hours": 48,
+                    },
+                },
+                "missing": ["snipeit.url"],
+            },
+        })
     );
 
     let human_config = identity.cli_arguments(&["config", "get"]);

@@ -320,12 +320,35 @@ mod tests {
         let settings = settings();
         let json = render_config(&settings, &[String::from("snipeit.url")], None, true)?;
         let value: Value = serde_json::from_str(&json)?;
-        assert_eq!(value["type"], "config");
         assert_eq!(
-            value["data"]["settings"]["snipeit"]["api_token_encrypted"],
-            ""
+            value,
+            serde_json::json!({
+                "type": "config",
+                "data": {
+                    "settings": {
+                        "snipeit": {
+                            "url": "https://example.test/\u{1b}[31m",
+                            "api_token_encrypted": "",
+                            "checkout_status_id": 11,
+                            "checkin_status_id": 12,
+                        },
+                        "polling": {
+                            "interval_hours": 7,
+                        },
+                        "logging": {
+                            "level": "debug\nnext",
+                            "max_size_mb": 20,
+                            "max_files": 4,
+                        },
+                        "monitors": {
+                            "checkin_policy": "auto_non_portable",
+                            "checkin_threshold_hours": 48,
+                        },
+                    },
+                    "missing": ["snipeit.url"],
+                },
+            })
         );
-        assert_eq!(value["data"]["missing"][0], "snipeit.url");
 
         let human = render_config(&settings, &[], None, false)?;
         assert!(human.contains("snipeit.url: https://example.test/\\u{1b}[31m"));
