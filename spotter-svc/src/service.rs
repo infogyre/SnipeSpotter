@@ -734,6 +734,8 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
         tokio::sync::watch::channel(settings.polling.interval_hours);
     let configured = config_status(&settings).is_empty();
     let startup_url = settings.snipeit.url.clone();
+    let settings_polling_snapshot = settings.polling.interval_hours;
+    let startup_state_snapshot = persisted_state.clone();
     let mut controller = crate::ServiceController::new(settings);
     controller.state = if configured {
         crate::FsmState::Idle
@@ -769,12 +771,22 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
         clock: Box::new(crate::owner_ports::SystemClock),
         journal_finalization: Box::new(crate::sync_engine::ProductionJournalFinalization),
     }));
-    let fsm = crate::fsm::spawn(32, move |command| {
+    let fsm = {
         let owner = std::sync::Arc::clone(&owner);
-        async move { owner.lock().await.handle(command).await }
-    })
-    .inspect_err(|e| tracing::error!(%e, "failed to spawn FSM"))?;
+        crate::fsm::spawn(32, move |command| {
+            let owner = std::sync::Arc::clone(&owner);
+            async move { owner.lock().await.handle(command).await }
+        })
+        .inspect_err(|e| tracing::error!(%e, "failed to spawn FSM"))?
+    };
     tracing::info!("FSM spawned");
+
+    // Startup committed-state data retained for the in-block_on publication
+    // (the owner owns its persisted state after construction).
+    let startup_configured = configured;
+    let startup_url = startup_url.clone();
+    let startup_interval_hours = settings_polling_snapshot;
+    let startup_state_for_publication = startup_state_snapshot.clone();
 
     // Publish status snapshots and drive the automatic scheduler from the
     // configuration generation observed by the owner. All async wiring runs
@@ -793,11 +805,14 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
         // state before any command, then arm the scheduler from the loaded
         // configuration. The legacy polling timer is retired: the scheduler
         // owns the automatic deadline exclusively.
-        let startup_url = startup_url.clone();
-        owner_publisher.publish_snapshot_owned(configured, &startup_url, &persisted_state);
+        owner_publisher.publish_snapshot_owned(
+            startup_configured,
+            &startup_url,
+            &startup_state_for_publication,
+        );
         owner_publisher.publish_schedule_input(
-            configured,
-            std::time::Duration::from_secs(u64::from(polling_receiver.borrow()) * 3600),
+            startup_configured,
+            std::time::Duration::from_secs(startup_interval_hours * 3600),
         );
         let pipe_endpoint = runtime.pipe_endpoint.clone();
         let pipe = tokio::spawn(crate::ipc_server::run_named_pipe_at(fsm, pipe_endpoint));

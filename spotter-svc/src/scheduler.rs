@@ -128,12 +128,38 @@ pub(crate) async fn run_scheduler(
             }
             continue;
         }
+        // Activation or accepted interval change arms ONE full interval from
+        // the arming instant; the first automatic sync happens at the
+        // deadline, never immediately.
+        let Some((deadline, projected)) =
+            project_next_sync(true, interval, Instant::now(), generation, generation)
+        else {
+            if schedule_input.changed().await.is_err() {
+                return;
+            }
+            continue;
+        };
+        publish_schedule(&handle, generation, Some(projected));
+        // Wait out the armed deadline; an input change (interval change,
+        // unconfiguration) re-evaluates at the loop top instead.
+        let wait_outcome = tokio::time::timeout_at(deadline, schedule_input.changed()).await;
+        match wait_outcome {
+            Err(_) => {}
+            Ok(changed) => {
+                if changed.is_err() {
+                    return;
+                }
+                continue;
+            }
+        }
+        // Due: clear next_sync before submission and keep it absent through
+        // queueing and execution.
+        publish_schedule(&handle, generation, None);
         let Ok(enqueue) = handle.enqueue_sync().await else {
             tracing::info!("automatic sync scheduler stopping: owner channel closed");
             publish_schedule(&handle, generation, None);
             return;
         };
-        publish_schedule(&handle, generation, None);
         let response = enqueue.response.await;
         if handle
             .wait_for_sync_generation(enqueue.target_generation, completed.clone())
@@ -144,20 +170,34 @@ pub(crate) async fn run_scheduler(
             return;
         }
         let _ = response;
-        let Some((deadline, _)) =
-            project_next_sync(configured, interval, Instant::now(), generation, generation)
-        else {
+        // Arm the completion-relative deadline from the LATEST configuration:
+        // re-read the input so an interval change during the sync governs.
+        let (latest_configured, latest_interval, latest_generation) = {
+            let latest = schedule_input.borrow_and_update();
+            (latest.configured, latest.interval, latest.generation)
+        };
+        if !latest_configured {
+            publish_schedule(&handle, latest_generation, None);
+            if schedule_input.changed().await.is_err() {
+                return;
+            }
+            continue;
+        }
+        let Some((next_deadline, next_projected)) = project_next_sync(
+            true,
+            latest_interval,
+            Instant::now(),
+            latest_generation,
+            latest_generation,
+        ) else {
             if schedule_input.changed().await.is_err() {
                 return;
             }
             continue;
         };
-        let wait_outcome = tokio::time::timeout_at(deadline, schedule_input.changed()).await;
-        match wait_outcome {
-            // Deadline elapsed: arm the next automatic enqueue immediately.
+        publish_schedule(&handle, latest_generation, Some(next_projected));
+        match tokio::time::timeout_at(next_deadline, schedule_input.changed()).await {
             Err(_) => {}
-            // Input changed first: re-evaluate configuration at the loop top.
-            // A closed channel terminates the scheduler cleanly.
             Ok(changed) => {
                 if changed.is_err() {
                     return;
