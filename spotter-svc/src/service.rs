@@ -2,7 +2,7 @@
 
 //! Windows Service Control Manager lifecycle and runtime orchestration.
 
-use std::{ffi::OsString, fs, path::Path, sync::mpsc, sync::Arc, time::Duration};
+use std::{ffi::OsString, fs, path::Path, sync::Arc, sync::mpsc, time::Duration};
 
 use crate::owner_ports::{
     Clock, HardwareDiscovery, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
@@ -1074,6 +1074,7 @@ mod tests {
         let mut owner = CommandOwner {
             journal_path: std::path::PathBuf::new(),
             polling_sender: tokio::sync::watch::channel(4).0,
+            status_publisher: None,
             persisted_state: PersistedServiceState::default(),
             controller: crate::ServiceController::new(settings),
             secret_protector: Box::new(RecordingProtector {
@@ -1124,6 +1125,7 @@ mod tests {
         let mut owner = CommandOwner {
             journal_path: journal_path.clone(),
             polling_sender: tokio::sync::watch::channel(4).0,
+            status_publisher: None,
             persisted_state: PersistedServiceState::default(),
             controller: crate::ServiceController::new(settings.clone()),
             secret_protector: Box::new(RecordingProtector {
@@ -1202,6 +1204,7 @@ mod tests {
         let mut owner = CommandOwner {
             journal_path: std::path::PathBuf::new(),
             polling_sender: tokio::sync::watch::channel(4).0,
+            status_publisher: None,
             persisted_state: PersistedServiceState::default(),
             controller: crate::ServiceController::new(spotter_core::Settings::default()),
             secret_protector: Box::new(RecordingProtector {
@@ -1471,6 +1474,7 @@ mod tests {
         let owner = CommandOwner {
             journal_path: std::path::PathBuf::new(),
             polling_sender: tokio::sync::watch::channel(4).0,
+            status_publisher: None,
             persisted_state: PersistedServiceState {
                 last_sync_time: Some(String::from("2026-01-01T00:00:00Z")),
                 matched_asset: Some(AssetSummary {
