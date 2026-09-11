@@ -28,7 +28,10 @@ pub struct FsmHandle {
     sender: mpsc::Sender<FsmRequest>,
     sync_pending: Arc<AtomicBool>,
     next_sync_generation: Arc<std::sync::atomic::AtomicU64>,
-    pending_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// `Some(generation)` while a sync is claimed/pending; the accepted
+    /// caller stores its generation under the same lock that publishes the
+    /// claim, so coalesced callers never observe a torn state.
+    pending_generation: Arc<std::sync::Mutex<Option<u64>>>,
     completed_sync_generation: watch::Sender<u64>,
     status_receiver: Option<watch::Receiver<PublicStatusSnapshot>>,
     schedule_receiver: Option<watch::Receiver<ScheduleSnapshot>>,
@@ -137,32 +140,28 @@ impl FsmHandle {
             // generation without any window where a coalesced caller could
             // observe a stale value.
             let allocated = self.next_sync_generation.fetch_add(1, Ordering::AcqRel) + 1;
-            // Only the accepted caller writes pending_generation, and it does
-            // so immediately after claiming pending, so the slot always holds
-            // the in-flight sync's generation when coalesced callers read it.
-            //
-            // Ordering argument: the accepted caller's Release store lands
-            // before any coalesced caller can observe the Acquire load of
-            // sync_pending=true (the CAS published it); a coalesced caller
-            // therefore reads this generation or a later accepted one —
-            // never a stale pre-claim value. Only accepted callers store,
-            // so no rejected claimer can overwrite the in-flight value.
-            let accepted = self
-                .sync_pending
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok();
-            if !accepted {
+            // The claim and the pending-generation store are one atomic
+            // section under this mutex: a coalesced caller either sees the
+            // claim un-set (and becomes the accepted caller) or reads the
+            // stored in-flight generation, never a torn intermediate state.
+            let mut claim = self
+                .pending_generation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sync generation lock poisoned"))?;
+            if claim.is_some() {
+                let pending = claim.expect("checked above");
+                drop(claim);
                 let (response, receiver) = oneshot::channel();
                 let _ = response.send(IpcResponse::Ok {
                     message: String::from("sync already queued"),
                 });
                 return Ok(SyncEnqueue {
                     response: receiver,
-                    target_generation: self.pending_target_generation(),
+                    target_generation: pending,
                     coalesced: true,
                 });
             }
-            self.pending_generation.store(allocated, Ordering::Release);
+            *claim = Some(allocated);
             allocated
         } else {
             0
@@ -180,6 +179,11 @@ impl FsmHandle {
         {
             if is_sync {
                 self.sync_pending.store(false, Ordering::Release);
+                // The claim died with the failed send: clear the stored
+                // generation so a later accepted sync publishes fresh.
+                if let Ok(mut guard) = self.pending_generation.lock() {
+                    *guard = None;
+                }
             }
             return Err(anyhow::anyhow!("service command loop is unavailable"));
         }
@@ -192,14 +196,6 @@ impl FsmHandle {
 
     pub(crate) fn completed_sync_generation(&self) -> watch::Receiver<u64> {
         self.completed_sync_generation.subscribe()
-    }
-
-    /// The generation of the currently pending sync: stored by the accepted
-    /// caller immediately after claiming pending, before any coalesced
-    /// caller can observe the claim. Coalesced callers read this so their
-    /// target always matches the in-flight sync.
-    fn pending_target_generation(&self) -> u64 {
-        self.pending_generation.load(Ordering::Acquire)
     }
 
     /// Registers a status publication channel owned by the service startup.
@@ -274,6 +270,9 @@ where
     let (sender, mut receiver) = mpsc::channel::<FsmRequest>(capacity);
     let sync_pending = Arc::new(AtomicBool::new(false));
     let loop_sync_pending = Arc::clone(&sync_pending);
+    let pending_generation: Arc<std::sync::Mutex<Option<u64>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let loop_pending_generation = std::sync::Arc::clone(&pending_generation);
     let (completed_sync_generation, _) = watch::channel(0_u64);
     let loop_completed_sync_generation = completed_sync_generation.clone();
     let (schedule_sender, schedule_receiver_for_handle) = watch::channel(ScheduleSnapshot {
@@ -286,6 +285,12 @@ where
             let response = handler(request.command).await;
             if is_sync {
                 loop_sync_pending.store(false, Ordering::Release);
+                // The claim completes: clear the stored generation so the
+                // next accepted sync publishes fresh (a stale value would
+                // make later requests coalesce forever).
+                if let Ok(mut guard) = loop_pending_generation.lock() {
+                    *guard = None;
+                }
                 if let Some(generation) = request.sync_generation {
                     loop_completed_sync_generation.send_replace(generation);
                 }
@@ -297,7 +302,7 @@ where
         sender,
         sync_pending,
         next_sync_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        pending_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        pending_generation,
         completed_sync_generation,
         status_receiver,
         schedule_receiver: schedule_receiver.or(Some(schedule_receiver_for_handle)),
@@ -430,7 +435,7 @@ mod tests {
             sender,
             sync_pending: Arc::new(AtomicBool::new(false)),
             next_sync_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pending_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending_generation: Arc::new(std::sync::Mutex::new(None)),
             completed_sync_generation,
             status_receiver: None,
             schedule_receiver: None,
