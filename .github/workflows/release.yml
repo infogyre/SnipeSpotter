@@ -39,6 +39,12 @@ jobs:
             publish=true
           fi
           printf 'version=%s\npublish=%s\n' "$version" "$publish" >> "$GITHUB_OUTPUT"
+      - name: Install and assert Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+          rustc --version | grep -Eq '^rustc 1\\.98\\.1 '
       - name: Verify lockfile
         run: cargo metadata --locked --no-deps --format-version 1 >/dev/null
 
@@ -51,8 +57,12 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+      - name: Install and assert Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ((rustc --version) -notmatch '^rustc 1\\.98\\.1 ') { throw "unexpected rustc version: $(rustc --version)" }
       - name: Test workspace
         run: cargo test --workspace --all-targets --locked
       - name: Production owner integration tests
@@ -91,8 +101,12 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal
+      - name: Install and assert Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.98.1 --profile minimal
+          if ((rustc --version) -notmatch '^rustc 1\\.98\\.1 ') { throw "unexpected rustc version: $(rustc --version)" }
       - name: Download binaries
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -109,8 +123,9 @@ jobs:
         shell: pwsh
         run: |
           dotnet tool install --global wix --version 6.0.0
-          wix --version
-          cargo install cargo-cyclonedx --locked
+          if ((wix --version) -notmatch '^6\\.0\\.0') { throw "unexpected WiX version: $(wix --version)" }
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          if ((cargo cyclonedx --version) -ne 'cargo-cyclonedx 0.5.9') { throw "unexpected cargo-cyclonedx version: $(cargo cyclonedx --version)" }
       - name: Generate SBOMs
         shell: pwsh
         run: |

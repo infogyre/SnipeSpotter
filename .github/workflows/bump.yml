@@ -24,8 +24,12 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Install Rust
-        run: rustup toolchain install stable --profile minimal
+      - name: Install and assert Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.98.1 --profile minimal
+          rustc --version | grep -Eq '^rustc 1\\.98\\.1 '
       - name: Calculate and apply version
         id: version
         env:
