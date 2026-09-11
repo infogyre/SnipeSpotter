@@ -718,11 +718,26 @@ mod tests {
             Ok(())
         }
 
-        fn open_directory(&self, _parent: &Path) -> io::Result<File> {
+        fn open_directory(&self, parent: &Path) -> io::Result<File> {
             if self.fail_open {
                 Err(io::Error::new(ErrorKind::PermissionDenied, SENTINEL_ERROR))
             } else {
-                File::open(".")
+                // Open the REAL parent directory. On Windows CI the test
+                // binary's "." may be unavailable or the temp-root ACLs may
+                // deny File::open on the directory; opening the actual parent
+                // keeps the sync-failure injection on the exercised path.
+                // A failed open here is indistinguishable from the
+                // best-effort contract, so callers treat it as skip.
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt as _;
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS: required to open a directory
+                        .open(parent)
+                }
+                #[cfg(not(windows))]
+                File::open(parent)
             }
         }
 

@@ -59,7 +59,10 @@ impl TlsLoopbackServer {
         let leaf_key_pem = leaf_key.serialize_pem();
         let ca_pem = ca_cert.pem();
 
-        let identity = Identity::from_pkcs8(leaf_pem.as_bytes(), leaf_key_pem.as_bytes())?;
+        // Windows schannel parses DER (CertCreateCertificateContext); PEM
+        // input fails with "ASN1 bad tag value met" there. Linux OpenSSL
+        // accepts both, so DER is used unconditionally.
+        let identity = Identity::from_pkcs8(&leaf_key.serialize_der(), leaf_cert.der().as_ref())?;
         let acceptor = Arc::new(TlsAcceptor::from(
             native_tls::TlsAcceptor::builder(identity).build()?,
         ));
@@ -149,10 +152,9 @@ pub(crate) fn mismatched_localhost_identity() -> anyhow::Result<native_tls::Iden
     let leaf_key = KeyPair::generate()?;
     let params = CertificateParams::new(vec![String::from("other-host")])?;
     let cert = params.self_signed(&leaf_key)?;
-    let key_pem = leaf_key.serialize_pem();
     Ok(Identity::from_pkcs8(
-        cert.pem().as_bytes(),
-        key_pem.as_bytes(),
+        &leaf_key.serialize_der(),
+        cert.der().as_ref(),
     )?)
 }
 
