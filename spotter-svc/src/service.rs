@@ -714,6 +714,11 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     .inspect_err(|e| tracing::error!(%e, "failed to spawn FSM"))?;
     tracing::info!("FSM spawned");
 
+    // Publish status snapshots and drive the automatic scheduler from the
+    // configuration generation observed by the owner.
+    let publisher = crate::status_publisher::StatusPublisher::new(&fsm)?;
+    crate::status_publisher::spawn_scheduler(fsm.clone(), publisher.schedule_receiver());
+
     set_status(&status_handle, ServiceState::Running, 0, Duration::ZERO)
         .inspect_err(|e| tracing::error!(%e, "failed to set Running"))?;
     tracing::info!("Running reported; entering main loop");

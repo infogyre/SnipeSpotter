@@ -13,8 +13,12 @@ pub mod operation_journal;
 #[cfg(windows)]
 pub mod owner_ports;
 pub mod ports;
+pub(crate) mod scheduler;
 #[cfg(windows)]
 pub mod service;
+pub(crate) mod status;
+#[cfg(windows)]
+pub(crate) mod status_publisher;
 #[cfg(test)]
 pub(crate) mod tls_test_fixture;
 
