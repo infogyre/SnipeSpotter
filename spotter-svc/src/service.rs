@@ -817,12 +817,13 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
         );
         let pipe_endpoint = runtime.pipe_endpoint.clone();
         let pipe_shutdown = PipeServerGuard::new();
+        // The server future gets its own token; the guard stays here to
+        // request shutdown after the SCM signal.
         let session_token = pipe_shutdown.subscribe();
         let pipe = tokio::spawn(crate::ipc_server::run_named_pipe_bounded(
             fsm,
             pipe_endpoint,
-            pipe_shutdown,
-            session_token,
+            session_token.clone(),
         ));
         tokio::task::spawn_blocking(move || shutdown_receiver.recv())
             .await

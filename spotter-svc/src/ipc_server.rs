@@ -161,21 +161,24 @@ impl PipeServerGuard {
 /// Returns an error when pipe creation fails or the shutdown drain exceeds
 /// its deadline.
 pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> Result<()> {
-    run_named_pipe_bounded(fsm, pipe_name, PipeServerGuard::new()).await
+    let guard = PipeServerGuard::new();
+    let session_token = guard.subscribe();
+    // Keep the guard alive for the lifetime of the server task so shutdown
+    // stays reachable; the token drives the loop.
+    let server = run_named_pipe_bounded(fsm, pipe_name, session_token);
+    server.await
 }
 
 #[cfg(windows)]
 pub(crate) async fn run_named_pipe_bounded(
     fsm: FsmHandle,
     pipe_name: impl Into<String>,
-    guard: PipeServerGuard,
     session_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use tokio::task::JoinSet;
 
     let pipe_name = pipe_name.into();
-    let shutdown = guard.subscribe();
-    drop(guard); // ownership consumed; the token drives all waiting
+    let shutdown = session_token;
     let mut sessions: JoinSet<Result<()>> = JoinSet::new();
     loop {
         if shutdown.is_cancelled() {

@@ -131,15 +131,30 @@ impl FsmHandle {
     async fn enqueue_with_generation(&self, command: ServiceCommand) -> Result<SyncEnqueue> {
         let is_sync = command == ServiceCommand::TriggerSync;
         let target_generation = if is_sync {
-            // Claim pending FIRST, then allocate the generation; a coalesced
-            // caller reads the generation AFTER observing the pending claim
-            // so its target always matches the accepted sync's generation.
+            // Claim pending FIRST, then allocate the generation. A coalesced
+            // caller spins briefly on the allocated generation so its target
+            // always matches the accepted sync: fetch_add publishes the new
+            // value, and pending is only cleared after completion, so a
+            // coalesced read of the pre-increment value proves the increment
+            // has not happened yet — wait for it instead of returning stale.
             if self
                 .sync_pending
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                let next = self.next_sync_generation.load(Ordering::Acquire);
+                // The accepted caller allocates its generation promptly after
+                // claiming pending. Read the pre-claim value once and poll
+                // (bounded, yielding) until the allocation is visible, so the
+                // coalesced target always matches the accepted sync.
+                let before = self.next_sync_generation.load(Ordering::Acquire);
+                let mut next = before;
+                for _ in 0..200 {
+                    next = self.next_sync_generation.load(Ordering::Acquire);
+                    if next > before {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
+                }
                 let (response, receiver) = oneshot::channel();
                 let _ = response.send(IpcResponse::Ok {
                     message: String::from("sync already queued"),
