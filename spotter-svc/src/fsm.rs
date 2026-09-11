@@ -28,6 +28,7 @@ pub struct FsmHandle {
     sender: mpsc::Sender<FsmRequest>,
     sync_pending: Arc<AtomicBool>,
     next_sync_generation: Arc<std::sync::atomic::AtomicU64>,
+    pending_generation: Arc<std::sync::atomic::AtomicU64>,
     completed_sync_generation: watch::Sender<u64>,
     status_receiver: Option<watch::Receiver<PublicStatusSnapshot>>,
     schedule_receiver: Option<watch::Receiver<ScheduleSnapshot>>,
@@ -131,41 +132,33 @@ impl FsmHandle {
     async fn enqueue_with_generation(&self, command: ServiceCommand) -> Result<SyncEnqueue> {
         let is_sync = command == ServiceCommand::TriggerSync;
         let target_generation = if is_sync {
-            // Claim pending FIRST, then allocate the generation. A coalesced
-            // caller spins briefly on the allocated generation so its target
-            // always matches the accepted sync: fetch_add publishes the new
-            // value, and pending is only cleared after completion, so a
-            // coalesced read of the pre-increment value proves the increment
-            // has not happened yet — wait for it instead of returning stale.
+            // Allocate a unique generation for every sync request BEFORE the
+            // pending claim: fetch_add is atomic, so each caller owns its
+            // generation without any window where a coalesced caller could
+            // observe a stale value.
+            let allocated = self.next_sync_generation.fetch_add(1, Ordering::AcqRel) + 1;
             if self
                 .sync_pending
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                // The accepted caller allocates its generation promptly after
-                // claiming pending. Read the pre-claim value once and poll
-                // (bounded, yielding) until the allocation is visible, so the
-                // coalesced target always matches the accepted sync.
-                let before = self.next_sync_generation.load(Ordering::Acquire);
-                let mut next = before;
-                for _ in 0..200 {
-                    next = self.next_sync_generation.load(Ordering::Acquire);
-                    if next > before {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_micros(50)).await;
-                }
+                // Pending claim already held: coalesce onto the accepted
+                // sync's generation, which the accepted caller stored before
+                // the pending flag became observable to us.
                 let (response, receiver) = oneshot::channel();
                 let _ = response.send(IpcResponse::Ok {
                     message: String::from("sync already queued"),
                 });
                 return Ok(SyncEnqueue {
                     response: receiver,
-                    target_generation: next,
+                    target_generation: self.pending_target_generation(),
                     coalesced: true,
                 });
             }
-            self.next_sync_generation.fetch_add(1, Ordering::AcqRel) + 1
+            // First store of the claim: the accepted generation is published
+            // before any coalesced caller can observe sync_pending=true.
+            self.pending_generation.store(allocated, Ordering::Release);
+            allocated
         } else {
             0
         };
@@ -194,6 +187,14 @@ impl FsmHandle {
 
     pub(crate) fn completed_sync_generation(&self) -> watch::Receiver<u64> {
         self.completed_sync_generation.subscribe()
+    }
+
+    /// The generation of the currently pending sync: stored by the accepted
+    /// caller immediately after claiming pending, before any coalesced
+    /// caller can observe the claim. Coalesced callers read this so their
+    /// target always matches the in-flight sync.
+    fn pending_target_generation(&self) -> u64 {
+        self.pending_generation.load(Ordering::Acquire)
     }
 
     /// Registers a status publication channel owned by the service startup.
@@ -291,6 +292,7 @@ where
         sender,
         sync_pending,
         next_sync_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        pending_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         completed_sync_generation,
         status_receiver,
         schedule_receiver: schedule_receiver.or(Some(schedule_receiver_for_handle)),
@@ -423,6 +425,7 @@ mod tests {
             sender,
             sync_pending: Arc::new(AtomicBool::new(false)),
             next_sync_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             completed_sync_generation,
             status_receiver: None,
             schedule_receiver: None,
