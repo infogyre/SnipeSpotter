@@ -1115,6 +1115,10 @@ try {
         service_name = $serviceName
         service_status = if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) { 'absent' } else { (Get-Service -Name $serviceName).Status.ToString() }
         data_root_exists = [bool](Test-Path -LiteralPath $DataRoot)
+        data_root_entries = if (Test-Path -LiteralPath $DataRoot) {
+            @(Get-ChildItem -LiteralPath $DataRoot -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName.Substring($DataRoot.Length) }) | Sort-Object
+        } else { @() }
     }
     # Preserve the service's own tracing logs for root-cause analysis; the
     # service writes under the per-run DataRoot.
