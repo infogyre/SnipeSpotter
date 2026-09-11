@@ -29,7 +29,7 @@ Assert-True ($valid.PSObject.Properties.Name -join ',' -ceq 'artifact_name,log_a
 # An empty MSI name is the explicit discovery sentinel; supplied names still obey the full 1..128 rule.
 Assert-True ((Assert-MsiName -Name '') -ceq '') 'empty MSI name must request discovery'
 Assert-True ((Assert-MsiName -Name (('a' * 124) + '.msi')) -ceq (('a' * 124) + '.msi')) '128-character MSI name was rejected'
-foreach ($name in @('../escape', '..\escape', 'C:\absolute', '\\server\share', 'good.msi:stream', 'CON.msi', 'aux.MSI', 'NUL.', 'good name.msi', "bad`n.msi", ('a' * 125) + '.msi', 'bad.msi.')) {
+foreach ($name in @('../escape', '..\escape', 'C:\absolute', '\\server\share', 'good.msi:stream', 'CON.msi', 'aux.MSI', 'NUL.', 'CON.foo.msi', 'AUX.backup.msi', 'good name.msi', "bad`n.msi", ('a' * 125) + '.msi', 'bad.msi.')) {
     Assert-Rejected -Description $name -Action { Assert-MsiName -Name $name }
 }
 foreach ($name in @('_leading', 'bad_name', 'bad name', 'CON.', 'release.')) {

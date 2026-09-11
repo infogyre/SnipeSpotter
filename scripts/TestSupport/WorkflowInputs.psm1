@@ -34,7 +34,8 @@ function Assert-AsciiSafeName {
     if ($Name -notmatch $pattern) { throw "$Label contains unsupported characters" }
     if ($RequireMsiSuffix -and $Name -notmatch '(?i)\.msi$') { throw "$Label must use the .msi suffix" }
     $base = [IO.Path]::GetFileNameWithoutExtension($Name)
-    if ($script:ReservedDeviceNames -contains $base.TrimEnd('.').ToUpperInvariant()) {
+    $stem = $base.Split('.')[0].TrimEnd('.')
+    if ($script:ReservedDeviceNames -contains $stem.ToUpperInvariant()) {
         throw "$Label uses a reserved device name"
     }
     return $Name

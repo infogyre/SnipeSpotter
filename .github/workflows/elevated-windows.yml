@@ -55,7 +55,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msvc
-          if ((rustc --version) -notmatch '^rustc 1\\.98\\.1 ') { throw "unexpected rustc version: $(rustc --version)" }
+          if ((rustc --version) -notmatch '^rustc 1\.98\.1 ') { throw "unexpected rustc version: $(rustc --version)" }
       - name: Validate workflow inputs
         id: validate_inputs
         shell: pwsh
@@ -117,7 +117,7 @@ jobs:
             throw 'source-artifact stage inventory differs from the closed expected set'
           }
           dotnet tool install --global wix --version 6.0.0
-          if ((wix --version) -notmatch '^6\\.0\\.0') { throw "unexpected WiX version: $(wix --version)" }
+          if ((wix --version) -notmatch '^6\.0\.0') { throw "unexpected WiX version: $(wix --version)" }
           Remove-Item -LiteralPath installer/bin, installer/obj -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force packaged | Out-Null
           $msi = Join-Path (Resolve-Path -LiteralPath packaged).Path "SnipeSpotter-$env:RUN_IDENTITY-x64.msi"
