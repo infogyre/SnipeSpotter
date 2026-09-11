@@ -141,6 +141,13 @@ impl PipeServerGuard {
     pub(crate) fn subscribe(&self) -> tokio_util::sync::CancellationToken {
         self.shutdown.clone()
     }
+
+    /// Alias kept for test readability: yields an independent token handle.
+    pub(crate) fn clone_token(&self) -> Self {
+        Self {
+            shutdown: self.shutdown.clone(),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -162,11 +169,13 @@ pub(crate) async fn run_named_pipe_bounded(
     fsm: FsmHandle,
     pipe_name: impl Into<String>,
     guard: PipeServerGuard,
+    session_token: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     use tokio::task::JoinSet;
 
     let pipe_name = pipe_name.into();
     let shutdown = guard.subscribe();
+    drop(guard); // ownership consumed; the token drives all waiting
     let mut sessions: JoinSet<Result<()>> = JoinSet::new();
     loop {
         if shutdown.is_cancelled() {
@@ -197,11 +206,13 @@ pub(crate) async fn run_named_pipe_bounded(
             _ = shutdown.cancelled() => break,
         }
         let fsm = fsm.clone();
-        let session_shutdown = shutdown.clone();
         sessions.spawn(async move {
+            // Abandonment is bounded: the session wind-down happens during the
+            // fixed drain window, then leftovers abort — the owner never sees
+            // a cancellation.
             tokio::select! {
                 outcome = serve_one(server, &fsm) => outcome,
-                _ = session_shutdown.cancelled() => Ok(()),
+                _ = session_token.cancelled() => Ok(()),
             }
         });
     }

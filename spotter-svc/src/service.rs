@@ -136,16 +136,6 @@ impl CommandOwner {
     }
 
     pub(crate) async fn handle(&mut self, command: ServiceCommand) -> IpcResponse {
-        // Publication points: mutation start, and each terminal activation.
-        let starts_work = matches!(
-            command,
-            ServiceCommand::TriggerSync
-                | ServiceCommand::CheckinAll
-                | ServiceCommand::CheckinSerial { .. }
-        );
-        if starts_work {
-            self.publish_snapshot();
-        }
         let response = match command {
             ServiceCommand::GetConfig => IpcResponse::Config {
                 settings: redact_settings(&self.controller.settings),
@@ -223,14 +213,17 @@ impl CommandOwner {
         }
         if let Err(error) = self.recover_before_new_work().await {
             self.controller.state = state_after_sync_error(&error);
+            self.publish_snapshot();
             return Err(error);
         }
         self.controller.state = crate::FsmState::Syncing;
+        self.publish_snapshot();
         let now = self.clock.now();
         let result = self.run_sync(now).await;
         match result {
             Ok(warnings) => {
                 self.controller.state = crate::FsmState::Idle;
+                self.publish_snapshot();
                 Ok(IpcResponse::Ok {
                     message: if warnings.is_empty() {
                         String::from("synchronization completed")
@@ -244,6 +237,7 @@ impl CommandOwner {
             }
             Err(error) if error.downcast_ref::<SavedCandidateError>().is_some() => {
                 self.controller.state = crate::FsmState::Error;
+                self.publish_snapshot();
                 Err(error)
             }
             Err(error) => {
@@ -255,7 +249,10 @@ impl CommandOwner {
                 });
                 match self.state_store.save(&mut candidate_state) {
                     Ok(()) => {
+                        // Durable activation of the failure record: publish
+                        // the committed failure state before returning.
                         self.persisted_state = candidate_state;
+                        self.publish_snapshot();
                         Err(error)
                     }
                     Err(save_error) => Err(error.context(format!(
@@ -369,6 +366,7 @@ impl CommandOwner {
         candidate_state.known_monitors = outcome.next_monitor_state.entries;
         self.state_store.save(&mut candidate_state)?;
         self.persisted_state = candidate_state.clone();
+        self.publish_snapshot();
         crate::sync_engine::commit_after_state_save_with(
             &self.journal_path,
             &outcome.confirmed_operations,
@@ -379,14 +377,20 @@ impl CommandOwner {
     }
 
     async fn recover_before_new_work(&mut self) -> Result<()> {
-        recover_owner_state_with_finalization(
+        let result = recover_owner_state_with_finalization(
             &self.journal_path,
             self.state_store.as_ref(),
             self.remote.as_mut(),
             &mut self.persisted_state,
             self.journal_finalization.as_ref(),
         )
-        .await
+        .await;
+        if result.is_ok() {
+            // Recovered candidate activation: publish before terminal journal
+            // finalization so readers see the recovered committed state.
+            self.publish_snapshot();
+        }
+        result
     }
 
     async fn run_sync(&mut self, now: chrono::DateTime<chrono::Utc>) -> Result<Vec<String>> {
@@ -453,6 +457,7 @@ impl CommandOwner {
         candidate_state.matched_asset = outcome.matched_asset;
         self.state_store.save(&mut candidate_state)?;
         self.persisted_state = candidate_state.clone();
+        self.publish_snapshot();
         crate::sync_engine::commit_after_state_save_with(
             &self.journal_path,
             &outcome.confirmed_operations,
@@ -791,7 +796,7 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     // Publish status snapshots and drive the automatic scheduler from the
     // configuration generation observed by the owner. All async wiring runs
     // inside the runtime; the publisher handle is shared with the owner.
-    let publisher = std::sync::Arc::new(crate::status_publisher::StatusPublisher::new(&fsm)?);
+    let publisher = std::sync::Arc::new(crate::status_publisher::StatusPublisher::new(&fsm));
     let owner_publisher = std::sync::Arc::clone(&publisher);
     {
         let mut owner_guard = owner.blocking_lock();
@@ -801,26 +806,31 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
         .inspect_err(|e| tracing::error!(%e, "failed to set Running"))?;
     tracing::info!("Running reported; entering main loop");
     tokio_runtime.block_on(async move {
-        // Initial snapshot: startup recovery completed; publish committed
-        // state before any command, then arm the scheduler from the loaded
-        // configuration. The legacy polling timer is retired: the scheduler
-        // owns the automatic deadline exclusively.
-        owner_publisher.publish_snapshot_owned(
+        // Initial snapshot: startup recovery completed; the startup activation
+        // advances the schedule generation to 1 and arms the scheduler with
+        // the loaded interval (first automatic sync one full interval out).
+        owner_publisher.publish_startup_activation(
             startup_configured,
             &startup_url,
+            std::time::Duration::from_secs(startup_interval_hours * 3600),
             &startup_state_for_publication,
         );
-        owner_publisher.publish_schedule_input(
-            startup_configured,
-            std::time::Duration::from_secs(startup_interval_hours * 3600),
-        );
         let pipe_endpoint = runtime.pipe_endpoint.clone();
-        let pipe = tokio::spawn(crate::ipc_server::run_named_pipe_at(fsm, pipe_endpoint));
+        let pipe_shutdown = PipeServerGuard::new();
+        let session_token = pipe_shutdown.subscribe();
+        let pipe = tokio::spawn(crate::ipc_server::run_named_pipe_bounded(
+            fsm,
+            pipe_endpoint,
+            pipe_shutdown,
+            session_token,
+        ));
         tokio::task::spawn_blocking(move || shutdown_receiver.recv())
             .await
             .context("shutdown listener task failed")?
             .context("service shutdown channel disconnected")?;
-        pipe.abort();
+        // Cooperative shutdown: signal the accept loop, then await its
+        // bounded drain; transport abandonment never cancels the owner.
+        pipe_shutdown.request_shutdown();
         match pipe.await {
             Err(error) if error.is_cancelled() => Ok::<(), anyhow::Error>(()),
             Err(error) => Err(error).context("IPC server task failed"),

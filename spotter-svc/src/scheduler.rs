@@ -28,7 +28,10 @@ pub(crate) struct ScheduleInput {
 // timestamp using the injected clock offset captured at scheduler start.
 // Used by project_next_sync and the test seam; cfg expectation matches those
 // call sites' availability.
-#[cfg_attr(all(not(windows), not(test)), expect(dead_code))]
+#[cfg_attr(
+    all(not(windows), not(feature = "test-support"), not(test)),
+    expect(dead_code)
+)]
 #[must_use]
 pub(crate) fn rfc3339_from_instant(deadline: Instant) -> String {
     let remaining = deadline.duration_since(Instant::now());
@@ -41,7 +44,10 @@ pub(crate) fn rfc3339_from_instant(deadline: Instant) -> String {
 /// Returns `None` when unconfigured, when the interval is zero, or when the
 /// generation observed by the schedule is stale relative to the configuration
 /// generation.
-#[cfg_attr(all(not(windows), not(test)), expect(dead_code))]
+#[cfg_attr(
+    all(not(windows), not(feature = "test-support"), not(test)),
+    expect(dead_code)
+)]
 #[must_use]
 pub(crate) fn project_next_sync(
     configured: bool,
@@ -61,7 +67,7 @@ pub(crate) fn project_next_sync(
 }
 
 /// Arming decision after a settings save or activation.
-#[cfg_attr(all(not(windows), not(test)), expect(dead_code))]
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ArmDecision {
     /// Unrelated or no-op save: keep the existing deadline.
@@ -74,7 +80,7 @@ pub(crate) enum ArmDecision {
 
 /// Pure arming rule: only actual interval changes or configured/unconfigured
 /// transitions reset the automatic deadline; unrelated saves never do.
-#[cfg_attr(all(not(windows), not(test)), expect(dead_code))]
+#[cfg(test)]
 #[must_use]
 pub(crate) fn arm_on_settings_change(
     previously_configured: bool,
@@ -100,7 +106,14 @@ pub(crate) fn arm_on_settings_change(
 ///
 /// Terminates cleanly when the FSM handle's channels close or configuration
 /// clears; the owner channel closing produces a bounded diagnostic.
-#[cfg_attr(all(not(windows), not(test)), expect(dead_code))]
+#[cfg_attr(
+    all(not(windows), not(feature = "test-support"), not(test)),
+    expect(dead_code)
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "arm/wait/enqueue state machine reads clearer unsplit"
+)]
 pub(crate) async fn run_scheduler(
     handle: FsmHandle,
     mut schedule_input: tokio::sync::watch::Receiver<ScheduleInput>,
@@ -153,7 +166,7 @@ pub(crate) async fn run_scheduler(
             }
         }
         // Due: clear next_sync before submission and keep it absent through
-        // queueing and execution.
+        // queueing and execution, then await the committed result.
         publish_schedule(&handle, generation, None);
         let Ok(enqueue) = handle.enqueue_sync().await else {
             tracing::info!("automatic sync scheduler stopping: owner channel closed");
@@ -196,19 +209,43 @@ pub(crate) async fn run_scheduler(
             continue;
         };
         publish_schedule(&handle, latest_generation, Some(next_projected));
+        // Deadline expiry leads directly into the next enqueue; an input
+        // change re-evaluates at the loop top, and a closed watch terminates.
         match tokio::time::timeout_at(next_deadline, schedule_input.changed()).await {
             Err(_) => {}
             Ok(changed) => {
                 if changed.is_err() {
                     return;
                 }
+                continue;
             }
         }
+        // Due: clear next_sync before submission and keep it absent through
+        // queueing and execution.
+        publish_schedule(&handle, latest_generation, None);
+        let Ok(enqueue) = handle.enqueue_sync().await else {
+            tracing::info!("automatic sync scheduler stopping: owner channel closed");
+            publish_schedule(&handle, latest_generation, None);
+            return;
+        };
+        let response = enqueue.response.await;
+        if handle
+            .wait_for_sync_generation(enqueue.target_generation, completed.clone())
+            .await
+            .is_err()
+        {
+            tracing::info!("automatic sync scheduler stopping: completion channel closed");
+            return;
+        }
+        let _ = response;
     }
 }
 
 /// Publishes the scheduler's projection through the FSM handle.
-#[cfg_attr(all(not(windows), not(test)), expect(dead_code))]
+#[cfg_attr(
+    all(not(windows), not(feature = "test-support"), not(test)),
+    expect(dead_code)
+)]
 fn publish_schedule(handle: &FsmHandle, generation: u64, next_sync: Option<String>) {
     handle.publish_schedule_snapshot(ScheduleSnapshot {
         config_generation: generation,

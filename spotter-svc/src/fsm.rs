@@ -131,12 +131,15 @@ impl FsmHandle {
     async fn enqueue_with_generation(&self, command: ServiceCommand) -> Result<SyncEnqueue> {
         let is_sync = command == ServiceCommand::TriggerSync;
         let target_generation = if is_sync {
-            let next = self.next_sync_generation.load(Ordering::Acquire);
+            // Claim pending FIRST, then allocate the generation; a coalesced
+            // caller reads the generation AFTER observing the pending claim
+            // so its target always matches the accepted sync's generation.
             if self
                 .sync_pending
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
+                let next = self.next_sync_generation.load(Ordering::Acquire);
                 let (response, receiver) = oneshot::channel();
                 let _ = response.send(IpcResponse::Ok {
                     message: String::from("sync already queued"),

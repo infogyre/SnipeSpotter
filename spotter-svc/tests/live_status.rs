@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Result;
 use spotter_svc::fsm::{FsmHandle, spawn};
 
-/// Spawn an FSM whose TriggerSync handler signals `started`, then blocks until
+/// Spawn an FSM whose `TriggerSync` handler signals `started`, then blocks until
 /// `release` is sent. Other commands complete immediately with `committed`.
 fn gated_sync_fixture() -> Result<(
     FsmHandle,
@@ -54,7 +54,7 @@ async fn live_status_during_gated_sync() -> Result<()> {
     let (handle, started, release) = gated_sync_fixture()?;
     // Attach a status publisher so status commands take the snapshot path
     // instead of queueing behind the gated sync.
-    let _publisher = spotter_svc::status_publisher_for_tests(&handle)?;
+    let _publisher = spotter_svc::status_publisher_for_tests(&handle);
     let handle_for_sync = handle.clone();
     let sync_handle = tokio::spawn(async move {
         handle_for_sync
@@ -100,7 +100,7 @@ async fn live_status_during_gated_sync() -> Result<()> {
 #[tokio::test]
 async fn live_status_reads_have_no_side_effects() -> Result<()> {
     let (handle, _started, release) = gated_sync_fixture()?;
-    let _publisher = spotter_svc::status_publisher_for_tests(&handle)?;
+    let _publisher = spotter_svc::status_publisher_for_tests(&handle);
     for _ in 0..3 {
         let response = tokio::time::timeout(
             Duration::from_secs(1),

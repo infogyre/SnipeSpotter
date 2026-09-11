@@ -24,17 +24,16 @@ pub mod status_publisher;
 /// commands read the snapshot path; also publishes one Idle snapshot so
 /// responses carry committed data.
 #[cfg(feature = "test-support")]
-pub fn status_publisher_for_tests(
-    handle: &fsm::FsmHandle,
-) -> anyhow::Result<crate::status_publisher::StatusPublisher> {
-    let publisher = crate::status_publisher::StatusPublisher::new(handle)?;
+#[must_use]
+pub fn status_publisher_for_tests(handle: &fsm::FsmHandle) -> status_publisher::StatusPublisher {
+    let publisher = status_publisher::StatusPublisher::new(handle);
     publisher.publish(
         "Idle",
         "",
         false,
         &spotter_core::state::ServiceState::default(),
     );
-    Ok(publisher)
+    publisher
 }
 #[cfg(test)]
 pub(crate) mod tls_test_fixture;

@@ -14,10 +14,14 @@ use tokio::sync::watch;
 
 use crate::fsm::FsmHandle;
 use crate::scheduler::{ScheduleInput, run_scheduler};
-use crate::status::{PublicStatusSnapshot, ScheduleSnapshot};
+use crate::status::PublicStatusSnapshot;
 
 /// Shared publication side owned by the service owner loop.
-#[cfg_attr(not(windows), expect(dead_code))]
+///
+/// The publisher is the single writer of the status snapshot and the
+/// scheduler-input watches. Status snapshots are published by the owner at
+/// real activations; the scheduler publishes schedule projections through
+/// the FSM handle.
 #[derive(Clone)]
 pub struct StatusPublisher {
     status_sender: watch::Sender<PublicStatusSnapshot>,
@@ -27,11 +31,10 @@ pub struct StatusPublisher {
 }
 
 impl StatusPublisher {
-    /// Construct the publisher with a fresh configuration generation.
-    ///
-    /// # Errors
-    /// Returns an error when the FSM handle lacks snapshot receivers.
-    pub(crate) fn new(handle: &FsmHandle) -> anyhow::Result<Self> {
+    /// Construct the publisher, attach its watches to the handle, and spawn
+    /// the automatic-sync scheduler task. Arming happens when the owner
+    /// publishes the startup activation.
+    pub(crate) fn new(handle: &FsmHandle) -> Self {
         let initial = PublicStatusSnapshot {
             state: String::from("Unconfigured"),
             last_sync: None,
@@ -55,26 +58,28 @@ impl StatusPublisher {
             current_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         publisher.attach_watches(handle);
-        // The scheduler owns the automatic deadline exclusively from startup;
-        // arming happens when the owner publishes the initial activation.
-        crate::status_publisher::spawn_scheduler(handle.clone(), publisher.schedule_receiver());
-        Ok(publisher)
+        // The scheduler owns the automatic deadline exclusively from startup.
+        spawn_scheduler(handle.clone(), publisher.schedule_receiver());
+        publisher
     }
 
     /// Watch side carrying the scheduler input for the spawned scheduler task.
+    #[cfg(any(windows, feature = "test-support"))]
     pub(crate) fn schedule_receiver(&self) -> watch::Receiver<ScheduleInput> {
         self.schedule_receiver.clone()
     }
 
     /// Registers the publisher's watch senders on the FSM handle so status
     /// reads take the snapshot path and the scheduler publishes projections.
-    #[cfg_attr(not(any(windows, feature = "test-support")), expect(dead_code))]
     fn attach_watches(&self, handle: &FsmHandle) {
         handle.attach_status_publication(self.status_sender.clone());
         handle.attach_schedule_input(self.schedule_sender.clone());
     }
 
     /// Publish committed state as the latest snapshot at a real activation.
+    ///
+    /// No-op saves do not advance the generation: the schedule projection
+    /// keeps its existing generation so an armed deadline is not stale.
     pub(crate) fn publish(
         &self,
         state: &str,
@@ -95,27 +100,39 @@ impl StatusPublisher {
             ));
     }
 
-    /// Publish the schedule projection owned by the scheduler.
-    pub(crate) fn publish_schedule(&self, schedule: ScheduleSnapshot) {
-        // The scheduler publishes via the FSM handle; this mirrors into the
-        // input watch so a reader joined later sees the latest schedule.
-        let _ = schedule;
-    }
-
     /// Publishes the startup committed-state snapshot from settings loaded at
-    /// boot, before any command runs.
-    pub(crate) fn publish_snapshot_owned(
+    /// boot, before any command runs, and arms the scheduler input.
+    #[cfg_attr(not(windows), expect(dead_code))]
+    pub(crate) fn publish_startup_activation(
         &self,
         configured: bool,
         snipeit_url: &str,
+        interval: Duration,
         persisted: &spotter_core::state::ServiceState,
     ) {
+        // The startup activation is the first generation advance; a schedule
+        // projection armed by the scheduler then matches this generation.
+        self.activate_configuration(configured, interval);
         let state = if configured { "Idle" } else { "Unconfigured" };
+        self.publish(state, snipeit_url, configured, persisted);
+    }
+
+    /// Publish the committed-state snapshot for an in-place state change
+    /// (mutation start/finish) without touching the schedule generation.
+    #[cfg_attr(not(windows), expect(dead_code))]
+    pub(crate) fn publish_state_change(
+        &self,
+        state: &str,
+        snipeit_url: &str,
+        configured: bool,
+        persisted: &spotter_core::state::ServiceState,
+    ) {
         self.publish(state, snipeit_url, configured, persisted);
     }
 
     /// Advance the configuration generation and republish the scheduler input
     /// after settings persist and activate.
+    #[cfg_attr(not(windows), expect(dead_code))]
     pub(crate) fn activate_configuration(&self, configured: bool, interval: Duration) -> u64 {
         let generation = self
             .current_generation
