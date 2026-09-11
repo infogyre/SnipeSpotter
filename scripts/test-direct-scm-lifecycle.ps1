@@ -973,7 +973,8 @@ try {
     Wait-Condition -Description 'Snipe-IT loopback fixture readiness' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
         $fixture.State.Ready -and $fixture.Listener.IsListening
     } | Out-Null
-    Assert-True $fixture.Prefix.StartsWith('http://127.0.0.1:') 'loopback fixture did not bind only to 127.0.0.1'
+    Assert-True $fixture.Prefix.StartsWith('https://localhost:') 'loopback TLS fixture did not advertise an https://localhost endpoint'
+    Assert-True ($null -ne $fixture.Listener) 'loopback TLS fixture listener missing'
 
     foreach ($update in @(
         @('snipeit.url', $fixture.Prefix.TrimEnd('/')),
@@ -1018,6 +1019,7 @@ try {
     Assert-True (@($evidence.Requests | Where-Object { $_.accepted -and -not $_.authorized }).Count -eq 0) 'unauthorized request was accepted'
     Assert-True (@($evidence.Requests | Where-Object { $_.method_class -eq 'mutation' }).Count -eq 0) 'fixture observed a mutation request'
     Assert-True (@($evidence.Requests | Where-Object { $_.route -eq 'unexpected' }).Count -eq 0) 'fixture observed an unexpected route'
+    Assert-True $fixture.Prefix.StartsWith('https://localhost:') 'fixture endpoint must remain https://localhost after evidence collection'
     Assert-True (@($evidence.Requests | Where-Object { $_.route -eq 'hardware_byserial' -and $_.response_class -eq 'not_found' }).Count -gt 0) 'fixture did not serve a hardware not-found read'
     Assert-True (@($evidence.Requests | Where-Object { $_.route -in @('manufacturers', 'models') -and $_.response_class -eq 'rows_empty' }).Count -ge 2) 'fixture did not serve empty taxonomy reads'
 
@@ -1092,6 +1094,15 @@ try {
             {
                 if ($null -ne $fixture) {
                     Stop-SnipeItLoopbackFixture -Fixture $fixture -TimeoutSeconds $WaitTimeoutSeconds
+                }
+            },
+            {
+                # TLS residue guard: run-scoped key/cert material must be gone
+                # even when the outer lifecycle fails after fixture startup.
+                $leftovers = @(Get-ChildItem ([IO.Path]::GetTempPath()) -Filter 'snipespotter-fixture-*' -ErrorAction SilentlyContinue)
+                if ($leftovers.Count -gt 0) {
+                    foreach ($leftover in $leftovers) { Remove-Item -LiteralPath $leftover.FullName -Force }
+                    throw 'loopback TLS fixture left certificate material behind'
                 }
             },
             {
