@@ -41,8 +41,6 @@ tracing = "=0.1.44"
 tracing-appender = "=0.2.5"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 tokio-util = { version = "=0.7.18", default-features = false, features = ["rt"] }
-rsa = { version = "=0.9.10", features = ["std"] }
-rand_core = { version = "=0.6.4", features = ["getrandom"] }
 rustls-pki-types = "=1.15.1"
 wiremock = "=0.6.5"
 wmi = "=0.18.4"

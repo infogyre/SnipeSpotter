@@ -17,8 +17,9 @@ use std::time::Duration;
 #[cfg_attr(not(windows), expect(unused_imports))]
 use anyhow::Context as _;
 use native_tls::Identity;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, PKCS_RSA_SHA256};
-use rustls_pki_types::PrivatePkcs8KeyDer;
+use rcgen::{
+    BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, PKCS_RSA_SHA256, RsaKeySize,
+};
 use secrecy::SecretString;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -39,24 +40,12 @@ impl TlsLoopbackServer {
     /// # Errors
     /// Returns an error when certificate generation, listener binding, or
     /// acceptor construction fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "certificate generation + listener setup reads clearer unsplit"
-    )]
     pub(crate) async fn start() -> anyhow::Result<Self> {
         // native-tls on Windows imports private keys through the legacy
         // CryptoAPI (PROV_RSA_FULL / PKCS_RSA_PRIVATE_KEY), which supports
         // RSA only; ECDSA keys fail schannel import. Generate RSA-2048 keys
         // via the rsa crate (dev-only) and hand them to rcgen as PKCS8 DER.
-        let ca_key = {
-            let mut rng = rand_core::OsRng;
-            let private = rsa::RsaPrivateKey::new(&mut rng, 2048)?;
-            let pkcs8_der = rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(&private)?;
-            KeyPair::from_pkcs8_der_and_sign_algo(
-                &PrivatePkcs8KeyDer::from(pkcs8_der.as_bytes()),
-                &PKCS_RSA_SHA256,
-            )?
-        };
+        let ca_key = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?;
         let mut ca_params = CertificateParams::default();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -66,15 +55,7 @@ impl TlsLoopbackServer {
         let ca_cert = ca_params.self_signed(&ca_key)?;
         let ca_issuer = Issuer::new(ca_params, ca_key);
 
-        let leaf_key = {
-            let mut rng = rand_core::OsRng;
-            let private = rsa::RsaPrivateKey::new(&mut rng, 2048)?;
-            let pkcs8_der = rsa::pkcs8::EncodePrivateKey::to_pkcs8_der(&private)?;
-            KeyPair::from_pkcs8_der_and_sign_algo(
-                &PrivatePkcs8KeyDer::from(pkcs8_der.as_bytes()),
-                &PKCS_RSA_SHA256,
-            )?
-        };
+        let leaf_key = KeyPair::generate_rsa_for(&PKCS_RSA_SHA256, RsaKeySize::_2048)?;
         let mut leaf_params = CertificateParams::new(vec![String::from("localhost")])?;
         leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         leaf_params.key_usages = vec![

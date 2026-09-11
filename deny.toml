@@ -33,18 +33,18 @@ reason = "hyper-util requires base64 0.22.1 while workspace crates use 0.23.1"
 
 [[bans.skip]]
 name = "getrandom"
-version = "=0.3.3"
-reason = "rand_core 0.9.5 retains getrandom 0.3.3 alongside workspace 0.4.3 (ring uses 0.2.17 on Windows targets)"
+version = "=0.3.4"
+reason = "aws-lc-rs (dev-only rcgen RSA keygen feature) retains getrandom 0.3.4 alongside workspace 0.4.3"
 
 [[bans.skip]]
 name = "getrandom"
 version = "=0.2.17"
-reason = "ring 0.17.14 uses getrandom 0.2.17 on Windows targets alongside 0.3.3/0.4.3"
+reason = "ring 0.17.14 uses getrandom 0.2.17 on Windows targets alongside 0.3.4/0.4.3"
 
 [[bans.skip]]
 name = "r-efi"
 version = "=5.3.0"
-reason = "getrandom 0.3.3 uses r-efi 5.3.0 on UEFI targets while getrandom 0.4.3 uses 6.0.0"
+reason = "getrandom 0.2.17 uses r-efi 5.3.0 on UEFI targets while getrandom 0.4.3 uses 6.0.0"
 
 [[bans.skip]]
 name = "syn"
