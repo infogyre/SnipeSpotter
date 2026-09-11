@@ -60,7 +60,7 @@ function New-FixtureCertificateMaterial {
     $pfxPasswordText = [Guid]::NewGuid().ToString('N')
     $pfxPasswordPath = "$leafKeyPath.pfxpass"
     Set-Content -LiteralPath $pfxPasswordPath -Value $pfxPasswordText -NoNewline -Encoding ASCII
-    $pfxOutput = & openssl pkcs12 -export -out $leafPfxPath -inkey $leafKeyPath -in $leafCertPath -passout "file:$pfxPasswordPath" 2>&1
+    $pfxOutput = & openssl pkcs12 -export -out $leafPfxPath -inkey $leafKeyPath -in $leafCertPath -certfile $caCertPath -passout "file:$pfxPasswordPath" 2>&1
     Remove-Item -LiteralPath $pfxPasswordPath -Force
     if ($LASTEXITCODE -ne 0) {
         throw ("fixture PFX conversion failed: " + ($pfxOutput -join ' '))
@@ -147,6 +147,7 @@ function Start-SnipeItLoopbackFixture {
             WorkerError = $null
             BindAttempts = 0
             Certificate = $certificate
+            ChainExtra = [Security.Cryptography.X509Certificates.X509Certificate2Collection]::new()
         })
 
         $worker = [PowerShell]::Create()
@@ -224,7 +225,7 @@ function Start-SnipeItLoopbackFixture {
                         $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $port)
                         $listener.Start()
                         $state.Listener = $listener
-                        $state.Prefix = 'https://localhost:' + $port
+                        $state.Prefix = 'https://localhost:' + $port + '/'
                         $state.BindAttempts = $attempt
                         break
                     } catch {
@@ -251,6 +252,9 @@ function Start-SnipeItLoopbackFixture {
                         $requestStage = 'tls_handshake'
                         $ssl = [Net.Security.SslStream]::new($stream, $false)
                         try {
+                            # AuthenticateAsServer(certificate) presents the
+                            # leaf; clients trusting the imported fixture CA
+                            # build the chain through the LocalMachine Root.
                             $ssl.AuthenticateAsServer($state.Certificate)
                             $requestStage = 'request_metadata'
                             $head = Read-HttpRequestHead -Stream $ssl
