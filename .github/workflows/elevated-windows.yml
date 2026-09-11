@@ -139,7 +139,12 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/TestSupport/WorkflowPaths.psm1') -Force
+          # Producer-consumer contract: exactly one MSI under packaged must
+          # exist here and must be the validated file.
+          $packagedMsis = @(Get-ChildItem -LiteralPath packaged -Filter '*.msi' -File)
+          if ($packagedMsis.Count -ne 1) { throw 'packaged must contain exactly one MSI for validation' }
           $msiPath = Resolve-ValidatedMsiPath -Root (Join-Path (Get-Location) 'packaged') -RequestedName $env:MSI_NAME
+          if ($packagedMsis[0].FullName -ne $msiPath) { throw 'packaged MSI does not match the validated name' }
           ./scripts/test-msi-lifecycle.ps1 -MsiPath $msiPath
       - name: Stage direct SCM service executable
         shell: pwsh

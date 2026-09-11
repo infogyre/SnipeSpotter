@@ -86,7 +86,7 @@ def test_lifecycle_imports_wait_helpers_after_scm_module() -> None:
 def test_service_enters_runtime_before_fsm_spawn() -> None:
     runtime_creation = SERVICE.index("let tokio_runtime = tokio::runtime::Builder")
     runtime_enter = SERVICE.index("let _runtime_guard = tokio_runtime.enter()")
-    fsm_spawn = SERVICE.index("let fsm = crate::fsm::spawn")
+    fsm_spawn = SERVICE.index("let fsm = {")
     assert runtime_creation < runtime_enter < fsm_spawn
 
 
@@ -522,7 +522,7 @@ def test_elevated_source_artifact_producer_matches_packaged_consumer() -> None:
     assert "Join-Path (Resolve-Path -LiteralPath packaged).Path" in build
     assert "source-artifact package inventory must contain exactly the MSI consumed by validation" in build
     assert "Get-ChildItem -LiteralPath packaged -Filter '*.msi' -File" in validate
-    assert "Join-Path (Get-Location) (Join-Path 'packaged' $resolvedName)" in validate
+    assert "Resolve-ValidatedMsiPath -Root (Join-Path (Get-Location) 'packaged')" in validate
 
 
 def test_ci_uses_reusable_elevated_result_or_successful_skip() -> None:
@@ -542,7 +542,8 @@ def test_elevated_source_artifact_contains_complete_msi_stage() -> None:
     workflow = (ROOT.parent / ".github" / "workflows" / "elevated-windows.yml").read_text(encoding="utf-8")
     build = workflow[workflow.index("- name: Build source MSI") : workflow.index("- name: Validate MSI lifecycle")]
     assert "Remove-Item -LiteralPath installer/bin" in build
-    assert "cargo install cargo-cyclonedx --locked" in build
+    assert "cargo install cargo-cyclonedx --version 0.5.9 --locked" in build
+    assert "cargo-cyclonedx 0.5.9" in build
     assert "cargo cyclonedx --manifest-path spotter-svc/Cargo.toml --format json" in build
     assert "cargo cyclonedx --manifest-path spotter-cli/Cargo.toml --format json" in build
     assert "Join-Path $stage 'sbom/spotter-svc.cdx.json'" in build

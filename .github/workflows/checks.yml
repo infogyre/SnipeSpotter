@@ -39,7 +39,7 @@ jobs:
         run: |
           set -euo pipefail
           rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
-          rustc --version | grep -Eq '^rustc 1\\.98\\.1 '
+          rustc --version | grep -Eq '^rustc 1\.98\.1 '
       - name: Workspace formatting
         run: cargo fmt --all --check
       - name: Product identity consistency
@@ -73,7 +73,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           rustup toolchain install 1.98.1 --profile minimal --component clippy
-          if ((rustc --version) -notmatch '^rustc 1\\.98\\.1 ') { throw "unexpected rustc version: $(rustc --version)" }
+          if ((rustc --version) -notmatch '^rustc 1\.98\.1 ') { throw "unexpected rustc version: $(rustc --version)" }
       - name: Workspace tests
         run: cargo test --workspace --all-targets
       - name: Production owner integration tests
