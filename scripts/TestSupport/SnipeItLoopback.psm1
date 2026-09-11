@@ -287,7 +287,19 @@ function Start-SnipeItLoopbackFixture {
                                 $route = 'unexpected'
                             }
                             $requestStage = 'request_auth'
-                            $authorized = $head.Contains('Authorization: Bearer ') -and $head.Contains($state.ExpectedAuthorization)
+                            # Header names and the auth scheme are case-insensitive per RFC 9110;
+                            # hyper serializes header names in lowercase.
+                            $authorized = $false
+                            foreach ($line in ($head -split "`r`n")) {
+                                $colon = $line.IndexOf(':')
+                                if ($colon -lt 1) { continue }
+                                $name = $line.Substring(0, $colon).Trim()
+                                if (-not $name.Equals('Authorization', [StringComparison]::OrdinalIgnoreCase)) { continue }
+                                $value = $line.Substring($colon + 1).Trim()
+                                if ($value.Equals($state.ExpectedAuthorization, [StringComparison]::OrdinalIgnoreCase)) {
+                                    $authorized = $true
+                                }
+                            }
                             $isMutation = $method -ne 'GET'
                             $accepted = $authorized -and $route -ne 'unexpected' -and $queryValid -and -not $isMutation
                             $statusCode = if (-not $authorized) {

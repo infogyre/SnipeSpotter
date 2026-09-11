@@ -862,7 +862,11 @@ function Write-DirectCliResultShapeDiagnostic {
         stdout_tail = if ($null -eq $Result) { '' } else { @($Result)[0].Stdout?.Substring([Math]::Max(0, (@($Result)[0].Stdout ?? '').Length - 512)) }
         stderr_tail = if ($null -eq $Result) { '' } else { @($Result)[0].Stderr?.Substring([Math]::Max(0, (@($Result)[0].Stderr ?? '').Length - 512)) }
     }
-    Write-BoundedDiagnostic -Path (Join-Path $LogDirectory "direct-cli-text-$($Stage.ToLowerInvariant()).json") -Values $textual
+    try {
+        Write-BoundedDiagnostic -Path (Join-Path $LogDirectory "direct-cli-text-$($Stage.ToLowerInvariant()).json") -Values $textual
+    } catch {
+        Write-Warning 'direct CLI output text diagnostic capture failed'
+    }
     $values = [ordered]@{
         stage = $Stage
         result_count = $resultCount
