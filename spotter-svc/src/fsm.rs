@@ -42,13 +42,17 @@ pub struct FsmHandle {
 }
 
 /// Clears the pending-generation slot when dropped, unless disarmed after a
-/// durable submit outcome.
+/// durable submit outcome (the FSM loop owns the claim from then on).
 struct ClaimGuard {
     slot: Arc<std::sync::Mutex<Option<u64>>>,
+    disarmed: bool,
 }
 
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
         if let Ok(mut guard) = self.slot.lock() {
             *guard = None;
         }
@@ -179,6 +183,7 @@ impl FsmHandle {
             // submitted.
             claim_guard = Some(ClaimGuard {
                 slot: std::sync::Arc::clone(&self.pending_generation),
+                disarmed: false,
             });
             allocated
         } else {
@@ -193,18 +198,18 @@ impl FsmHandle {
                 sync_generation: is_sync.then_some(target_generation),
             })
             .await;
-        if send_outcome.is_ok() {
-            // Durable submit: the FSM loop owns the claim lifecycle now.
-            std::mem::forget(claim_guard.take());
+        if let Some(guard) = claim_guard.as_mut() {
+            // Durable submit (accepted or failed): the FSM loop owns the
+            // claim lifecycle now; a later Drop must not clear the slot.
+            guard.disarmed = true;
         }
         if send_outcome.is_err() {
+            // Submit failed: clear the claim so later syncs start fresh.
+            if let Some(guard) = claim_guard.take() {
+                drop(guard);
+            }
             if is_sync {
                 self.sync_pending.store(false, Ordering::Release);
-                // The claim died with the failed send: clear the stored
-                // generation so a later accepted sync publishes fresh.
-                if let Ok(mut guard) = self.pending_generation.lock() {
-                    *guard = None;
-                }
             }
             return Err(anyhow::anyhow!("service command loop is unavailable"));
         }
