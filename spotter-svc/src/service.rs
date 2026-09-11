@@ -2,7 +2,7 @@
 
 //! Windows Service Control Manager lifecycle and runtime orchestration.
 
-use std::{ffi::OsString, fs, path::Path, sync::mpsc, time::Duration};
+use std::{ffi::OsString, fs, path::Path, sync::mpsc, sync::Arc, time::Duration};
 
 use crate::owner_ports::{
     Clock, HardwareDiscovery, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
