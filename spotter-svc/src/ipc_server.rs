@@ -114,23 +114,105 @@ pub async fn run_named_pipe(fsm: FsmHandle) -> Result<()> {
     run_named_pipe_at(fsm, spotter_core::PIPE_NAME).await
 }
 
+/// Fixed bound on concurrently active pipe sessions; excess connections are
+/// accepted and promptly closed so saturation cannot queue unbounded tasks.
 #[cfg(windows)]
-/// Run the secured named-pipe accept loop on an explicit endpoint.
+pub(crate) const MAX_ACTIVE_PIPE_SESSIONS: usize = 16;
+
+/// Cooperative shutdown signal for the native accept loop.
+#[cfg(windows)]
+#[derive(Default)]
+pub(crate) struct PipeServerGuard {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(windows)]
+impl PipeServerGuard {
+    pub(crate) fn new() -> Self {
+        Self {
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
+    pub(crate) fn subscribe(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown.clone()
+    }
+}
+
+#[cfg(windows)]
+/// Run the secured named-pipe accept loop on an explicit endpoint with
+/// bounded concurrent sessions and cooperative shutdown.
 ///
 /// The endpoint is intended for isolated integration tests. Production callers should use
 /// [`run_named_pipe`], which preserves the fixed product pipe identity.
 ///
 /// # Errors
-/// Returns an error when pipe creation or a client session fails.
+/// Returns an error when pipe creation fails or the shutdown drain exceeds
+/// its deadline.
 pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> Result<()> {
+    run_named_pipe_bounded(fsm, pipe_name, PipeServerGuard::new()).await
+}
+
+#[cfg(windows)]
+pub(crate) async fn run_named_pipe_bounded(
+    fsm: FsmHandle,
+    pipe_name: impl Into<String>,
+    guard: PipeServerGuard,
+) -> Result<()> {
+    use tokio::task::JoinSet;
+
     let pipe_name = pipe_name.into();
+    let shutdown = guard.subscribe();
+    let mut sessions: JoinSet<Result<()>> = JoinSet::new();
     loop {
-        let server = create_secured_server(&pipe_name)?;
-        server.connect().await?;
-        if let Err(error) = serve_one(server, &fsm).await {
-            tracing::warn!(%error, "IPC client session failed");
+        if shutdown.is_cancelled() {
+            break;
         }
+        // Create the next listening instance promptly; never hold a session
+        // slot while awaiting an unaccepted connection.
+        if sessions.len() >= MAX_ACTIVE_PIPE_SESSIONS {
+            // Capacity full: reap completed sessions, then accept and promptly
+            // close any excess connection rather than queueing it.
+            while sessions.try_join_next().is_some() {}
+            let server = create_secured_server(&pipe_name)?;
+            server.connect().await?;
+            drop(server);
+            continue;
+        }
+        let server = create_secured_server(&pipe_name)?;
+        tokio::select! {
+            connected = server.connect() => {
+                connected.context("named-pipe client connect failed")?;
+            }
+            _ = shutdown.cancelled() => break,
+        }
+        let fsm = fsm.clone();
+        let session_shutdown = shutdown.clone();
+        sessions.spawn(async move {
+            tokio::select! {
+                outcome = serve_one(server, &fsm) => outcome,
+                _ = session_shutdown.cancelled() => Ok(()),
+            }
+        });
     }
+    // Cooperative shutdown: stop accepting, drain active sessions under a
+    // bounded deadline, then abort leftovers and observe joins with a fixed
+    // diagnostic. This ends response observation, never an FSM cancellation.
+    const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
+    let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        sessions.abort_all();
+        while sessions.join_next().await.is_some() {}
+        tracing::warn!("pipe shutdown drain deadline elapsed; remaining sessions aborted");
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
