@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg_attr(not(windows), expect(unused_imports))]
 use anyhow::Context as _;
 use native_tls::Identity;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
