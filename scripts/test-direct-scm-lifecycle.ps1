@@ -855,6 +855,14 @@ function Write-DirectCliResultShapeDiagnostic {
     $resultIsArray = [bool]($Result -is [array])
     $records = if ($null -eq $Result) { $null } else { @($Result) }
     $resultCount = if ($null -eq $Result) { 0 } else { $records.Count }
+    # Bounded CLI output text per stage: the shape booleans alone do not
+    # explain failures like a rejected sync.
+    $textual = [ordered]@{
+        stage = $Stage
+        stdout_tail = if ($null -eq $Result) { '' } else { @($Result)[0].Stdout?.Substring([Math]::Max(0, (@($Result)[0].Stdout ?? '').Length - 512)) }
+        stderr_tail = if ($null -eq $Result) { '' } else { @($Result)[0].Stderr?.Substring([Math]::Max(0, (@($Result)[0].Stderr ?? '').Length - 512)) }
+    }
+    Write-BoundedDiagnostic -Path (Join-Path $LogDirectory "direct-cli-text-$($Stage.ToLowerInvariant()).json") -Values $textual
     $values = [ordered]@{
         stage = $Stage
         result_count = $resultCount
