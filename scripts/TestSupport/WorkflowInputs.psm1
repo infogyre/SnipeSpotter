@@ -46,12 +46,13 @@ function Assert-RunIdentity {
 }
 
 function Assert-ArtifactName {
-    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][string]$Label = 'artifact_name')
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $false)][string]$Label = 'artifact_name')
     return Assert-AsciiSafeName -Name $Name -Label $Label -MaximumLength 128 -AllowEmpty:$false -AllowUnderscore:$true -RequireMsiSuffix:$false
 }
 
 function Assert-MsiName {
     param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name)
+    # Empty is the explicit sentinel for existing MSI discovery; supplied names must pass every filename rule below.
     if ([string]::IsNullOrEmpty($Name)) { return $Name }
     if ([IO.Path]::IsPathRooted($Name) -or $Name.Contains('/') -or $Name.Contains('\') -or $Name.Contains(':')) {
         throw 'msi_name must be a filename, not a path'
@@ -65,7 +66,8 @@ function Assert-DiscoveredMsiFile {
     return Assert-MsiName -Name $Name
 }
 
-function Get-ValidatedWorkflowInputs {
+# Justification: exported workflow contract name is fixed (singular/plural lint).
+function Get-WorkflowInputContract {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory = $true)][string]$ArtifactName,
@@ -86,4 +88,4 @@ function Get-ValidatedWorkflowInputs {
     }
 }
 
-Export-ModuleMember -Function Assert-RunIdentity, Assert-ArtifactName, Assert-MsiName, Assert-DiscoveredMsiFile, Get-ValidatedWorkflowInputs
+Export-ModuleMember -Function Assert-RunIdentity, Assert-ArtifactName, Assert-MsiName, Assert-DiscoveredMsiFile, Get-WorkflowInputContract

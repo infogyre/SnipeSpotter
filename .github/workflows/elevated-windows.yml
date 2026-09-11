@@ -68,7 +68,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/TestSupport/WorkflowInputs.psm1') -Force
-          $validated = Get-ValidatedWorkflowInputs -ArtifactName $env:ARTIFACT_NAME -LogArtifactName $env:LOG_ARTIFACT_NAME -RunIdentity $env:RUN_IDENTITY -MsiName $env:MSI_NAME
+          $validated = Get-WorkflowInputContract -ArtifactName $env:ARTIFACT_NAME -LogArtifactName $env:LOG_ARTIFACT_NAME -RunIdentity $env:RUN_IDENTITY -MsiName $env:MSI_NAME
           @(
             "artifact_name=$($validated.artifact_name)"
             "log_artifact_name=$($validated.log_artifact_name)"

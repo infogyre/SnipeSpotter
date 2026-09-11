@@ -94,12 +94,10 @@ def test_elevated_validation_is_before_side_effects_and_outputs_exact_four_value
     assert validate < build
     block = text[validate:download]
     assert "Import-Module" in block
-    assert "Get-ValidatedWorkflowInputs" in block
+    assert "Get-WorkflowInputContract" in block
     assert "GITHUB_OUTPUT" in block
-    assert block.count("artifact_name=") == 1
-    assert block.count("log_artifact_name=") == 1
-    assert block.count("run_identity=") == 1
-    assert block.count("msi_name=") == 1
+    output_keys = re.findall(r"(?m)^\s*\"([^\"=]+)=", block)
+    assert output_keys == ["artifact_name", "log_artifact_name", "run_identity", "msi_name"]
     consumers = text[download:]
     assert "name: ${{ inputs.artifact_name }}" not in consumers
     assert "name: ${{ inputs.log_artifact_name }}" not in consumers
@@ -120,7 +118,7 @@ def test_workflow_inputs_module_and_executable_probe_exist() -> None:
         "Assert-RunIdentity",
         "Assert-MsiName",
         "Assert-ArtifactName",
-        "Get-ValidatedWorkflowInputs",
+        "Get-WorkflowInputContract",
     ):
         assert symbol in source
     paths_source = (ROOT / "scripts" / "TestSupport" / "WorkflowPaths.psm1").read_text(encoding="utf-8")
@@ -146,22 +144,43 @@ def test_executable_input_probe_passes_without_elevation() -> None:
 
 
 def test_workflow_input_probe_mutations_are_rejected() -> None:
-    source = MODULE.read_text(encoding="utf-8")
+    input_source = MODULE.read_text(encoding="utf-8")
+    paths_module = ROOT / "scripts" / "TestSupport" / "WorkflowPaths.psm1"
+    paths_source = paths_module.read_text(encoding="utf-8")
     mutations = (
-        source.replace("-not [string]::IsNullOrEmpty($Name)", "$false", 1),
-        source.replace("[IO.FileAttributes]::ReparsePoint", "[IO.FileAttributes]::Normal", 1),
+        (
+            "WorkflowInputs.psm1",
+            input_source.replace(
+                'if ($Name -notmatch $pattern) { throw "$Label contains unsupported characters" }',
+                'if ($false) { throw "$Label contains unsupported characters" }',
+                1,
+            ),
+        ),
+        (
+            "WorkflowPaths.psm1",
+            paths_source.replace(
+                "    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {",
+                "    if ($false) {",
+                1,
+            ),
+        ),
     )
-    for index, mutation in enumerate(mutations):
-        assert mutation != source
+    for index, (mutated_name, mutation) in enumerate(mutations):
+        original = input_source if mutated_name == "WorkflowInputs.psm1" else paths_source
+        assert mutation != original
         with tempfile.TemporaryDirectory(prefix=f"workflow-input-mutation-{index}-") as directory:
-            module = Path(directory) / "WorkflowInputs.psm1"
-            module.write_text(mutation, encoding="utf-8")
-            probe = INPUT_PROBE.read_text(encoding="utf-8").replace(
-                "Join-Path $PSScriptRoot 'TestSupport/WorkflowInputs.psm1'",
-                str(module).replace("'", "''"),
+            support = Path(directory) / "TestSupport"
+            support.mkdir()
+            (support / "WorkflowInputs.psm1").write_text(
+                mutation if mutated_name == "WorkflowInputs.psm1" else input_source,
+                encoding="utf-8",
+            )
+            (support / "WorkflowPaths.psm1").write_text(
+                mutation if mutated_name == "WorkflowPaths.psm1" else paths_source,
+                encoding="utf-8",
             )
             script = Path(directory) / "probe.ps1"
-            script.write_text(probe, encoding="utf-8")
+            script.write_text(INPUT_PROBE.read_text(encoding="utf-8"), encoding="utf-8")
             pwsh = shutil.which("pwsh")
             assert pwsh
             result = subprocess.run(
@@ -171,7 +190,7 @@ def test_workflow_input_probe_mutations_are_rejected() -> None:
                 text=True,
                 timeout=60,
             )
-            assert result.returncode != 0, f"mutation {index} was accepted"
+            assert result.returncode != 0, f"mutation {index} ({mutated_name}) was accepted"
 
 
 if __name__ == "__main__":

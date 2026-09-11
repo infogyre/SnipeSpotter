@@ -19,17 +19,74 @@ function Assert-Rejected {
     Assert-True $rejected "accepted invalid $Description"
 }
 
-$valid = Get-ValidatedWorkflowInputs -ArtifactName 'packaged-release' -LogArtifactName 'msi-lifecycle-logs' -RunIdentity 'release-123-1' -MsiName 'SnipeSpotter-0.1.0-x64.msi'
+$labelParameter = (Get-Command Assert-ArtifactName).Parameters['Label']
+Assert-True (-not [bool]($labelParameter.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] -and $_.Mandatory })) 'artifact Label must be optional'
+Assert-True ((Assert-ArtifactName -Name 'packaged-release') -ceq 'packaged-release') 'artifact default label failed'
+
+$valid = Get-WorkflowInputContract -ArtifactName 'packaged-release' -LogArtifactName 'msi-lifecycle-logs' -RunIdentity 'release-123-1' -MsiName 'SnipeSpotter-0.1.0-x64.msi'
 Assert-True ($valid.PSObject.Properties.Name -join ',' -ceq 'artifact_name,log_artifact_name,run_identity,msi_name') 'validator output shape/order changed'
 
-foreach ($name in @('../escape', '..\escape', 'C:\absolute', '\\server\share', 'good.msi:stream', 'CON.msi', 'aux.MSI', 'NUL.', 'good name.msi', "bad`n.msi", ('a' * 129) + '.msi', 'bad.msi.')) {
+# An empty MSI name is the explicit discovery sentinel; supplied names still obey the full 1..128 rule.
+Assert-True ((Assert-MsiName -Name '') -ceq '') 'empty MSI name must request discovery'
+Assert-True ((Assert-MsiName -Name (('a' * 124) + '.msi')) -ceq (('a' * 124) + '.msi')) '128-character MSI name was rejected'
+foreach ($name in @('../escape', '..\escape', 'C:\absolute', '\\server\share', 'good.msi:stream', 'CON.msi', 'aux.MSI', 'NUL.', 'good name.msi', "bad`n.msi", ('a' * 125) + '.msi', 'bad.msi.')) {
     Assert-Rejected -Description $name -Action { Assert-MsiName -Name $name }
 }
 foreach ($name in @('_leading', 'bad_name', 'bad name', 'CON.', 'release.')) {
     Assert-Rejected -Description $name -Action { Assert-RunIdentity -Name $name }
 }
 foreach ($name in @('../artifact', 'bad artifact', 'CON', 'bad.', ('a' * 129))) {
-    Assert-Rejected -Description $name -Action { Assert-ArtifactName -Name $name }
+    Assert-Rejected -Description $name -Action { Assert-ArtifactName -Name $name -Label 'artifact_name' }
+}
+
+$script:ExecutorInvocations = 0
+$injectedMsiExecutor = {
+    param([Parameter(Mandatory = $true)][string]$MsiPath)
+    $script:ExecutorInvocations++
+    $script:ExecutorLastPath = $MsiPath
+}
+function Invoke-ValidatedMsiProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$ArtifactName,
+        [Parameter(Mandatory = $true)][string]$LogArtifactName,
+        [Parameter(Mandatory = $true)][string]$RunIdentity,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$MsiName,
+        [Parameter(Mandatory = $true)][string]$StagePath,
+        [Parameter(Mandatory = $true)][scriptblock]$MsiExecutor
+    )
+    $validated = Get-WorkflowInputContract -ArtifactName $ArtifactName -LogArtifactName $LogArtifactName -RunIdentity $RunIdentity -MsiName $MsiName
+    New-Item -ItemType Directory -Force -Path $StagePath | Out-Null
+    & $MsiExecutor (Join-Path $StagePath $validated.msi_name)
+}
+function Assert-RejectedWithoutSideEffect {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][string]$StagePath
+    )
+    $script:ExecutorInvocations = 0
+    Remove-Item -LiteralPath $StagePath -Recurse -Force -ErrorAction SilentlyContinue
+    Assert-Rejected -Description $Description -Action $Action
+    Assert-True (-not (Test-Path -LiteralPath $StagePath)) "rejected $Description created a staging path"
+    Assert-True ($script:ExecutorInvocations -eq 0) "rejected $Description invoked the MSI executor"
+}
+
+$rejectionStage = Join-Path ([IO.Path]::GetTempPath()) ('workflow-inputs-rejection-' + [Guid]::NewGuid().ToString('N'))
+try {
+    foreach ($name in @('../escape', '..\escape', 'C:\absolute', 'good name.msi', 'bad.msi.')) {
+        $caseName = $name
+        Assert-RejectedWithoutSideEffect -Description $caseName -StagePath $rejectionStage -Action {
+            Invoke-ValidatedMsiProbe -ArtifactName 'packaged-release' -LogArtifactName 'msi-lifecycle-logs' -RunIdentity 'release-123-1' -MsiName $caseName -StagePath $rejectionStage -MsiExecutor $injectedMsiExecutor
+        }
+    }
+    Assert-RejectedWithoutSideEffect -Description 'invalid artifact staging' -StagePath $rejectionStage -Action {
+        Invoke-ValidatedMsiProbe -ArtifactName '../artifact' -LogArtifactName 'msi-lifecycle-logs' -RunIdentity 'release-123-1' -MsiName 'safe.msi' -StagePath $rejectionStage -MsiExecutor $injectedMsiExecutor
+    }
+    Assert-RejectedWithoutSideEffect -Description 'invalid run identity staging' -StagePath $rejectionStage -Action {
+        Invoke-ValidatedMsiProbe -ArtifactName 'packaged-release' -LogArtifactName 'msi-lifecycle-logs' -RunIdentity '_invalid' -MsiName 'safe.msi' -StagePath $rejectionStage -MsiExecutor $injectedMsiExecutor
+    }
+} finally {
+    Remove-Item -LiteralPath $rejectionStage -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 $root = Join-Path ([IO.Path]::GetTempPath()) ('workflow-inputs-' + [Guid]::NewGuid().ToString('N'))
