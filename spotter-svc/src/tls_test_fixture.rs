@@ -65,24 +65,16 @@ impl TlsLoopbackServer {
         let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer)?;
         let ca_pem = ca_cert.pem();
 
-        // Identity input format is backend-specific: Windows schannel parses
-        // DER (CertCreateCertificateContext) and rejects PEM with "ASN1 bad
-        // tag value met"; the DER key must be the PKCS#8 form — decode
-        // rcgen's PKCS#8 PEM body to DER (serialize_der() emits SEC1 for
-        // EC keys, which schallery rejects as "not a PKCS#8 key").
+        // native-tls schannel from_pkcs8 expects PEM for BOTH arguments
+        // (certs PEM first, then the PKCS#8 PEM key — it validates the key's
+        // PEM guards and parses certs via CryptStringToBinaryA). The RSA
+        // key (aws_lc_rs keygen) satisfies the CryptoAPI PKCS1 import that
+        // rejected ECDSA keys with "not a PKCS#8 key".
         #[cfg(windows)]
-        let identity = {
-            let pkcs8_pem = leaf_key.serialize_pem();
-            let der_body = pkcs8_pem
-                .lines()
-                .filter(|line| !line.starts_with("-----"))
-                .collect::<String>();
-            use base64::Engine as _;
-            let pkcs8_der = base64::engine::general_purpose::STANDARD
-                .decode(der_body.trim())
-                .context("failed to decode fixture PKCS#8 key")?;
-            Identity::from_pkcs8(&pkcs8_der, leaf_cert.der().as_ref())?
-        };
+        let identity = Identity::from_pkcs8(
+            leaf_cert.pem().as_bytes(),
+            leaf_key.serialize_pem().as_bytes(),
+        )?;
         #[cfg(not(windows))]
         let identity = Identity::from_pkcs8(
             leaf_cert.pem().as_bytes(),
@@ -178,18 +170,8 @@ pub(crate) fn mismatched_localhost_identity() -> anyhow::Result<native_tls::Iden
     let params = CertificateParams::new(vec![String::from("other-host")])?;
     let cert = params.self_signed(&leaf_key)?;
     #[cfg(windows)]
-    let identity = {
-        let pkcs8_pem = leaf_key.serialize_pem();
-        let der_body = pkcs8_pem
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect::<String>();
-        use base64::Engine as _;
-        let pkcs8_der = base64::engine::general_purpose::STANDARD
-            .decode(der_body.trim())
-            .context("failed to decode fixture PKCS#8 key")?;
-        Identity::from_pkcs8(&pkcs8_der, cert.der().as_ref())?
-    };
+    let identity =
+        Identity::from_pkcs8(cert.pem().as_bytes(), leaf_key.serialize_pem().as_bytes())?;
     #[cfg(not(windows))]
     let identity =
         Identity::from_pkcs8(cert.pem().as_bytes(), leaf_key.serialize_pem().as_bytes())?;
