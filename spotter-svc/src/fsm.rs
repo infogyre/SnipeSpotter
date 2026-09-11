@@ -198,13 +198,16 @@ impl FsmHandle {
                 sync_generation: is_sync.then_some(target_generation),
             })
             .await;
-        if let Some(guard) = claim_guard.as_mut() {
-            // Durable submit (accepted or failed): the FSM loop owns the
+        if send_outcome.is_ok() {
+            // Durable submit (accepted into the queue): the FSM loop owns the
             // claim lifecycle now; a later Drop must not clear the slot.
-            guard.disarmed = true;
+            if let Some(guard) = claim_guard.as_mut() {
+                guard.disarmed = true;
+            }
         }
         if send_outcome.is_err() {
-            // Submit failed: clear the claim so later syncs start fresh.
+            // Submit failed: dropping the armed guard clears the claim so
+            // later syncs start fresh.
             if let Some(guard) = claim_guard.take() {
                 drop(guard);
             }
