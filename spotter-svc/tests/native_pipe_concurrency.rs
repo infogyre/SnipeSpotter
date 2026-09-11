@@ -78,8 +78,7 @@ fn client_roundtrip(endpoint: &str, command: &ServiceCommand) -> Result<IpcRespo
     file.flush()?;
     let mut response = Vec::new();
     let mut limited = file.take((IPC_MAX_LINE_BYTES + 1) as u64);
-    let read = limited
-        .read_until(b'\n', &mut response)
+    let read = std::io::BufRead::read_until(&mut limited, b'\n', &mut response)
         .context("named-pipe client read failed")?;
     drop(limited);
     if read == 0 {
@@ -227,7 +226,7 @@ async fn native_pipe_shutdown_drains_or_boundedly_observes_sessions() -> Result<
     let guard = PipeServerGuard::new();
     let shutdown_guard = guard.clone_token();
     let session_token = guard.subscribe();
-    let mut server_task =
+    let server_task =
         tokio::spawn(run_named_pipe_bounded(fsm, endpoint.clone(), session_token));
 
     // Drive a gated session: connect, send the sync that blocks the handler.
