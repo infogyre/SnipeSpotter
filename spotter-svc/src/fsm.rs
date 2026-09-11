@@ -135,21 +135,16 @@ impl FsmHandle {
     async fn enqueue_with_generation(&self, command: ServiceCommand) -> Result<SyncEnqueue> {
         let is_sync = command == ServiceCommand::TriggerSync;
         let target_generation = if is_sync {
-            // Allocate a unique generation for every sync request BEFORE the
-            // pending claim: fetch_add is atomic, so each caller owns its
-            // generation without any window where a coalesced caller could
-            // observe a stale value.
-            let allocated = self.next_sync_generation.fetch_add(1, Ordering::AcqRel) + 1;
-            // The claim and the pending-generation store are one atomic
-            // section under this mutex: a coalesced caller either sees the
-            // claim un-set (and becomes the accepted caller) or reads the
-            // stored in-flight generation, never a torn intermediate state.
+            // The claim lock orders allocation: a caller allocates only while
+            // holding the slot mutex, so generations are assigned in claim
+            // order — a paused caller cannot claim a stale lower generation
+            // after a later sync already completed, and coalesced callers
+            // always read the in-flight generation.
             let mut claim = self
                 .pending_generation
                 .lock()
                 .map_err(|_| anyhow::anyhow!("sync generation lock poisoned"))?;
-            if claim.is_some() {
-                let pending = claim.expect("checked above");
+            if let Some(pending) = *claim {
                 drop(claim);
                 let (response, receiver) = oneshot::channel();
                 let _ = response.send(IpcResponse::Ok {
@@ -161,6 +156,7 @@ impl FsmHandle {
                     coalesced: true,
                 });
             }
+            let allocated = self.next_sync_generation.fetch_add(1, Ordering::AcqRel) + 1;
             *claim = Some(allocated);
             allocated
         } else {
