@@ -161,12 +161,28 @@ impl PipeServerGuard {
 /// Returns an error when pipe creation fails or the shutdown drain exceeds
 /// its deadline.
 pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> Result<()> {
-    let guard = PipeServerGuard::new();
-    let session_token = guard.subscribe();
-    // Keep the guard alive for the lifetime of the server task so shutdown
-    // stays reachable; the token drives the loop.
-    let server = run_named_pipe_bounded(fsm, pipe_name, session_token);
-    server.await
+    // Sequential compatibility loop for the CLI named-pipe tests: connect,
+    // serve inline, repeat. The production service uses
+    // [`run_named_pipe_bounded`], which adds bounded concurrency, excess
+    // handling, and cooperative shutdown.
+    let pipe_name = pipe_name.into();
+    let shutdown = PipeServerGuard::new();
+    let session_token = shutdown.subscribe();
+    loop {
+        if shutdown.shutdown.is_cancelled() {
+            return Ok(());
+        }
+        let server = create_secured_server(&pipe_name)?;
+        tokio::select! {
+            connected = server.connect() => {
+                connected.context("named-pipe client connect failed")?;
+            }
+            _ = session_token.cancelled() => return Ok(()),
+        }
+        if let Err(error) = serve_one(server, &fsm).await {
+            tracing::warn!(%error, "IPC client session failed");
+        }
+    }
 }
 
 #[cfg(windows)]
