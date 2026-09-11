@@ -14,6 +14,7 @@ use anyhow::{Result, bail};
 use spotter_core::ipc::{IpcResponse, ServiceCommand};
 use tokio::sync::{mpsc, oneshot, watch};
 
+use crate::scheduler::ScheduleInput;
 use crate::status::{PublicStatusSnapshot, ScheduleSnapshot, project_status};
 
 pub struct FsmRequest {
@@ -31,6 +32,9 @@ pub struct FsmHandle {
     status_receiver: Option<watch::Receiver<PublicStatusSnapshot>>,
     schedule_receiver: Option<watch::Receiver<ScheduleSnapshot>>,
     schedule_sender: Option<watch::Sender<ScheduleSnapshot>>,
+    attached_status_sender: Arc<std::sync::Mutex<Option<watch::Sender<PublicStatusSnapshot>>>>,
+    #[cfg_attr(not(any(windows, feature = "test-support")), expect(dead_code))]
+    attached_schedule_sender: Arc<std::sync::Mutex<Option<watch::Sender<ScheduleInput>>>>,
 }
 
 /// Result of accepting or coalescing a synchronization request.
@@ -63,16 +67,28 @@ impl FsmHandle {
     }
 
     async fn request_status(&self, full: bool) -> Result<IpcResponse> {
-        let Some(status_receiver) = self.status_receiver.as_ref() else {
-            return self
-                .enqueue(if full {
-                    ServiceCommand::GetStatusFull
-                } else {
-                    ServiceCommand::GetStatus
-                })
-                .await?
-                .await
-                .map_err(|_| anyhow::anyhow!("service command response was cancelled"));
+        // Prefer an attached publication channel (service startup), falling
+        // back to the handle's snapshot receiver, then to the serialized
+        // queue for plain spawns without a publisher.
+        let attached = self
+            .attached_status_sender
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(watch::Sender::subscribe));
+        let status_receiver = match (self.status_receiver.as_ref(), attached) {
+            (_, Some(receiver)) => receiver,
+            (Some(receiver), _) => receiver.clone(),
+            (None, None) => {
+                return self
+                    .enqueue(if full {
+                        ServiceCommand::GetStatusFull
+                    } else {
+                        ServiceCommand::GetStatus
+                    })
+                    .await?
+                    .await
+                    .map_err(|_| anyhow::anyhow!("service command response was cancelled"));
+            }
         };
         let status = status_receiver.borrow().clone();
         let schedule = match self.schedule_receiver.as_ref() {
@@ -162,6 +178,26 @@ impl FsmHandle {
         self.completed_sync_generation.subscribe()
     }
 
+    /// Registers a status publication channel owned by the service startup.
+    #[cfg_attr(not(any(windows, feature = "test-support")), expect(dead_code))]
+    pub(crate) fn attach_status_publication(&self, sender: watch::Sender<PublicStatusSnapshot>) {
+        self.attached_status_sender
+            .lock()
+            .map(|mut guard| *guard = Some(sender))
+            .map_err(|_| anyhow::anyhow!("status publication lock poisoned"))
+            .ok();
+    }
+
+    /// Registers a scheduler-input channel owned by the service startup.
+    #[cfg_attr(not(any(windows, feature = "test-support")), expect(dead_code))]
+    pub(crate) fn attach_schedule_input(&self, sender: watch::Sender<ScheduleInput>) {
+        self.attached_schedule_sender
+            .lock()
+            .map(|mut guard| *guard = Some(sender))
+            .map_err(|_| anyhow::anyhow!("schedule input lock poisoned"))
+            .ok();
+    }
+
     /// Publishes a scheduler-owned schedule projection for status readers.
     pub(crate) fn publish_schedule_snapshot(&self, schedule: ScheduleSnapshot) {
         if let Some(schedule_sender) = self.schedule_sender.as_ref() {
@@ -241,6 +277,8 @@ where
         status_receiver,
         schedule_receiver: schedule_receiver.or(Some(schedule_receiver_for_handle)),
         schedule_sender: Some(schedule_sender),
+        attached_status_sender: Arc::new(std::sync::Mutex::new(None)),
+        attached_schedule_sender: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -371,6 +409,8 @@ mod tests {
             status_receiver: None,
             schedule_receiver: None,
             schedule_sender: None,
+            attached_status_sender: Arc::new(std::sync::Mutex::new(None)),
+            attached_schedule_sender: Arc::new(std::sync::Mutex::new(None)),
         };
 
         let error = handle

@@ -17,8 +17,25 @@ pub(crate) mod scheduler;
 #[cfg(windows)]
 pub mod service;
 pub(crate) mod status;
-#[cfg(windows)]
-pub(crate) mod status_publisher;
+#[cfg(any(windows, feature = "test-support"))]
+pub mod status_publisher;
+
+/// Test-support-only: attach a status publisher to a handle so status
+/// commands read the snapshot path; also publishes one Idle snapshot so
+/// responses carry committed data.
+#[cfg(feature = "test-support")]
+pub fn status_publisher_for_tests(
+    handle: &fsm::FsmHandle,
+) -> anyhow::Result<crate::status_publisher::StatusPublisher> {
+    let publisher = crate::status_publisher::StatusPublisher::new(handle)?;
+    publisher.publish(
+        "Idle",
+        "",
+        false,
+        &spotter_core::state::ServiceState::default(),
+    );
+    Ok(publisher)
+}
 #[cfg(test)]
 pub(crate) mod tls_test_fixture;
 

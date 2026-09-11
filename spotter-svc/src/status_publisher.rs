@@ -13,21 +13,19 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::fsm::FsmHandle;
-#[cfg(any(test, windows))]
-use crate::scheduler::ScheduleInput;
-#[cfg(windows)]
+use crate::scheduler::{ScheduleInput, run_scheduler};
 use crate::status::{PublicStatusSnapshot, ScheduleSnapshot};
 
 /// Shared publication side owned by the service owner loop.
+#[cfg_attr(not(windows), expect(dead_code))]
 #[derive(Clone)]
-pub(crate) struct StatusPublisher {
+pub struct StatusPublisher {
     status_sender: watch::Sender<PublicStatusSnapshot>,
     schedule_sender: watch::Sender<ScheduleInput>,
     schedule_receiver: watch::Receiver<ScheduleInput>,
     current_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
-#[cfg(windows)]
 impl StatusPublisher {
     /// Construct the publisher with a fresh configuration generation.
     ///
@@ -65,6 +63,9 @@ impl StatusPublisher {
         self.schedule_receiver.clone()
     }
 
+    /// Registers the publisher's watch senders on the FSM handle so status
+    /// reads take the snapshot path and the scheduler publishes projections.
+    #[cfg_attr(not(any(windows, feature = "test-support")), expect(dead_code))]
     fn attach_watches(&self, handle: &FsmHandle) {
         handle.attach_status_publication(self.status_sender.clone());
         handle.attach_schedule_input(self.schedule_sender.clone());

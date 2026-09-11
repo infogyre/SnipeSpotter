@@ -28,7 +28,7 @@ pub(crate) struct ScheduleSnapshot {
 
 impl PublicStatusSnapshot {
     /// Build a public snapshot from committed state and nonsecret configuration fields.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, feature = "test-support"))]
     #[expect(dead_code, reason = "Windows owner publication consumes it at runtime")]
     #[must_use]
     pub(crate) fn from_parts(
