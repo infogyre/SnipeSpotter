@@ -55,14 +55,18 @@ impl TlsLoopbackServer {
             rcgen::KeyUsagePurpose::KeyEncipherment,
         ];
         let leaf_cert = leaf_params.signed_by(&leaf_key, &ca_issuer)?;
-        let leaf_pem = leaf_cert.pem();
-        let leaf_key_pem = leaf_key.serialize_pem();
         let ca_pem = ca_cert.pem();
 
-        // Windows schannel parses DER (CertCreateCertificateContext); PEM
-        // input fails with "ASN1 bad tag value met" there. Linux OpenSSL
-        // accepts both, so DER is used unconditionally.
+        // Identity input format is backend-specific: Windows schannel parses
+        // DER (CertCreateCertificateContext) and rejects PEM with "ASN1 bad
+        // tag value met"; Linux OpenSSL requires PKCS#8 PEM.
+        #[cfg(windows)]
         let identity = Identity::from_pkcs8(&leaf_key.serialize_der(), leaf_cert.der().as_ref())?;
+        #[cfg(not(windows))]
+        let identity = Identity::from_pkcs8(
+            leaf_cert.pem().as_bytes(),
+            leaf_key.serialize_pem().as_bytes(),
+        )?;
         let acceptor = Arc::new(TlsAcceptor::from(
             native_tls::TlsAcceptor::builder(identity).build()?,
         ));
@@ -152,10 +156,12 @@ pub(crate) fn mismatched_localhost_identity() -> anyhow::Result<native_tls::Iden
     let leaf_key = KeyPair::generate()?;
     let params = CertificateParams::new(vec![String::from("other-host")])?;
     let cert = params.self_signed(&leaf_key)?;
-    Ok(Identity::from_pkcs8(
-        &leaf_key.serialize_der(),
-        cert.der().as_ref(),
-    )?)
+    #[cfg(windows)]
+    let identity = Identity::from_pkcs8(&leaf_key.serialize_der(), cert.der().as_ref())?;
+    #[cfg(not(windows))]
+    let identity =
+        Identity::from_pkcs8(cert.pem().as_bytes(), leaf_key.serialize_pem().as_bytes())?;
+    Ok(identity)
 }
 
 /// Shared assertion helper: connect with a client and expect success or
