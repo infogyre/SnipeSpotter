@@ -1108,6 +1108,16 @@ try {
         service_status = if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) { 'absent' } else { (Get-Service -Name $serviceName).Status.ToString() }
         data_root_exists = [bool](Test-Path -LiteralPath $DataRoot)
     }
+    # Preserve the service's own tracing logs for root-cause analysis; the
+    # service writes under the per-run DataRoot.
+    try {
+        $serviceLogDir = Join-Path $DataRoot 'logs'
+        if (Test-Path -LiteralPath $serviceLogDir) {
+            $targetDir = Join-Path $LogDirectory 'service-logs'
+            New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+            Copy-Item -LiteralPath (Join-Path $serviceLogDir '*') -Destination $targetDir -Force
+        }
+    } catch { Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'service-log-copy-error.txt') -Values @{ error = $_.ToString() } }
 } finally {
     try {
         Invoke-FailureSafeCleanup -Actions @(
