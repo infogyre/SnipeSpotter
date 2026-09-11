@@ -973,7 +973,7 @@ try {
 
     $fixture = Start-SnipeItLoopbackFixture -AuthorizationSentinel $tokenSentinel
     Wait-Condition -Description 'Snipe-IT loopback fixture readiness' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
-        $fixture.State.Ready -and $fixture.Listener.IsListening
+        $fixture.State.Ready -and $fixture.Listener -and $fixture.Listener.Server.IsBound
     } | Out-Null
     Assert-True $fixture.Prefix.StartsWith('https://localhost:') 'loopback TLS fixture did not advertise an https://localhost endpoint'
     Assert-True ($null -ne $fixture.Listener) 'loopback TLS fixture listener missing'
