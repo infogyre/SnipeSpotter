@@ -55,6 +55,9 @@ impl StatusPublisher {
             current_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         publisher.attach_watches(handle);
+        // The scheduler owns the automatic deadline exclusively from startup;
+        // arming happens when the owner publishes the initial activation.
+        crate::status_publisher::spawn_scheduler(handle.clone(), publisher.schedule_receiver());
         Ok(publisher)
     }
 
@@ -97,6 +100,18 @@ impl StatusPublisher {
         // The scheduler publishes via the FSM handle; this mirrors into the
         // input watch so a reader joined later sees the latest schedule.
         let _ = schedule;
+    }
+
+    /// Publishes the startup committed-state snapshot from settings loaded at
+    /// boot, before any command runs.
+    pub(crate) fn publish_snapshot_owned(
+        &self,
+        configured: bool,
+        snipeit_url: &str,
+        persisted: &spotter_core::state::ServiceState,
+    ) {
+        let state = if configured { "Idle" } else { "Unconfigured" };
+        self.publish(state, snipeit_url, configured, persisted);
     }
 
     /// Advance the configuration generation and republish the scheduler input

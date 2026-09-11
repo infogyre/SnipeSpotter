@@ -935,6 +935,8 @@ Assert-True ($null -eq $service) "refusing to mutate pre-existing unique service
 
 $tokenSentinel = "AC4-" + [Guid]::NewGuid().ToString('N')
 $fixture = $null
+$fixtureCaImported = $false
+[Security.Cryptography.X509Certificates.X509Certificate2]$fixtureCaIdentity = $null
 $primaryError = $null
 $cleanupError = $null
 try {
@@ -978,14 +980,17 @@ try {
 
     # Trust only this run's fixture CA in LocalMachine Root so the real
     # LocalSystem service validates the endpoint through normal Windows trust;
-    # removed in the cleanup block below.
+    # removed in the cleanup block below. The identity is retained in memory
+    # because cleanup may run after the material files are deleted.
     $fixtureCaImported = $false
+    [Security.Cryptography.X509Certificates.X509Certificate2]$fixtureCaIdentity = $null
     try {
         $fixtureCa = [Security.Cryptography.X509Certificates.X509Certificate2]::new($fixture.Material.CaCertPath)
         $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'LocalMachine')
         $rootStore.Open('ReadWrite')
         $rootStore.Add($fixtureCa)
         $rootStore.Close()
+        $fixtureCaIdentity = $fixtureCa
         $fixtureCaImported = $true
     } catch {
         throw "failed to import the loopback fixture CA into LocalMachine Root: $_"
@@ -1107,20 +1112,14 @@ try {
     try {
         Invoke-FailureSafeCleanup -Actions @(
             {
-                if ($null -ne $fixture) {
-                    Stop-SnipeItLoopbackFixture -Fixture $fixture -TimeoutSeconds $WaitTimeoutSeconds
-                }
-            },
-            {
-                # Trust-store residue guard: remove the fixture CA exactly as
-                # imported; a missing store entry is tolerated only after a
-                # successful removal.
-                if ($fixtureCaImported) {
+                # Trust-store residue guard FIRST: remove the exact imported
+                # CA from LocalMachine Root while its in-memory identity is
+                # still available (the fixture CA file may already be gone).
+                if ($fixtureCaImported -and $null -ne $fixtureCaIdentity) {
                     try {
-                        $fixtureCa = [Security.Cryptography.X509Certificates.X509Certificate2]::new($fixture.Material.CaCertPath)
                         $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'LocalMachine')
                         $rootStore.Open('ReadWrite')
-                        $rootStore.Remove($fixtureCa)
+                        $rootStore.Remove($fixtureCaIdentity)
                         $rootStore.Close()
                     } catch {
                         throw 'fixture CA removal from LocalMachine Root failed'
@@ -1128,12 +1127,20 @@ try {
                 }
             },
             {
-                # TLS residue guard: run-scoped key/cert material must be gone
-                # even when the outer lifecycle fails after fixture startup.
-                $leftovers = @(Get-ChildItem ([IO.Path]::GetTempPath()) -Filter 'snipespotter-fixture-*' -ErrorAction SilentlyContinue)
-                if ($leftovers.Count -gt 0) {
-                    foreach ($leftover in $leftovers) { Remove-Item -LiteralPath $leftover.FullName -Force }
-                    throw 'loopback TLS fixture left certificate material behind'
+                if ($null -ne $fixture) {
+                    Stop-SnipeItLoopbackFixture -Fixture $fixture -TimeoutSeconds $WaitTimeoutSeconds
+                }
+            },
+            {
+                # TLS residue guard: only THIS run's tracked material must be
+                # gone; never sweep the shared temporary directory by prefix.
+                if ($null -ne $fixture) {
+                    foreach ($tracked in $fixture.Material.Paths) {
+                        if (Test-Path -LiteralPath $tracked) {
+                            Remove-Item -LiteralPath $tracked -Force
+                            throw 'loopback TLS fixture left tracked certificate material behind'
+                        }
+                    }
                 }
             },
             {
