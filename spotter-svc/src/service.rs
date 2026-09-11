@@ -89,6 +89,7 @@ define_windows_service!(ffi_service_main, service_main);
 pub(crate) struct CommandOwner {
     journal_path: std::path::PathBuf,
     polling_sender: tokio::sync::watch::Sender<u64>,
+    status_publisher: Option<Arc<crate::status_publisher::StatusPublisher>>,
     persisted_state: PersistedServiceState,
     controller: crate::ServiceController,
     secret_protector: Box<dyn SecretProtector>,
@@ -120,6 +121,7 @@ impl CommandOwner {
         Self {
             journal_path,
             polling_sender,
+            status_publisher: None,
             persisted_state,
             controller,
             secret_protector: ports.secret_protector,
@@ -134,7 +136,17 @@ impl CommandOwner {
     }
 
     pub(crate) async fn handle(&mut self, command: ServiceCommand) -> IpcResponse {
-        match command {
+        // Publication points: mutation start, and each terminal activation.
+        let starts_work = matches!(
+            command,
+            ServiceCommand::TriggerSync
+                | ServiceCommand::CheckinAll
+                | ServiceCommand::CheckinSerial { .. }
+        );
+        if starts_work {
+            self.publish_snapshot();
+        }
+        let response = match command {
             ServiceCommand::GetConfig => IpcResponse::Config {
                 settings: redact_settings(&self.controller.settings),
                 missing: config_status(&self.controller.settings)
@@ -159,7 +171,50 @@ impl CommandOwner {
                 .force_checkin(Some(&serial))
                 .await
                 .unwrap_or_else(protocol_error),
-        }
+        };
+        self.publish_snapshot();
+        response
+    }
+
+    /// Publishes the committed state plus transient FSM state to the status
+    /// snapshot channel; a no-op when no publisher is attached.
+    fn publish_snapshot(&mut self) {
+        let Some(publisher) = self.status_publisher.as_ref() else {
+            return;
+        };
+        let state = match self.controller.state {
+            crate::FsmState::Bootstrap
+            | crate::FsmState::LoadConfig
+            | crate::FsmState::Decrypt
+            | crate::FsmState::ValidateConfig => "Starting",
+            crate::FsmState::Unconfigured => "Unconfigured",
+            crate::FsmState::Idle => "Idle",
+            crate::FsmState::Syncing => "Syncing",
+            crate::FsmState::Error => "Error",
+        };
+        let configured = self.controller.state != crate::FsmState::Unconfigured;
+        publisher.publish(
+            state,
+            &self.controller.settings.snipeit.url,
+            configured,
+            &self.persisted_state,
+        );
+    }
+
+    /// Arms the scheduler after a settings save that persisted successfully:
+    /// configured transitions and actual interval changes advance the
+    /// generation; unrelated saves and no-op values re-publish the same
+    /// generation without resetting any armed deadline (enforced by the
+    /// scheduler's arming rule).
+    fn activate_scheduler(&mut self) {
+        let Some(publisher) = self.status_publisher.as_ref() else {
+            return;
+        };
+        let configured = self.controller.state != crate::FsmState::Unconfigured;
+        let interval = std::time::Duration::from_secs(
+            u64::from(self.controller.settings.polling.interval_hours) * 3600,
+        );
+        publisher.activate_configuration(configured, interval);
     }
 
     async fn trigger_sync(&mut self) -> Result<IpcResponse> {
@@ -429,6 +484,8 @@ impl CommandOwner {
             self.remote = remote;
         }
         self.refresh_configuration_state();
+        self.publish_snapshot();
+        self.activate_scheduler();
         Ok(IpcResponse::Ok {
             message: format!("updated {field}"),
         })
@@ -455,6 +512,8 @@ impl CommandOwner {
             self.remote = remote;
         }
         self.refresh_configuration_state();
+        self.publish_snapshot();
+        self.activate_scheduler();
         Ok(IpcResponse::Ok {
             message: String::from("API token updated"),
         })
@@ -691,6 +750,7 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     let owner = std::sync::Arc::new(tokio::sync::Mutex::new(CommandOwner {
         journal_path,
         polling_sender,
+        status_publisher: None,
         persisted_state,
         controller,
         secret_protector: Box::new(crate::owner_ports::DpapiProtector),
@@ -718,6 +778,14 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     // configuration generation observed by the owner.
     let publisher = crate::status_publisher::StatusPublisher::new(&fsm)?;
     crate::status_publisher::spawn_scheduler(fsm.clone(), publisher.schedule_receiver());
+    {
+        let publisher = std::sync::Arc::new(publisher);
+        let mut owner_guard = owner.lock().await;
+        owner_guard.status_publisher = Some(std::sync::Arc::clone(&publisher));
+        // Initial snapshot: startup recovery completed; publish the committed
+        // state so status reads serve real data before any command.
+        owner_guard.publish_snapshot();
+    }
 
     set_status(&status_handle, ServiceState::Running, 0, Duration::ZERO)
         .inspect_err(|e| tracing::error!(%e, "failed to set Running"))?;

@@ -976,6 +976,21 @@ try {
     Assert-True $fixture.Prefix.StartsWith('https://localhost:') 'loopback TLS fixture did not advertise an https://localhost endpoint'
     Assert-True ($null -ne $fixture.Listener) 'loopback TLS fixture listener missing'
 
+    # Trust only this run's fixture CA in LocalMachine Root so the real
+    # LocalSystem service validates the endpoint through normal Windows trust;
+    # removed in the cleanup block below.
+    $fixtureCaImported = $false
+    try {
+        $fixtureCa = [Security.Cryptography.X509Certificates.X509Certificate2]::new($fixture.Material.CaCertPath)
+        $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'LocalMachine')
+        $rootStore.Open('ReadWrite')
+        $rootStore.Add($fixtureCa)
+        $rootStore.Close()
+        $fixtureCaImported = $true
+    } catch {
+        throw "failed to import the loopback fixture CA into LocalMachine Root: $_"
+    }
+
     foreach ($update in @(
         @('snipeit.url', $fixture.Prefix.TrimEnd('/')),
         @('snipeit.checkout_status_id', '1'),
@@ -1094,6 +1109,22 @@ try {
             {
                 if ($null -ne $fixture) {
                     Stop-SnipeItLoopbackFixture -Fixture $fixture -TimeoutSeconds $WaitTimeoutSeconds
+                }
+            },
+            {
+                # Trust-store residue guard: remove the fixture CA exactly as
+                # imported; a missing store entry is tolerated only after a
+                # successful removal.
+                if ($fixtureCaImported) {
+                    try {
+                        $fixtureCa = [Security.Cryptography.X509Certificates.X509Certificate2]::new($fixture.Material.CaCertPath)
+                        $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'LocalMachine')
+                        $rootStore.Open('ReadWrite')
+                        $rootStore.Remove($fixtureCa)
+                        $rootStore.Close()
+                    } catch {
+                        throw 'fixture CA removal from LocalMachine Root failed'
+                    }
                 }
             },
             {
