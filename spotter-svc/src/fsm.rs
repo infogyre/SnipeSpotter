@@ -137,14 +137,14 @@ impl FsmHandle {
             // generation without any window where a coalesced caller could
             // observe a stale value.
             let allocated = self.next_sync_generation.fetch_add(1, Ordering::AcqRel) + 1;
-            if self
+            // Only the accepted caller writes pending_generation, and it does
+            // so immediately after claiming pending, so the slot always holds
+            // the in-flight sync's generation when coalesced callers read it.
+            let accepted = self
                 .sync_pending
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                // Pending claim already held: coalesce onto the accepted
-                // sync's generation, which the accepted caller stored before
-                // the pending flag became observable to us.
+                .is_ok();
+            if !accepted {
                 let (response, receiver) = oneshot::channel();
                 let _ = response.send(IpcResponse::Ok {
                     message: String::from("sync already queued"),
@@ -155,8 +155,6 @@ impl FsmHandle {
                     coalesced: true,
                 });
             }
-            // First store of the claim: the accepted generation is published
-            // before any coalesced caller can observe sync_pending=true.
             self.pending_generation.store(allocated, Ordering::Release);
             allocated
         } else {

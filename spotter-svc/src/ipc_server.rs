@@ -178,7 +178,7 @@ pub(crate) async fn run_named_pipe_bounded(
     use tokio::task::JoinSet;
 
     let pipe_name = pipe_name.into();
-    let shutdown = session_token;
+    let shutdown = session_token.clone();
     let mut sessions: JoinSet<Result<()>> = JoinSet::new();
     loop {
         if shutdown.is_cancelled() {
