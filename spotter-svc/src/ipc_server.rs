@@ -130,7 +130,7 @@ pub struct PipeServerGuard {
 #[cfg(windows)]
 #[cfg_attr(not(feature = "test-support"), expect(dead_code))]
 impl PipeServerGuard {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             shutdown: tokio_util::sync::CancellationToken::new(),
         }

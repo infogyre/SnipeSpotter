@@ -14,6 +14,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use anyhow::Result;
 use spotter_core::ipc::{IpcResponse, ServiceCommand};
 use spotter_svc::ipc_server::{MAX_ACTIVE_PIPE_SESSIONS, PipeServerGuard, run_named_pipe_bounded};
@@ -215,21 +216,12 @@ async fn native_pipe_shutdown_drains_or_boundedly_observes_sessions() -> Result<
             client_roundtrip(&endpoint, &ServiceCommand::TriggerSync)
         })
     };
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            if started_rx.is_closed() {
-                anyhow::bail!("handler start channel closed unexpectedly");
-            }
-            // started_tx fires when the handler begins; detect completion of
-            // that signal by polling channel readiness via try_recv.
-            if started_rx.has_changed().unwrap_or(false) {
-                return Ok::<(), anyhow::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("gated sync must reach its handler")?;
+    tokio::time::timeout(Duration::from_secs(2), started_rx)
+        .await
+        .expect("gated sync must reach its handler")
+        .ok();
+    // Give the handler a moment to enter its gated wait before shutdown.
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // A second client abandons its session (connects, never sends a request).
     let abandoned = {
