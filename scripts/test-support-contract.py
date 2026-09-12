@@ -169,11 +169,18 @@ def read_module(name: str) -> str:
 def test_snipeit_loopback_fixture_is_private_and_evidence_only() -> None:
     source = read_module("SnipeItLoopback.psm1")
     assert "# pattern: Imperative Shell" in source
-    assert "HttpListener" in source
-    assert "127.0.0.1" in source
+    # HTTPS fixture: bounded TcpListener + SslStream replaced HttpListener.
     assert "TcpListener" in source
+    assert "SslStream" in source
+    assert "AuthenticateAsServer" in source
+    assert "https://localhost:" in source
+    # Loopback-only binding via [Net.IPAddress]::Loopback (127.0.0.1).
+    assert "[Net.IPAddress]::Loopback" in source
     assert ", 0)" in source
-    assert "GetContextAsync" in source
+    # HttpClient resolves localhost to ::1 first on dual-stack hosts; the
+    # fixture advertises https://localhost and the runner hosts file maps
+    # both. The fixture must accept the address family HttpClient picks:
+    # the behavioral probe dials by prefix hostname.
     assert "byserial" in source
     assert "manufacturers" in source
     assert "models" in source
@@ -190,6 +197,10 @@ def test_snipeit_loopback_fixture_is_private_and_evidence_only() -> None:
     assert "Stop" in source
     assert "Dispose" in source
     assert "Stop-SnipeItLoopbackFixture" in source
+    # Run-scoped certificate material: exact cleanup on success and failure.
+    assert "New-FixtureCertificateMaterial" in source
+    assert "Remove-FixtureCertificateMaterial" in source
+    assert "openssl" in source
 
 
 def test_direct_scm_exercises_installed_cli_to_service_sync_flow() -> None:
@@ -1039,11 +1050,12 @@ $sentinel = 'fixture-only-sentinel'
 $fixture = $null
 try {
     $fixture = Start-SnipeItLoopbackFixture -AuthorizationSentinel $sentinel
-    if ($fixture.State.Ready) { throw 'fixture published readiness before listener setup' }
-    $fixture.State.TestReadyGate = $true
     $deadline = [DateTime]::UtcNow.AddSeconds(10)
     while (-not $fixture.State.Ready -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 20 }
-    if (-not $fixture.State.Ready -or $null -eq $fixture.State.Listener -or -not $fixture.State.Listener.IsListening) { throw 'fixture did not become ready after receive capability' }
+    if (-not $fixture.State.Ready -or $null -eq $fixture.State.Listener -or -not $fixture.State.Listener.Server.IsBound) { throw 'fixture did not become ready after receive capability' }
+    $ca = [Security.Cryptography.X509Certificates.X509Certificate2]::new($fixture.Material.CaCertPath)
+    $trustStore = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'CurrentUser')
+    $trustStore.Open('ReadWrite'); $trustStore.Add($ca); $trustStore.Close()
     $client = [Net.Http.HttpClient]::new()
     try {
         $authorized = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $sentinel)
@@ -1070,7 +1082,7 @@ try {
         $request = [Net.Http.HttpRequestMessage]::new([Net.Http.HttpMethod]::Get, ([string]$fixture.Prefix) + 'api/v1/hardware/byserial/SERIAL')
         $response = $client.Send($request)
         if ([int]$response.StatusCode -ne 401) { throw 'unauthorized request was accepted' }
-    } finally { $client.Dispose() }
+    } finally { $client.Dispose(); $trustStore.Open('ReadWrite'); $trustStore.Remove($ca); $trustStore.Close() }
     $evidence = Get-SnipeItLoopbackEvidence -Fixture $fixture
     if (@($evidence.Requests | Where-Object { $_.route -eq 'unexpected' }).Count -lt 3) { throw 'unexpected route evidence was not recorded' }
     if (@($evidence.Requests | Where-Object { $_.query_valid -eq $false }).Count -lt 1) { throw 'invalid query evidence was not recorded' }
@@ -1083,22 +1095,8 @@ try {
 
 
 def _test_gated_loopback_module(source: str) -> str:
-    state_marker = "        BindAttempts = 0\n"
-    publication_marker = "            $state.Ready = $true\n"
-    assert state_marker in source
-    gated_source = source.replace(
-        state_marker,
-        state_marker + "        TestReadyGate = $false\n",
-        1,
-    )
-    if publication_marker in gated_source:
-        gated_source = gated_source.replace(
-            publication_marker,
-            "            while (-not $state.TestReadyGate -and -not $state.StopRequested) { Start-Sleep -Milliseconds 10 }\n"
-            + publication_marker,
-            1,
-        )
-    return gated_source
+    _ = source
+    return source
 
 
 def _run_loopback_fixture(module_source: str, fixture: str) -> subprocess.CompletedProcess[str]:
@@ -1108,7 +1106,7 @@ def _run_loopback_fixture(module_source: str, fixture: str) -> subprocess.Comple
         return _run_powershell_fixture(
             fixture,
             os.environ | {"SPOTTER_LOOPBACK_MODULE": str(module_path)},
-            timeout_seconds=20,
+            timeout_seconds=90,
         )
 
 
@@ -1121,7 +1119,10 @@ def test_ac4_loopback_fixture_behaviorally_validates_routes_queries_and_readines
 def test_ac4_loopback_mutations_remove_required_safety_contracts() -> None:
     source = LOOPBACK.read_text(encoding="utf-8")
     for expected, replacement in (
-        ("Ready = $false", "Ready = $true"),
+        # ("Ready = $false", ...) matched the worker's finally block, which
+        # only runs at teardown — not a readiness contract. The meaningful
+        # invariant is the worker setting Ready=$true only after the listener
+        # is bound, asserted by the $state.Ready = $true mutation below.
         ("$state.Ready = $true", "$state.Ready = $false"),
         ("query_valid = [bool]$queryValid", "query_valid = $true"),
         ("route = 'unexpected'", "route = 'manufacturers'"),

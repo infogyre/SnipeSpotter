@@ -1,0 +1,9 @@
+[package]
+name = "fixture-external-wildcard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fixture-external = { path = "fixture-external", version = "*" }
+
+[workspace]

@@ -205,6 +205,220 @@ async fn actual_binary_status_roundtrips_on_isolated_service_endpoint() {
 }
 
 #[cfg(all(windows, feature = "test-support"))]
+#[tokio::test]
+async fn actual_binary_config_selection_and_status_outputs_match_contract() {
+    let identity = test_identity();
+    let mut settings = spotter_core::Settings::default();
+    settings.snipeit.url = String::from("https://example.test/\u{1b}[31m");
+    settings.snipeit.api_token_encrypted = vec![0x41, 0x42];
+    settings.snipeit.checkout_status_id = 11;
+    settings.snipeit.checkin_status_id = 12;
+    settings.polling.interval_hours = 7;
+    settings.logging.level = String::from("debug\nnext");
+    settings.logging.max_size_mb = 20;
+    settings.logging.max_files = 4;
+    settings.monitors.checkin_policy = spotter_core::CheckinPolicy::AutoNonPortable;
+    settings.monitors.checkin_threshold_hours = 48;
+    let fsm = spotter_svc::fsm::spawn(4, move |command| {
+        let settings = settings.clone();
+        async move {
+            match command {
+                spotter_core::ipc::ServiceCommand::GetConfig => {
+                    spotter_core::ipc::IpcResponse::Config {
+                        settings: spotter_core::ipc::redact_settings(&settings),
+                        missing: vec![String::from("snipeit.url")],
+                    }
+                }
+                spotter_core::ipc::ServiceCommand::GetStatus => {
+                    spotter_core::ipc::IpcResponse::Status {
+                        state: String::from("Syncing\u{1b}[31m"),
+                        last_sync: None,
+                        next_sync: Some(String::from("2026-01-02T00:00:00Z\nunsafe")),
+                        snipeit_url: String::from("https://status.example\u{1b}[2J"),
+                    }
+                }
+                spotter_core::ipc::ServiceCommand::GetStatusFull => {
+                    spotter_core::ipc::IpcResponse::StatusFull {
+                        state: String::from("Idle"),
+                        last_sync: Some(String::from("2026-01-01T00:00:00Z")),
+                        next_sync: None,
+                        snipeit_url: String::from("https://status.example"),
+                        matched_asset: Some(spotter_core::state::AssetSummary {
+                            id: 42,
+                            name: String::from("Laptop"),
+                            serial: Some(String::from("SERIAL")),
+                            asset_tag: None,
+                        }),
+                        monitors: vec![
+                            spotter_core::ipc::MonitorStatus {
+                                serial: String::from("MON-B"),
+                                asset_id: None,
+                                checked_out: false,
+                                absent_since: None,
+                            },
+                            spotter_core::ipc::MonitorStatus {
+                                serial: String::from("MON-A"),
+                                asset_id: Some(7),
+                                checked_out: true,
+                                absent_since: Some(String::from("2026-01-03")),
+                            },
+                        ],
+                    }
+                }
+                _ => spotter_core::ipc::IpcResponse::Ok {
+                    message: String::from("ok"),
+                },
+            }
+        }
+    })
+    .expect("test FSM must start");
+    let server = ServerGuard::spawn(fsm, identity.pipe_endpoint.clone());
+    wait_for_pipe(&identity.pipe_endpoint).await;
+
+    let selected = identity.cli_arguments(&["--json", "config", "get", "polling.interval_hours"]);
+    let selected = tokio::task::spawn_blocking(move || run_cli(&selected))
+        .await
+        .expect("selected config task must not panic");
+    assert!(selected.status.success());
+    assert!(selected.stderr.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&selected.stdout).expect("scalar JSON"),
+        7
+    );
+
+    let complete = identity.cli_arguments(&["--json", "config", "get"]);
+    let complete = tokio::task::spawn_blocking(move || run_cli(&complete))
+        .await
+        .expect("complete config task must not panic");
+    assert!(complete.status.success());
+    let complete_json: serde_json::Value =
+        serde_json::from_slice(&complete.stdout).expect("config envelope JSON");
+    assert_eq!(
+        complete_json,
+        serde_json::json!({
+            "type": "config",
+            "data": {
+                "settings": {
+                    "snipeit": {
+                        "url": "https://example.test/\u{1b}[31m",
+                        "api_token_encrypted": "",
+                        "checkout_status_id": 11,
+                        "checkin_status_id": 12,
+                    },
+                    "polling": {
+                        "interval_hours": 7,
+                    },
+                    "logging": {
+                        "level": "debug\nnext",
+                        "max_size_mb": 20,
+                        "max_files": 4,
+                    },
+                    "monitors": {
+                        "checkin_policy": "auto_non_portable",
+                        "checkin_threshold_hours": 48,
+                    },
+                },
+                "missing": ["snipeit.url"],
+            },
+        })
+    );
+
+    let human_config = identity.cli_arguments(&["config", "get"]);
+    let human_config = tokio::task::spawn_blocking(move || run_cli(&human_config))
+        .await
+        .expect("human config task must not panic");
+    assert!(human_config.status.success());
+    let human_config = String::from_utf8(human_config.stdout).expect("human config UTF-8");
+    assert!(human_config.contains("snipeit.url: https://example.test/\\u{1b}[31m"));
+    assert!(human_config.contains("logging.level: debug\\nnext"));
+    assert!(human_config.contains("missing: snipeit.url"));
+    assert!(!human_config.contains("4142") && !human_config.contains("configured"));
+
+    let status = identity.cli_arguments(&["status"]);
+    let status = tokio::task::spawn_blocking(move || run_cli(&status))
+        .await
+        .expect("status task must not panic");
+    assert!(status.status.success());
+    let status = String::from_utf8(status.stdout).expect("human status UTF-8");
+    assert!(status.contains("State: Syncing\\u{1b}[31m"));
+    assert!(status.contains("Last Sync: <none>"));
+    assert!(status.contains("Next Sync: 2026-01-02T00:00:00Z\\nunsafe"));
+    assert!(!status.contains("Matched Asset:"));
+
+    let full = identity.cli_arguments(&["status", "--full"]);
+    let full = tokio::task::spawn_blocking(move || run_cli(&full))
+        .await
+        .expect("full status task must not panic");
+    assert!(full.status.success());
+    let full = String::from_utf8(full.stdout).expect("human full status UTF-8");
+    assert!(full.contains("Matched Asset: Laptop (ID 42, serial SERIAL, asset tag <none>)"));
+    assert!(full.find("  MON-A:").expect("MON-A") < full.find("  MON-B:").expect("MON-B"));
+    assert!(full.contains("MON-A: asset 7, checked out true, absent since 2026-01-03"));
+
+    server.shutdown().await;
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+#[tokio::test]
+async fn actual_binary_empty_full_status_uses_explicit_placeholders() {
+    let identity = test_identity();
+    let fsm = spotter_svc::fsm::spawn(1, |_| async {
+        spotter_core::ipc::IpcResponse::StatusFull {
+            state: String::from("Idle"),
+            last_sync: None,
+            next_sync: None,
+            snipeit_url: String::new(),
+            matched_asset: None,
+            monitors: Vec::new(),
+        }
+    })
+    .expect("test FSM must start");
+    let server = ServerGuard::spawn(fsm, identity.pipe_endpoint.clone());
+    wait_for_pipe(&identity.pipe_endpoint).await;
+
+    let arguments = identity.cli_arguments(&["status", "--full"]);
+    let output = tokio::task::spawn_blocking(move || run_cli(&arguments))
+        .await
+        .expect("empty full status task must not panic");
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("empty full status UTF-8");
+    assert!(stdout.contains("Snipe-IT Instance: <none>"));
+    assert!(stdout.contains("Last Sync: <none>"));
+    assert!(stdout.contains("Next Sync: <none>"));
+    assert!(stdout.contains("Matched Asset: <none>"));
+    assert!(stdout.contains("Monitors:\n  <none>"));
+
+    server.shutdown().await;
+}
+
+#[cfg(all(windows, feature = "test-support"))]
+#[test]
+fn actual_binary_rejects_secret_and_unknown_selectors_before_transport() {
+    let identity = test_identity();
+    for selector in [
+        "snipeit.api_token_encrypted",
+        "logging.level\\u{1b}[31m-arbitrary-input",
+    ] {
+        let arguments = identity.cli_arguments(&["config", "get", selector]);
+        let output = run_cli(arguments.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).expect("selector error UTF-8");
+        assert!(stderr.starts_with("error: "));
+        assert!(!stderr.contains(selector));
+        if selector == "snipeit.api_token_encrypted" {
+            assert_eq!(
+                stderr,
+                "error: use the set-token command to update the API token\n"
+            );
+        } else {
+            assert_eq!(stderr, "error: unknown configuration field\n");
+        }
+    }
+}
+
+#[cfg(all(windows, feature = "test-support"))]
 #[test]
 fn actual_binary_unbound_endpoint_is_deterministically_unavailable() {
     let identity = test_identity();

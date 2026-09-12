@@ -1,0 +1,10 @@
+[package]
+name = "fixture-unlisted-duplicate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winnow-old = { package = "winnow", version = "=0.7.15" }
+winnow-new = { package = "winnow", version = "=1.0.4" }
+
+[workspace]

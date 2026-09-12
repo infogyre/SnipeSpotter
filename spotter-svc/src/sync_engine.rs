@@ -1662,7 +1662,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let mut client = crate::snipeit_client::SnipeItClient::new(
+        let mut client = crate::snipeit_client::SnipeItClient::new_loopback_http_for_test(
             server.uri(),
             SecretString::from(String::from("token")),
         )?;
@@ -1691,7 +1691,7 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let mut client = crate::snipeit_client::SnipeItClient::new(
+        let mut client = crate::snipeit_client::SnipeItClient::new_loopback_http_for_test(
             server.uri(),
             SecretString::from(String::from("token")),
         )?;

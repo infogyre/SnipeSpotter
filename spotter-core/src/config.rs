@@ -140,6 +140,74 @@ pub enum SettingsValidationError {
 ///
 /// # Errors
 /// Returns a fixed, value-free category for the first invalid setting.
+/// Validate a supplied Snipe-IT endpoint without contacting it.
+///
+/// The endpoint must be an HTTPS URL with a valid authority, no credentials, query, or fragment.
+/// Empty input is accepted by this field-level helper so staged installer settings remain valid.
+///
+/// # Errors
+///
+/// Returns [`SettingsValidationError::SnipeItUrl`] when the supplied endpoint violates the policy.
+pub fn validate_snipeit_url(value: &str) -> Result<(), SettingsValidationError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(());
+    }
+    let Some((scheme, remainder)) = value.split_once("://") else {
+        return Err(SettingsValidationError::SnipeItUrl);
+    };
+    if scheme != "https"
+        || remainder.is_empty()
+        || remainder
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(SettingsValidationError::SnipeItUrl);
+    }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty() || remainder[authority_end..].contains(['?', '#']) {
+        return Err(SettingsValidationError::SnipeItUrl);
+    }
+    if authority.contains('@') {
+        return Err(SettingsValidationError::SnipeItUrl);
+    }
+    let host_and_port = if let Some(rest) = authority.strip_prefix('[') {
+        let Some(closing_bracket) = rest.find(']') else {
+            return Err(SettingsValidationError::SnipeItUrl);
+        };
+        let host = &rest[..closing_bracket];
+        if host.parse::<std::net::Ipv6Addr>().is_err() || host.is_empty() {
+            return Err(SettingsValidationError::SnipeItUrl);
+        }
+        let suffix = &rest[closing_bracket + 1..];
+        if !suffix.is_empty() && !suffix.strip_prefix(':').is_some_and(is_valid_port) {
+            return Err(SettingsValidationError::SnipeItUrl);
+        }
+        return Ok(());
+    } else {
+        authority
+    };
+    if let Some((host, port)) = host_and_port.rsplit_once(':') {
+        if host.is_empty() || host.contains(':') || !is_valid_port(port) {
+            return Err(SettingsValidationError::SnipeItUrl);
+        }
+    } else if host_and_port.contains(':') {
+        return Err(SettingsValidationError::SnipeItUrl);
+    }
+    if host_and_port.starts_with(':') || host_and_port.ends_with(':') {
+        return Err(SettingsValidationError::SnipeItUrl);
+    }
+    Ok(())
+}
+
+/// Validates loaded settings, rejecting non-HTTPS endpoints and incomplete
+/// identity fields.
+///
+/// # Errors
+///
+/// Returns [`SettingsValidationError`] when the Snipe-IT URL is not a valid
+/// HTTPS endpoint or identity fields are inconsistent with activation state.
 pub fn validate_settings(settings: &Settings) -> Result<(), SettingsValidationError> {
     let url = settings.snipeit.url.trim();
     let token_is_blank = settings.snipeit.api_token_encrypted.is_empty();
@@ -151,18 +219,14 @@ pub fn validate_settings(settings: &Settings) -> Result<(), SettingsValidationEr
         && settings.snipeit.checkout_status_id != 0
         && settings.snipeit.checkin_status_id != 0;
     if identity_is_complete {
-        if !is_http_url(url) {
-            return Err(SettingsValidationError::SnipeItUrl);
-        }
+        validate_snipeit_url(url)?;
     } else if !identity_is_blank && config_status(settings).is_empty() {
         // An activation candidate (no missing required settings) can no longer be
         // partial; this branch is unreachable by construction but stays as a
         // defense-in-depth guard for future field additions.
         return Err(SettingsValidationError::SnipeItPartialIdentity);
     }
-    if !url.is_empty() && !is_http_url(url) {
-        return Err(SettingsValidationError::SnipeItUrl);
-    }
+    validate_snipeit_url(url)?;
     if !(1..=168).contains(&settings.polling.interval_hours) {
         return Err(SettingsValidationError::PollingInterval);
     }
@@ -182,42 +246,6 @@ pub fn validate_settings(settings: &Settings) -> Result<(), SettingsValidationEr
         return Err(SettingsValidationError::CheckinThreshold);
     }
     Ok(())
-}
-
-fn is_http_url(value: &str) -> bool {
-    let Some((scheme, remainder)) = value.split_once("://") else {
-        return false;
-    };
-    if !matches!(scheme, "http" | "https")
-        || remainder.is_empty()
-        || remainder
-            .chars()
-            .any(|character| character.is_control() || character.is_whitespace())
-    {
-        return false;
-    }
-    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-    let authority = &remainder[..authority_end];
-    let host_and_port = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    if host_and_port.is_empty() {
-        return false;
-    }
-    if let Some(host_and_port) = host_and_port.strip_prefix('[') {
-        let Some(closing_bracket) = host_and_port.find(']') else {
-            return false;
-        };
-        let port = &host_and_port[closing_bracket + 1..];
-        if !port.is_empty() && !port.strip_prefix(':').is_some_and(is_valid_port) {
-            return false;
-        }
-    } else if let Some((host, port)) = host_and_port.rsplit_once(':') {
-        if host.is_empty() || !is_valid_port(port) || host.contains(':') {
-            return false;
-        }
-    }
-    true
 }
 
 fn is_valid_port(port: &str) -> bool {
@@ -497,6 +525,11 @@ interval_hours = 12
             "https://host:0",
             "https://host:65536",
             "https://host:99999999999",
+            "https://user:password@host.example",
+            "https://host.example/path?query=secret",
+            "https://host.example/path#fragment",
+            "https://[not-an-ipv6-address]",
+            "https://host:443:444",
             "ftp://snipe-it.example.com",
         ] {
             let mut settings = complete_settings();

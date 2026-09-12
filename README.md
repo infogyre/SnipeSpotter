@@ -9,7 +9,8 @@ SnipeSpotter synchronizes Windows system and monitor inventory with an existing 
 - **SMBIOS discovery**: Reads Type 1 (System Information), Type 2 (Baseboard), and Type 3 (System Enclosure) tables via `GetSystemFirmwareTable`.
 - **WMI monitor discovery**: Queries `WmiMonitorID` in `root\wmi` for connected monitor manufacturer codes, product codes, serials, and manufacture dates.
 - **DPAPI token protection**: API tokens are encrypted with machine-scope DPAPI by the LocalSystem service. Plaintext never persists to disk.
-- **Named-pipe IPC**: The CLI communicates with the service over a named pipe restricted to SYSTEM and built-in Administrators via a DACL.
+- **HTTPS-only Snipe-IT access**: Every production URL entry point enforces HTTPS with OS trust-store validation before any network I/O; no insecure opt-out exists.
+- **Named-pipe IPC**: The CLI communicates with the service over a named pipe restricted to SYSTEM and built-in Administrators via a DACL, with at most 16 concurrent sessions and cooperative shutdown.
 - **Operation journaling**: Prepared operations are durably journaled before remote execution. Recovery reconciles server state before retrying uncertain mutations.
 - **Signed state**: Service state is HMAC-SHA256 signed with constant-time verification to detect tampering.
 - **WiX 6 MSI installer**: Installs binaries, PDBs, and CycloneDX SBOMs; registers the service as automatic LocalSystem without starting it; adds `bin\` to system PATH; creates ProgramData with restricted ACLs.

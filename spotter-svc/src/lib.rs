@@ -13,8 +13,30 @@ pub mod operation_journal;
 #[cfg(windows)]
 pub mod owner_ports;
 pub mod ports;
+pub(crate) mod scheduler;
 #[cfg(windows)]
 pub mod service;
+pub(crate) mod status;
+#[cfg(any(windows, feature = "test-support"))]
+pub mod status_publisher;
+
+/// Test-support-only: attach a status publisher to a handle so status
+/// commands read the snapshot path; also publishes one Idle snapshot so
+/// responses carry committed data.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn status_publisher_for_tests(handle: &fsm::FsmHandle) -> status_publisher::StatusPublisher {
+    let publisher = status_publisher::StatusPublisher::new(handle);
+    publisher.publish(
+        "Idle",
+        "",
+        false,
+        &spotter_core::state::ServiceState::default(),
+    );
+    publisher
+}
+#[cfg(test)]
+pub(crate) mod tls_test_fixture;
 
 #[cfg(all(windows, feature = "test-support"))]
 /// Test-only construction of the production command owner.

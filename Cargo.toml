@@ -19,28 +19,30 @@ authors = ["Jake Wimmer"]
 
 [workspace.dependencies]
 anyhow = "=1.0.104"
-base64 = "=0.22.1"
-clap = { version = "=4.5.37", features = ["derive"] }
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.145"
-thiserror = "=2.0.12"
-chrono = { version = "=0.4.41", features = ["serde", "clock"] }
-embed-resource = "=3.0.5"
-hmac = "=0.12.1"
-sha2 = "=0.10.9"
+base64 = "=0.23.1"
+clap = { version = "=4.6.6", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "=2.0.20"
+chrono = { version = "=0.4.45", features = ["serde", "clock"] }
+embed-resource = "=3.0.11"
+hmac = "=0.13.0"
+sha2 = "=0.11.0"
 subtle = "=2.6.1"
-toml = "=0.8.23"
-proptest = "=1.6.0"
-getrandom = "=0.3.3"
-reqwest = { version = "=0.12.15", default-features = false, features = ["json"] }
+toml = "=1.1.5"
+proptest = "=1.11.0"
+getrandom = "=0.4.3"
+reqwest = { version = "=0.13.4", default-features = false, features = ["json", "native-tls"] }
 rpassword = "=7.5.4"
 secrecy = "=0.10.3"
-tempfile = "=3.20.0"
-tokio = { version = "=1.44.2", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "net"] }
+tempfile = "=3.27.0"
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs", "io-util", "net"] }
 tracing = "=0.1.44"
-tracing-appender = "=0.2.3"
+tracing-appender = "=0.2.5"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
-wiremock = "=0.6.3"
+tokio-util = { version = "=0.7.18", default-features = false, features = ["rt"] }
+rustls-pki-types = "=1.15.1"
+wiremock = "=0.6.5"
 wmi = "=0.18.4"
 windows = { version = "=0.62.2", features = [
     "Foundation",
@@ -59,7 +61,7 @@ windows = { version = "=0.62.2", features = [
     "Win32_System_Threading",
     "Win32_System_Services",
 ] }
-windows-service = "=0.8.0"
+windows-service = "=0.8.1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

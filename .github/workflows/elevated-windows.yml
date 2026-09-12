@@ -50,17 +50,42 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Install and assert Rust toolchain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msvc
+          if ((rustc --version) -notmatch '^rustc 1\.98\.1 ') { throw "unexpected rustc version: $(rustc --version)" }
+      - name: Validate workflow inputs
+        id: validate_inputs
+        shell: pwsh
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+          LOG_ARTIFACT_NAME: ${{ inputs.log_artifact_name }}
+          RUN_IDENTITY: ${{ inputs.run_identity }}
+          MSI_NAME: ${{ inputs.msi_name }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/TestSupport/WorkflowInputs.psm1') -Force
+          $validated = Get-WorkflowInputContract -ArtifactName $env:ARTIFACT_NAME -LogArtifactName $env:LOG_ARTIFACT_NAME -RunIdentity $env:RUN_IDENTITY -MsiName $env:MSI_NAME
+          @(
+            "artifact_name=$($validated.artifact_name)"
+            "log_artifact_name=$($validated.log_artifact_name)"
+            "run_identity=$($validated.run_identity)"
+            "msi_name=$($validated.msi_name)"
+          ) | Set-Content -LiteralPath $env:GITHUB_OUTPUT
       - name: Download packaged MSI
         if: ${{ !inputs.source_artifact }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ${{ inputs.artifact_name }}
+          name: ${{ steps.validate_inputs.outputs.artifact_name }}
           path: packaged
       - name: Build source MSI
         if: ${{ inputs.source_artifact }}
         shell: pwsh
         env:
-          RUN_IDENTITY: ${{ inputs.run_identity }}
+          RUN_IDENTITY: ${{ steps.validate_inputs.outputs.run_identity }}
         run: |
           $ErrorActionPreference = 'Stop'
           cargo build -p spotter-svc -p spotter-cli --release --locked --target x86_64-pc-windows-msvc
@@ -70,7 +95,8 @@ jobs:
           Copy-Item target/x86_64-pc-windows-msvc/release/spotter-cli.exe $stage
           Copy-Item target/x86_64-pc-windows-msvc/release/spotter_svc.pdb $stage
           Copy-Item target/x86_64-pc-windows-msvc/release/spotter_cli.pdb $stage
-          cargo install cargo-cyclonedx --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          if ((cargo cyclonedx --version) -notmatch 'cargo(-cyclonedx)?-cyclonedx 0\.5\.9$') { throw "unexpected cargo-cyclonedx version: $(cargo cyclonedx --version)" }
           cargo cyclonedx --manifest-path spotter-svc/Cargo.toml --format json
           cargo cyclonedx --manifest-path spotter-cli/Cargo.toml --format json
           Move-Item spotter-svc/spotter-svc.cdx.json (Join-Path $stage 'sbom/spotter-svc.cdx.json')
@@ -91,6 +117,7 @@ jobs:
             throw 'source-artifact stage inventory differs from the closed expected set'
           }
           dotnet tool install --global wix --version 6.0.0
+          if ((wix --version) -notmatch '^6\.0\.0') { throw "unexpected WiX version: $(wix --version)" }
           Remove-Item -LiteralPath installer/bin, installer/obj -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force packaged | Out-Null
           $msi = Join-Path (Resolve-Path -LiteralPath packaged).Path "SnipeSpotter-$env:RUN_IDENTITY-x64.msi"
@@ -107,24 +134,23 @@ jobs:
         id: validate
         shell: pwsh
         env:
-          MSI_NAME: ${{ inputs.msi_name }}
-          RUN_IDENTITY: ${{ inputs.run_identity }}
+          MSI_NAME: ${{ steps.validate_inputs.outputs.msi_name }}
+          RUN_IDENTITY: ${{ steps.validate_inputs.outputs.run_identity }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $resolvedName = $env:MSI_NAME
-          if ([string]::IsNullOrWhiteSpace($resolvedName)) {
-            $resolvedName = (Get-ChildItem -LiteralPath packaged -Filter '*.msi' -File | Select-Object -First 1).Name
-          }
-          $msiPath = Join-Path (Get-Location) (Join-Path 'packaged' $resolvedName)
-          if (-not (Test-Path -LiteralPath $msiPath -PathType Leaf)) {
-            throw "packaged MSI was not found: $msiPath"
-          }
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'scripts/TestSupport/WorkflowPaths.psm1') -Force
+          # Producer-consumer contract: exactly one MSI under packaged must
+          # exist here and must be the validated file.
+          $packagedMsis = @(Get-ChildItem -LiteralPath packaged -Filter '*.msi' -File)
+          if ($packagedMsis.Count -ne 1) { throw 'packaged must contain exactly one MSI for validation' }
+          $msiPath = Resolve-ValidatedMsiPath -Root (Join-Path (Get-Location) 'packaged') -RequestedName $env:MSI_NAME
+          if ($packagedMsis[0].FullName -ne $msiPath) { throw 'packaged MSI does not match the validated name' }
           ./scripts/test-msi-lifecycle.ps1 -MsiPath $msiPath
       - name: Stage direct SCM service executable
         shell: pwsh
         env:
           SOURCE_ARTIFACT: ${{ inputs.source_artifact }}
-          RUN_IDENTITY: ${{ inputs.run_identity }}
+          RUN_IDENTITY: ${{ steps.validate_inputs.outputs.run_identity }}
         run: |
           $ErrorActionPreference = 'Stop'
           $packaged = (Resolve-Path -LiteralPath packaged).Path
@@ -164,7 +190,7 @@ jobs:
         id: direct_scm
         shell: pwsh
         env:
-          RUN_IDENTITY: ${{ inputs.run_identity }}
+          RUN_IDENTITY: ${{ steps.validate_inputs.outputs.run_identity }}
         run: |
           $ErrorActionPreference = 'Stop'
           $cliPath = Join-Path (Resolve-Path -LiteralPath packaged).Path 'spotter-cli-test-support.exe'
@@ -172,7 +198,7 @@ jobs:
           $directDataRoot = Join-Path $env:RUNNER_TEMP "snipespotter-direct-$env:RUN_IDENTITY-data"
           ./scripts/test-direct-scm-lifecycle.ps1 -CliPath $cliPath -ServicePath $servicePath -RunIdentity $env:RUN_IDENTITY -DataRoot $directDataRoot -LogDirectory (Join-Path $env:RUNNER_TEMP 'snipespotter-msi-logs')
       - name: Capture bounded lifecycle diagnostics
-        if: always()
+        if: ${{ always() && steps.validate_inputs.outcome == 'success' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Continue'
@@ -219,9 +245,9 @@ jobs:
           $result = if ($msiPassed -and $directScmPassed) { 'success' } else { 'failure' }
           "lifecycle_result=$result" | Set-Content -LiteralPath $env:GITHUB_OUTPUT
       - name: Upload MSI lifecycle logs
-        if: always()
+        if: ${{ always() && steps.validate_inputs.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ${{ inputs.log_artifact_name }}
+          name: ${{ steps.validate_inputs.outputs.log_artifact_name }}
           path: ${{ runner.temp }}/snipespotter-msi-logs/*
           if-no-files-found: warn

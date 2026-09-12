@@ -70,6 +70,14 @@ The separate reusable elevated workflow contains the `lifecycle` job. It is invo
 
 All third-party GitHub Actions are pinned to full commit SHAs with version comments. Never replace a SHA with a floating tag. The `paths-filter` action is pinned to `v3.0.4` and the `attest-build-provenance` action to `v2`.
 
+### Toolchain and tool pins
+
+`rust-toolchain.toml` pins the CI/developer toolchain to exact version 1.98.1 (minimal profile plus rustfmt and clippy). The product MSRV remains 1.85 and is checked separately with a locked 1.85.0 core build/test lane. Every workflow-installed tool is pinned exactly and the executed version is asserted, not just the install string: cargo-deny 0.20.2, cargo-llvm-cov 0.9.1, cargo-cyclonedx 0.5.9, cargo-mutants 27.1.0, and PSScriptAnalyzer 1.25.0 (checked via `RequiredVersion` even when another version is preinstalled). WiX/SDK/.NET extension versions stay aligned at 6.0.0 and the elevated workflow asserts the executed `wix --version`. A Python workflow contract (`scripts/test-workflow-contract.py`) fails any workflow that introduces unpinned external actions, unpinned install commands, or drift from the toolchain pin; mutating a pin in the contract's fixture input fails the test.
+
+### Workflow input validation
+
+`scripts/TestSupport/WorkflowInputs.psm1` validates elevated-workflow inputs (run identity, MSI name, artifact and log artifact names) after checkout and before any input-derived path creation, artifact-download selection, or MSI execution. Exactly four validated outputs (`artifact_name`, `log_artifact_name`, `run_identity`, `msi_name`) flow through `GITHUB_OUTPUT`; downstream download/upload name fields consume only these validated outputs. Inputs are always env values, never direct script interpolation. Invalid values are rejected — never normalized — and always-run uploads are gated on successful validation. The executable table-driven tests (`scripts/test-workflow-inputs.ps1`) cover traversal, reserved device names (including multi-extension stems), ADS, control characters, overlong names, and missing/ambiguous MSI discovery, asserting rejected cases create no staging path and never invoke the MSI executor.
+
 ### Workflow security
 
 - `persist-credentials: false` is set on read-only checkouts.

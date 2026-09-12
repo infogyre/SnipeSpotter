@@ -12,17 +12,60 @@ use std::{
 
 use anyhow::{Result, bail};
 use spotter_core::ipc::{IpcResponse, ServiceCommand};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
+
+use crate::scheduler::ScheduleInput;
+use crate::status::{PublicStatusSnapshot, ScheduleSnapshot, project_status};
 
 pub struct FsmRequest {
     pub command: ServiceCommand,
     response: oneshot::Sender<IpcResponse>,
+    sync_generation: Option<u64>,
 }
 
 #[derive(Clone)]
 pub struct FsmHandle {
     sender: mpsc::Sender<FsmRequest>,
     sync_pending: Arc<AtomicBool>,
+    next_sync_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// `Some(generation)` while a sync is claimed/pending; the accepted
+    /// caller stores its generation under the same lock that publishes the
+    /// claim, so coalesced callers never observe a torn state.
+    pending_generation: Arc<std::sync::Mutex<Option<u64>>>,
+    completed_sync_generation: watch::Sender<u64>,
+    status_receiver: Option<watch::Receiver<PublicStatusSnapshot>>,
+    schedule_receiver: Option<watch::Receiver<ScheduleSnapshot>>,
+    schedule_sender: Option<watch::Sender<ScheduleSnapshot>>,
+    attached_status_sender: Arc<std::sync::Mutex<Option<watch::Sender<PublicStatusSnapshot>>>>,
+    #[cfg_attr(not(any(windows, feature = "test-support")), expect(dead_code))]
+    attached_schedule_sender: Arc<std::sync::Mutex<Option<watch::Sender<ScheduleInput>>>>,
+}
+
+/// Clears the pending-generation slot when dropped, unless disarmed after a
+/// durable submit outcome (the FSM loop owns the claim from then on).
+struct ClaimGuard {
+    slot: Arc<std::sync::Mutex<Option<u64>>>,
+    disarmed: bool,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = None;
+        }
+    }
+}
+
+/// Result of accepting or coalescing a synchronization request.
+#[derive(Debug)]
+pub(crate) struct SyncEnqueue {
+    pub(crate) response: oneshot::Receiver<IpcResponse>,
+    pub(crate) target_generation: u64,
+    #[allow(dead_code, reason = "read on Windows native lane and by tests")]
+    pub(crate) coalesced: bool,
 }
 
 impl FsmHandle {
@@ -31,10 +74,53 @@ impl FsmHandle {
     /// # Errors
     /// Returns an error when the service loop has stopped or the response is cancelled.
     pub async fn request(&self, command: ServiceCommand) -> Result<IpcResponse> {
+        if matches!(
+            command,
+            ServiceCommand::GetStatus | ServiceCommand::GetStatusFull
+        ) {
+            return self
+                .request_status(command == ServiceCommand::GetStatusFull)
+                .await;
+        }
         self.enqueue(command)
             .await?
             .await
             .map_err(|_| anyhow::anyhow!("service command response was cancelled"))
+    }
+
+    async fn request_status(&self, full: bool) -> Result<IpcResponse> {
+        // Prefer an attached publication channel (service startup), falling
+        // back to the handle's snapshot receiver, then to the serialized
+        // queue for plain spawns without a publisher.
+        let attached = self
+            .attached_status_sender
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(watch::Sender::subscribe));
+        let status_receiver = match (self.status_receiver.as_ref(), attached) {
+            (_, Some(receiver)) => receiver,
+            (Some(receiver), _) => receiver.clone(),
+            (None, None) => {
+                return self
+                    .enqueue(if full {
+                        ServiceCommand::GetStatusFull
+                    } else {
+                        ServiceCommand::GetStatus
+                    })
+                    .await?
+                    .await
+                    .map_err(|_| anyhow::anyhow!("service command response was cancelled"));
+            }
+        };
+        let status = status_receiver.borrow().clone();
+        let schedule = match self.schedule_receiver.as_ref() {
+            Some(receiver) => receiver.borrow().clone(),
+            None => ScheduleSnapshot {
+                config_generation: status.config_generation,
+                next_sync: None,
+            },
+        };
+        Ok(project_status(&status, &schedule, full))
     }
 
     /// Enqueue one command and return its response receiver before waiting for completion.
@@ -48,32 +134,132 @@ impl FsmHandle {
         &self,
         command: ServiceCommand,
     ) -> Result<oneshot::Receiver<IpcResponse>> {
-        let is_sync = command == ServiceCommand::TriggerSync;
-        if is_sync
-            && self
-                .sync_pending
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            let (response, receiver) = oneshot::channel();
-            let _ = response.send(IpcResponse::Ok {
-                message: String::from("sync already queued"),
-            });
-            return Ok(receiver);
-        }
-        let (response, receiver) = oneshot::channel();
-        if self
-            .sender
-            .send(FsmRequest { command, response })
+        Ok(self.enqueue_with_generation(command).await?.response)
+    }
+
+    pub(crate) async fn enqueue_sync(&self) -> Result<SyncEnqueue> {
+        self.enqueue_with_generation(ServiceCommand::TriggerSync)
             .await
-            .is_err()
-        {
+    }
+
+    async fn enqueue_with_generation(&self, command: ServiceCommand) -> Result<SyncEnqueue> {
+        let is_sync = command == ServiceCommand::TriggerSync;
+        let mut claim_guard: Option<ClaimGuard> = None;
+        let target_generation = if is_sync {
+            // The claim lock orders allocation: a caller allocates only while
+            // holding the slot mutex, so generations are assigned in claim
+            // order — a paused caller cannot claim a stale lower generation
+            // after a later sync already completed, and coalesced callers
+            // always read the in-flight generation.
+            let mut claim = self
+                .pending_generation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sync generation lock poisoned"))?;
+            if let Some(pending) = *claim {
+                drop(claim);
+                let (response, receiver) = oneshot::channel();
+                let _ = response.send(IpcResponse::Ok {
+                    message: String::from("sync already queued"),
+                });
+                return Ok(SyncEnqueue {
+                    response: receiver,
+                    target_generation: pending,
+                    coalesced: true,
+                });
+            }
+            let allocated = self.next_sync_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            *claim = Some(allocated);
+            // Cancellation safety: if this future is dropped while the
+            // bounded send is still waiting, the claim guard clears the slot
+            // so later syncs cannot coalesce onto work that was never
+            // submitted.
+            claim_guard = Some(ClaimGuard {
+                slot: std::sync::Arc::clone(&self.pending_generation),
+                disarmed: false,
+            });
+            allocated
+        } else {
+            0
+        };
+        let (response, receiver) = oneshot::channel();
+        let send_outcome = self
+            .sender
+            .send(FsmRequest {
+                command,
+                response,
+                sync_generation: is_sync.then_some(target_generation),
+            })
+            .await;
+        if send_outcome.is_ok() {
+            // Durable submit (accepted into the queue): the FSM loop owns the
+            // claim lifecycle now; a later Drop must not clear the slot.
+            if let Some(guard) = claim_guard.as_mut() {
+                guard.disarmed = true;
+            }
+        }
+        if send_outcome.is_err() {
+            // Submit failed: dropping the armed guard clears the claim so
+            // later syncs start fresh.
+            if let Some(guard) = claim_guard.take() {
+                drop(guard);
+            }
             if is_sync {
                 self.sync_pending.store(false, Ordering::Release);
             }
             return Err(anyhow::anyhow!("service command loop is unavailable"));
         }
-        Ok(receiver)
+        Ok(SyncEnqueue {
+            response: receiver,
+            target_generation,
+            coalesced: false,
+        })
+    }
+
+    pub(crate) fn completed_sync_generation(&self) -> watch::Receiver<u64> {
+        self.completed_sync_generation.subscribe()
+    }
+
+    /// Registers a status publication channel owned by the service startup.
+    #[cfg_attr(not(any(windows, feature = "test-support")), expect(dead_code))]
+    pub(crate) fn attach_status_publication(&self, sender: watch::Sender<PublicStatusSnapshot>) {
+        self.attached_status_sender
+            .lock()
+            .map(|mut guard| *guard = Some(sender))
+            .map_err(|_| anyhow::anyhow!("status publication lock poisoned"))
+            .ok();
+    }
+
+    /// Registers a scheduler-input channel owned by the service startup.
+    #[cfg_attr(not(any(windows, feature = "test-support")), expect(dead_code))]
+    pub(crate) fn attach_schedule_input(&self, sender: watch::Sender<ScheduleInput>) {
+        self.attached_schedule_sender
+            .lock()
+            .map(|mut guard| *guard = Some(sender))
+            .map_err(|_| anyhow::anyhow!("schedule input lock poisoned"))
+            .ok();
+    }
+
+    /// Publishes a scheduler-owned schedule projection for status readers.
+    pub(crate) fn publish_schedule_snapshot(&self, schedule: ScheduleSnapshot) {
+        if let Some(schedule_sender) = self.schedule_sender.as_ref() {
+            schedule_sender.send_replace(schedule);
+        }
+    }
+
+    pub(crate) async fn wait_for_sync_generation(
+        &self,
+        target_generation: u64,
+        mut completed: watch::Receiver<u64>,
+    ) -> Result<()> {
+        loop {
+            if *completed.borrow() >= target_generation {
+                return Ok(());
+            }
+            completed
+                .changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("sync completion channel is unavailable"))?;
+        }
     }
 }
 
@@ -81,7 +267,20 @@ impl FsmHandle {
 ///
 /// # Errors
 /// Returns an error when the requested channel capacity is zero.
-pub fn spawn<H, Fut>(capacity: usize, mut handler: H) -> Result<FsmHandle>
+pub fn spawn<H, Fut>(capacity: usize, handler: H) -> Result<FsmHandle>
+where
+    H: FnMut(ServiceCommand) -> Fut + Send + 'static,
+    Fut: Future<Output = IpcResponse> + Send + 'static,
+{
+    spawn_with_status(capacity, handler, None, None)
+}
+
+pub(crate) fn spawn_with_status<H, Fut>(
+    capacity: usize,
+    mut handler: H,
+    status_receiver: Option<watch::Receiver<PublicStatusSnapshot>>,
+    schedule_receiver: Option<watch::Receiver<ScheduleSnapshot>>,
+) -> Result<FsmHandle>
 where
     H: FnMut(ServiceCommand) -> Fut + Send + 'static,
     Fut: Future<Output = IpcResponse> + Send + 'static,
@@ -92,12 +291,30 @@ where
     let (sender, mut receiver) = mpsc::channel::<FsmRequest>(capacity);
     let sync_pending = Arc::new(AtomicBool::new(false));
     let loop_sync_pending = Arc::clone(&sync_pending);
+    let pending_generation: Arc<std::sync::Mutex<Option<u64>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let loop_pending_generation = std::sync::Arc::clone(&pending_generation);
+    let (completed_sync_generation, _) = watch::channel(0_u64);
+    let loop_completed_sync_generation = completed_sync_generation.clone();
+    let (schedule_sender, schedule_receiver_for_handle) = watch::channel(ScheduleSnapshot {
+        config_generation: 0,
+        next_sync: None,
+    });
     tokio::spawn(async move {
         while let Some(request) = receiver.recv().await {
             let is_sync = request.command == ServiceCommand::TriggerSync;
             let response = handler(request.command).await;
             if is_sync {
                 loop_sync_pending.store(false, Ordering::Release);
+                // The claim completes: clear the stored generation so the
+                // next accepted sync publishes fresh (a stale value would
+                // make later requests coalesce forever).
+                if let Ok(mut guard) = loop_pending_generation.lock() {
+                    *guard = None;
+                }
+                if let Some(generation) = request.sync_generation {
+                    loop_completed_sync_generation.send_replace(generation);
+                }
             }
             let _ = request.response.send(response);
         }
@@ -105,6 +322,14 @@ where
     Ok(FsmHandle {
         sender,
         sync_pending,
+        next_sync_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        pending_generation,
+        completed_sync_generation,
+        status_receiver,
+        schedule_receiver: schedule_receiver.or(Some(schedule_receiver_for_handle)),
+        schedule_sender: Some(schedule_sender),
+        attached_status_sender: Arc::new(std::sync::Mutex::new(None)),
+        attached_schedule_sender: Arc::new(std::sync::Mutex::new(None)),
     })
 }
 
@@ -141,6 +366,21 @@ mod tests {
         assert_eq!(values.len(), 4);
         assert!(values[1].starts_with("commit:"));
         assert!(values[2].starts_with("start:"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_completion_before_wait_is_not_lost() -> Result<()> {
+        let handle = spawn(2, |_| async {
+            IpcResponse::Ok {
+                message: String::from("committed"),
+            }
+        })?;
+        let first = handle.enqueue_sync().await?;
+        let target = first.target_generation;
+        let completed = handle.completed_sync_generation();
+        let _ = first.response.await?;
+        handle.wait_for_sync_generation(target, completed).await?;
         Ok(())
     }
 
@@ -211,9 +451,18 @@ mod tests {
     async fn reports_unavailable_loop_when_sender_is_closed() -> Result<()> {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
+        let (completed_sync_generation, _) = watch::channel(0_u64);
         let handle = FsmHandle {
             sender,
             sync_pending: Arc::new(AtomicBool::new(false)),
+            next_sync_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending_generation: Arc::new(std::sync::Mutex::new(None)),
+            completed_sync_generation,
+            status_receiver: None,
+            schedule_receiver: None,
+            schedule_sender: None,
+            attached_status_sender: Arc::new(std::sync::Mutex::new(None)),
+            attached_schedule_sender: Arc::new(std::sync::Mutex::new(None)),
         };
 
         let error = handle

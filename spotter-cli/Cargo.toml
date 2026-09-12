@@ -24,16 +24,16 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 rpassword = { workspace = true }
 serde_json = { workspace = true }
-spotter-core = { path = "../spotter-core" }
+spotter-core = { path = "../spotter-core", version = "=0.1.0" }
 
 [target.'cfg(windows)'.dependencies]
-spotter-win32 = { path = "../spotter-win32" }
+spotter-win32 = { path = "../spotter-win32", version = "=0.1.0" }
 windows = { workspace = true }
 windows-service = { workspace = true }
 
 [build-dependencies]
-spotter-build = { path = "../spotter-build" }
+spotter-build = { path = "../spotter-build", version = "=0.1.0" }
 
 [dev-dependencies]
-spotter-svc = { path = "../spotter-svc" }
+spotter-svc = { path = "../spotter-svc", version = "=0.1.0" }
 tokio = { workspace = true }

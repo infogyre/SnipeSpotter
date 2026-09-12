@@ -114,24 +114,155 @@ pub async fn run_named_pipe(fsm: FsmHandle) -> Result<()> {
     run_named_pipe_at(fsm, spotter_core::PIPE_NAME).await
 }
 
+/// Fixed bound on concurrently active pipe sessions; excess connections are
+/// accepted and promptly closed so saturation cannot queue unbounded tasks.
 #[cfg(windows)]
-/// Run the secured named-pipe accept loop on an explicit endpoint.
+pub const MAX_ACTIVE_PIPE_SESSIONS: usize = 16;
+
+/// Cooperative shutdown signal for the native accept loop.
+#[cfg(windows)]
+pub struct PipeServerGuard {
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(windows)]
+impl Default for PipeServerGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(windows)]
+impl PipeServerGuard {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
+    #[must_use]
+    pub fn subscribe(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown.clone()
+    }
+
+    /// Alias kept for test readability: yields an independent token handle.
+    #[must_use]
+    pub fn clone_token(&self) -> Self {
+        Self {
+            shutdown: self.shutdown.clone(),
+        }
+    }
+}
+
+/// Run the secured named-pipe accept loop on an explicit endpoint with
+/// bounded concurrent sessions and cooperative shutdown.
 ///
 /// The endpoint is intended for isolated integration tests. Production callers should use
 /// [`run_named_pipe`], which preserves the fixed product pipe identity.
 ///
 /// # Errors
-/// Returns an error when pipe creation or a client session fails.
+/// Returns an error when pipe creation fails or a client session fails.
+#[cfg(windows)]
 pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> Result<()> {
+    // Sequential compatibility loop for the CLI named-pipe tests: connect,
+    // serve inline, repeat. The production service uses
+    // [`run_named_pipe_bounded`], which adds bounded concurrency, excess
+    // handling, and cooperative shutdown.
     let pipe_name = pipe_name.into();
+    let shutdown = PipeServerGuard::new();
+    let session_token = shutdown.subscribe();
     loop {
+        if shutdown.shutdown.is_cancelled() {
+            return Ok(());
+        }
         let server = create_secured_server(&pipe_name)?;
-        server.connect().await?;
+        tokio::select! {
+            outcome = server.connect() => {
+                outcome.context("named-pipe client connect failed")?;
+            }
+            () = session_token.cancelled() => return Ok(()),
+        }
         if let Err(error) = serve_one(server, &fsm).await {
             tracing::warn!(%error, "IPC client session failed");
         }
     }
 }
+
+/// Run the bounded named-pipe accept loop with cooperative shutdown.
+///
+/// # Errors
+/// Returns an error when pipe creation fails or the shutdown drain exceeds
+/// its deadline.
+#[cfg(windows)]
+pub async fn run_named_pipe_bounded(
+    fsm: FsmHandle,
+    pipe_name: impl Into<String>,
+    session_token: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    use tokio::task::JoinSet;
+
+    let pipe_name = pipe_name.into();
+    let shutdown = session_token.clone();
+    let mut sessions: JoinSet<Result<()>> = JoinSet::new();
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        // Create the next listening instance promptly; never hold a session
+        // slot while awaiting an unaccepted connection.
+        if sessions.len() >= MAX_ACTIVE_PIPE_SESSIONS {
+            // Capacity full: reap completed sessions, then accept and promptly
+            // close any excess connection rather than queueing it. The connect
+            // wait stays interruptible by shutdown.
+            while sessions.try_join_next().is_some() {}
+            let server = create_secured_server(&pipe_name)?;
+            tokio::select! {
+                outcome = server.connect() => {
+                    outcome.context("named-pipe client connect failed")?;
+                }
+                () = shutdown.cancelled() => break,
+            }
+            drop(server);
+            continue;
+        }
+        let server = create_secured_server(&pipe_name)?;
+        tokio::select! {
+            outcome = server.connect() => {
+                outcome.context("named-pipe client connect failed")?;
+            }
+            () = shutdown.cancelled() => break,
+        }
+        let fsm = fsm.clone();
+        sessions.spawn(async move {
+            // Shutdown never cancels an in-flight session: sessions finish
+            // during the bounded drain window and only the deadline aborts
+            // leftovers. This ends response observation, not the owner.
+            serve_one(server, &fsm).await
+        });
+    }
+    // Cooperative shutdown: stop accepting, drain active sessions under a
+    // bounded deadline, then abort leftovers and observe joins with a fixed
+    // diagnostic. This ends response observation, never an FSM cancellation.
+    let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
+        while sessions.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        sessions.abort_all();
+        while sessions.join_next().await.is_some() {}
+        tracing::warn!("pipe shutdown drain deadline elapsed; remaining sessions aborted");
+    }
+    Ok(())
+}
+
+/// Fixed drain window for cooperative pipe shutdown before leftovers abort.
+#[cfg(windows)]
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(windows)]
 fn create_secured_server(

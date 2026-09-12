@@ -26,4 +26,4 @@ windows = { workspace = true, features = ["Win32_System_RemoteDesktop", "Win32_S
 windows-service = { workspace = true }
 
 [build-dependencies]
-spotter-build = { path = "../spotter-build" }
+spotter-build = { path = "../spotter-build", version = "=0.1.0" }

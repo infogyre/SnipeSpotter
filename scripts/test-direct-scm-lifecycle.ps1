@@ -855,6 +855,18 @@ function Write-DirectCliResultShapeDiagnostic {
     $resultIsArray = [bool]($Result -is [array])
     $records = if ($null -eq $Result) { $null } else { @($Result) }
     $resultCount = if ($null -eq $Result) { 0 } else { $records.Count }
+    # Bounded CLI output text per stage: the shape booleans alone do not
+    # explain failures like a rejected sync.
+    $textual = [ordered]@{
+        stage = $Stage
+        stdout_tail = if ($null -eq $Result) { '' } else { @($Result)[0].Stdout?.Substring([Math]::Max(0, (@($Result)[0].Stdout ?? '').Length - 512)) }
+        stderr_tail = if ($null -eq $Result) { '' } else { @($Result)[0].Stderr?.Substring([Math]::Max(0, (@($Result)[0].Stderr ?? '').Length - 512)) }
+    }
+    try {
+        Write-BoundedDiagnostic -Path (Join-Path $LogDirectory "direct-cli-text-$($Stage.ToLowerInvariant()).json") -Values $textual
+    } catch {
+        Write-Warning 'direct CLI output text diagnostic capture failed'
+    }
     $values = [ordered]@{
         stage = $Stage
         result_count = $resultCount
@@ -935,6 +947,8 @@ Assert-True ($null -eq $service) "refusing to mutate pre-existing unique service
 
 $tokenSentinel = "AC4-" + [Guid]::NewGuid().ToString('N')
 $fixture = $null
+$fixtureCaImported = $false
+[Security.Cryptography.X509Certificates.X509Certificate2]$fixtureCaIdentity = $null
 $primaryError = $null
 $cleanupError = $null
 try {
@@ -971,9 +985,28 @@ try {
 
     $fixture = Start-SnipeItLoopbackFixture -AuthorizationSentinel $tokenSentinel
     Wait-Condition -Description 'Snipe-IT loopback fixture readiness' -TimeoutSeconds $WaitTimeoutSeconds -PollIntervalSeconds $PollIntervalSeconds -Condition {
-        $fixture.State.Ready -and $fixture.Listener.IsListening
+        $fixture.State.Ready -and $fixture.Listener -and $fixture.Listener.Server.IsBound
     } | Out-Null
-    Assert-True $fixture.Prefix.StartsWith('http://127.0.0.1:') 'loopback fixture did not bind only to 127.0.0.1'
+    Assert-True $fixture.Prefix.StartsWith('https://localhost:') 'loopback TLS fixture did not advertise an https://localhost endpoint'
+    Assert-True ($null -ne $fixture.Listener) 'loopback TLS fixture listener missing'
+
+    # Trust only this run's fixture CA in LocalMachine Root so the real
+    # LocalSystem service validates the endpoint through normal Windows trust;
+    # removed in the cleanup block below. The identity is retained in memory
+    # because cleanup may run after the material files are deleted.
+    $fixtureCaImported = $false
+    [Security.Cryptography.X509Certificates.X509Certificate2]$fixtureCaIdentity = $null
+    try {
+        $fixtureCa = [Security.Cryptography.X509Certificates.X509Certificate2]::new($fixture.Material.CaCertPath)
+        $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'LocalMachine')
+        $rootStore.Open('ReadWrite')
+        $rootStore.Add($fixtureCa)
+        $rootStore.Close()
+        $fixtureCaIdentity = $fixtureCa
+        $fixtureCaImported = $true
+    } catch {
+        throw "failed to import the loopback fixture CA into LocalMachine Root: $_"
+    }
 
     foreach ($update in @(
         @('snipeit.url', $fixture.Prefix.TrimEnd('/')),
@@ -1018,6 +1051,7 @@ try {
     Assert-True (@($evidence.Requests | Where-Object { $_.accepted -and -not $_.authorized }).Count -eq 0) 'unauthorized request was accepted'
     Assert-True (@($evidence.Requests | Where-Object { $_.method_class -eq 'mutation' }).Count -eq 0) 'fixture observed a mutation request'
     Assert-True (@($evidence.Requests | Where-Object { $_.route -eq 'unexpected' }).Count -eq 0) 'fixture observed an unexpected route'
+    Assert-True $fixture.Prefix.StartsWith('https://localhost:') 'fixture endpoint must remain https://localhost after evidence collection'
     Assert-True (@($evidence.Requests | Where-Object { $_.route -eq 'hardware_byserial' -and $_.response_class -eq 'not_found' }).Count -gt 0) 'fixture did not serve a hardware not-found read'
     Assert-True (@($evidence.Requests | Where-Object { $_.route -in @('manufacturers', 'models') -and $_.response_class -eq 'rows_empty' }).Count -ge 2) 'fixture did not serve empty taxonomy reads'
 
@@ -1085,13 +1119,54 @@ try {
         service_name = $serviceName
         service_status = if ($null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)) { 'absent' } else { (Get-Service -Name $serviceName).Status.ToString() }
         data_root_exists = [bool](Test-Path -LiteralPath $DataRoot)
+        data_root_entries = if (Test-Path -LiteralPath $DataRoot) {
+            @(Get-ChildItem -LiteralPath $DataRoot -Recurse -Depth 2 -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName.Substring($DataRoot.Length) }) | Sort-Object
+        } else { @() }
     }
+    # Preserve the service's own tracing logs for root-cause analysis; the
+    # service writes under the per-run DataRoot.
+    try {
+        $serviceLogDir = Join-Path $DataRoot 'logs'
+        if (Test-Path -LiteralPath $serviceLogDir) {
+            $targetDir = Join-Path $LogDirectory 'service-logs'
+            New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+            Copy-Item -LiteralPath (Join-Path $serviceLogDir '*') -Destination $targetDir -Force
+        }
+    } catch { Write-BoundedDiagnostic -Path (Join-Path $LogDirectory 'service-log-copy-error.txt') -Values @{ error = $_.ToString() } }
 } finally {
     try {
         Invoke-FailureSafeCleanup -Actions @(
             {
+                # Trust-store residue guard FIRST: remove the exact imported
+                # CA from LocalMachine Root while its in-memory identity is
+                # still available (the fixture CA file may already be gone).
+                if ($fixtureCaImported -and $null -ne $fixtureCaIdentity) {
+                    try {
+                        $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new('Root', 'LocalMachine')
+                        $rootStore.Open('ReadWrite')
+                        $rootStore.Remove($fixtureCaIdentity)
+                        $rootStore.Close()
+                    } catch {
+                        throw 'fixture CA removal from LocalMachine Root failed'
+                    }
+                }
+            },
+            {
                 if ($null -ne $fixture) {
                     Stop-SnipeItLoopbackFixture -Fixture $fixture -TimeoutSeconds $WaitTimeoutSeconds
+                }
+            },
+            {
+                # TLS residue guard: only THIS run's tracked material must be
+                # gone; never sweep the shared temporary directory by prefix.
+                if ($null -ne $fixture) {
+                    foreach ($tracked in $fixture.Material.Paths) {
+                        if (Test-Path -LiteralPath $tracked) {
+                            Remove-Item -LiteralPath $tracked -Force
+                            throw 'loopback TLS fixture left tracked certificate material behind'
+                        }
+                    }
                 }
             },
             {

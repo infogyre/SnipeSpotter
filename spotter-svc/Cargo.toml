@@ -32,22 +32,29 @@ reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-spotter-core = { path = "../spotter-core" }
+spotter-core = { path = "../spotter-core", version = "=0.1.0" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+base64 = { workspace = true }
+tokio-util = { workspace = true }
+rustls-pki-types = "=1.15.1"
 toml = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-spotter-win32 = { path = "../spotter-win32" }
+spotter-win32 = { path = "../spotter-win32", version = "=0.1.0" }
 wmi = { workspace = true }
 windows = { workspace = true }
 windows-service = { workspace = true }
 
 [build-dependencies]
-spotter-build = { path = "../spotter-build" }
+spotter-build = { path = "../spotter-build", version = "=0.1.0" }
 
 [dev-dependencies]
+native-tls = "=0.2.18"
+tokio-native-tls = "=0.3.1"
+rcgen = { version = "=0.14.10", features = ["aws_lc_rs"] }
+tokio = { version = "=1.53.1", features = ["test-util"] }
 tempfile = { workspace = true }
 wiremock = { workspace = true }

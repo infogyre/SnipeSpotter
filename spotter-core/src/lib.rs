@@ -12,7 +12,7 @@ pub mod sync;
 pub use config::{
     BLANK_SETTINGS_TOML, CheckinPolicy, LoggingSettings, MonitorSettings, PollingSettings,
     Settings, SettingsValidationError, SnipeItSettings, config_status, poll_duration,
-    validate_settings,
+    validate_settings, validate_snipeit_url,
 };
 
 pub use identity::{
