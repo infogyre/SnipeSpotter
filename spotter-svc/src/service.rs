@@ -735,7 +735,7 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
             &mut persisted_state,
         ))?;
     }
-    let (polling_sender, polling_receiver) =
+    let (polling_sender, _polling_receiver) =
         tokio::sync::watch::channel(settings.polling.interval_hours);
     let configured = config_status(&settings).is_empty();
     let startup_url = settings.snipeit.url.clone();
