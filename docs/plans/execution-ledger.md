@@ -140,6 +140,28 @@ Fill with command, SHA, pass/fail/skip, CI link. Host is Linux; all native Windo
 | --- | --- | --- | --- |
 | (none yet) | | | |
 
+## Post-integration local verification (2026-09-12, HEAD 671204f)
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | PASS |
+| `cargo test -p spotter-core` | PASS (47) |
+| `cargo clippy -p spotter-core --all-targets -- -D warnings` | PASS |
+| `cargo check --workspace --all-targets` | PASS |
+| `cargo test -p spotter-svc --all-targets --features test-support --locked` | PASS (126) |
+| `cargo test -p spotter-cli --features test-support --locked` | PASS (20 lib + 7 binary_contract) |
+| `python3 scripts/test_docs_contracts.py` | PASS (2) |
+| `python3 scripts/test-msi-lifecycle-contract.py` | PASS |
+| `python3 scripts/test-support-contract.py` | PASS |
+| `python3 scripts/test-workflow-contract.py` | PASS (7) |
+| `python3 -m unittest discover -s scripts/hardware -p 'test_*.py'` | PASS (34) |
+| `python3 scripts/check-product-identity.py` | PASS |
+
+Remaining BLOCKED native/external boundaries (explicitly not passed): actual MSI build/install/
+upgrade/uninstall + file-table/installed-tree inspection and direct-SCM lifecycle (Windows runners);
+native IPC identity fixtures (lanes A); native hardware fixtures (lane C); `cargo clippy --workspace`
+and Windows workspace test runs; SPOTR-23 controlled dispatch; any push/PR/dispatch/Jira write.
+
 ## Integration log
 
 | Date | Integrated | Source commit | Base used | Notes |
@@ -159,4 +181,4 @@ Fill with command, SHA, pass/fail/skip, CI link. Host is Linux; all native Windo
 
 | Worktree | Branch | Disposition |
 | --- | --- | --- |
-| (none yet) | | |
+| `spotter.hardening-lane-d-msi-symbols` | `hardening/lane-d-msi-symbols` | Removed 2026-09-12 via `wt remove --foreground --no-delete-branch --no-hooks` (clean, integrated at merge `3ae0bf7`, tip `21938ea` verified ancestor of integration HEAD). Branch RETAINED — not merged to `main`; no force-delete used. |
