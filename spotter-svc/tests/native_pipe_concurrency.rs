@@ -179,9 +179,27 @@ async fn native_session_capacity_and_reaccept() -> Result<()> {
     // Reaccept: after the burst, a fresh client must still get service. The
     // roundtrip runs on the blocking pool: recv_timeout would otherwise block
     // this single-threaded test runtime and starve the server task.
+    // Reaccept: after the burst, a fresh client must still get service. While
+    // the loop is still inside the capacity-full branch it promptly closes
+    // this client as excess; retry until the slots free and the server
+    // accepts. Each attempt is timecapped on the blocking pool.
     let final_response = tokio::task::spawn_blocking({
         let endpoint = endpoint.clone();
-        move || bounded_roundtrip(&endpoint, &ServiceCommand::GetStatus)
+        move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match bounded_roundtrip(&endpoint, &ServiceCommand::GetStatus) {
+                    Ok(response) => return Ok(response),
+                    Err(error)
+                        if error.to_string().contains("server closed the session")
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
     })
     .await
     .expect("reaccept task joins")?;
