@@ -4,17 +4,26 @@
 
 //! Temporary Windows service host for the privacy-safe hardware experiment.
 
+#[cfg(any(test, all(windows, feature = "hardware-experiment")))]
+mod path_policy;
+
+#[cfg(all(windows, feature = "hardware-experiment"))]
+mod windows_path_policy;
+
 #[cfg(all(windows, feature = "hardware-experiment"))]
 mod windows_service_host {
     use std::{
         env,
         ffi::OsString,
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         process::{Command, Stdio},
         sync::mpsc,
         time::Duration,
     };
+
+    use super::{path_policy, windows_path_policy};
+    use windows_path_policy::{RetainedHandle, inspect_path};
 
     use serde::Deserialize;
     use windows::Win32::System::{
@@ -45,6 +54,21 @@ mod windows_service_host {
         key_path: PathBuf,
         output_path: PathBuf,
         pwsh_path: PathBuf,
+        staging_root: PathBuf,
+    }
+
+    struct LaunchBound {
+        collector: RetainedHandle,
+        key: RetainedHandle,
+        output_directory: RetainedHandle,
+        pwsh: RetainedHandle,
+        _service_executable: RetainedHandle,
+        _root: RetainedHandle,
+    }
+
+    struct RunningCollector {
+        process: std::process::Child,
+        _launch_bound: LaunchBound,
     }
 
     pub fn run() -> Result<(), String> {
@@ -73,6 +97,7 @@ mod windows_service_host {
         if config.service_name != service_name {
             return Err("service name does not match service configuration".to_owned());
         }
+        let launch_bound = validate_launch_inputs(&config)?;
 
         let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
         let status_handle =
@@ -93,9 +118,10 @@ mod windows_service_host {
         )?;
         set_status(status_handle, ServiceState::Running, 0, Duration::ZERO)?;
 
-        let mut collector = spawn_collector(&config)?;
+        let mut collector = spawn_collector(&config, launch_bound)?;
         let service_result = loop {
             if let Some(status) = collector
+                .process
                 .try_wait()
                 .map_err(|error| format!("failed to query hardware collector: {error}"))?
             {
@@ -107,14 +133,14 @@ mod windows_service_host {
             }
             match stop_receiver.recv_timeout(Duration::from_secs(1)) {
                 Ok(()) => {
-                    let _ = collector.kill();
-                    let _ = collector.wait();
+                    let _ = collector.process.kill();
+                    let _ = collector.process.wait();
                     break Err("hardware collector stopped by SCM".to_owned());
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = collector.kill();
-                    let _ = collector.wait();
+                    let _ = collector.process.kill();
+                    let _ = collector.process.wait();
                     break Err("hardware service control channel disconnected".to_owned());
                 }
             }
@@ -123,14 +149,62 @@ mod windows_service_host {
         service_result
     }
 
-    fn spawn_collector(config: &ServiceConfig) -> Result<std::process::Child, String> {
+    fn validate_launch_inputs(config: &ServiceConfig) -> Result<LaunchBound, String> {
+        let root = inspect_path(
+            &config.staging_root,
+            &config.staging_root,
+            path_policy::PathPurpose::StagingRoot,
+        )?;
+        let collector = inspect_path(
+            &config.staging_root,
+            &config.collector,
+            path_policy::PathPurpose::Collector,
+        )?;
+        let key = inspect_path(
+            &config.staging_root,
+            &config.key_path,
+            path_policy::PathPurpose::Key,
+        )?;
+        let output_directory_path = config
+            .output_path
+            .parent()
+            .ok_or_else(|| "output path has no protected parent directory".to_owned())?;
+        let output_directory = inspect_path(
+            &config.staging_root,
+            output_directory_path,
+            path_policy::PathPurpose::OutputDirectory,
+        )?;
+        let pwsh = inspect_path(
+            &config.staging_root,
+            &config.pwsh_path,
+            path_policy::PathPurpose::PowerShellHost,
+        )?;
+        let service_executable = inspect_path(
+            &config.staging_root,
+            &current_executable_path()?,
+            path_policy::PathPurpose::ServiceExecutable,
+        )?;
+        Ok(LaunchBound {
+            collector,
+            key,
+            output_directory,
+            pwsh,
+            _service_executable: service_executable,
+            _root: root,
+        })
+    }
+
+    fn spawn_collector(
+        config: &ServiceConfig,
+        launch_bound: LaunchBound,
+    ) -> Result<RunningCollector, String> {
         let session_id = current_session_id()?;
-        Command::new(&config.pwsh_path)
+        let child = Command::new(launch_bound.pwsh.final_path())
             .arg("-NoLogo")
             .arg("-NoProfile")
             .arg("-NonInteractive")
             .arg("-File")
-            .arg(&config.collector)
+            .arg(launch_bound.collector.final_path())
             .arg("-Image")
             .arg(&config.image)
             .arg("-ImageAlias")
@@ -142,22 +216,53 @@ mod windows_service_host {
             .arg("-SessionId")
             .arg(session_id.to_string())
             .arg("-HmacKeyPath")
-            .arg(&config.key_path)
+            .arg(launch_bound.key.final_path())
             .arg("-OutputPath")
-            .arg(&config.output_path)
+            .arg(
+                launch_bound
+                    .output_directory
+                    .final_path()
+                    .join(output_file_name(config)),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|error| format!("failed to launch hardware collector: {error}"))
+            .map_err(|error| format!("failed to launch hardware collector: {error}"))?;
+        Ok(RunningCollector {
+            process: child,
+            _launch_bound: launch_bound,
+        })
+    }
+
+    fn output_file_name(config: &ServiceConfig) -> String {
+        config.output_path.file_name().map_or_else(
+            || "hardware-report.json".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    }
+
+    fn current_executable_path() -> Result<PathBuf, String> {
+        env::current_exe().map_err(|error| format!("failed to resolve service executable: {error}"))
     }
 
     fn load_config(path: &str) -> Result<ServiceConfig, String> {
-        let bytes =
-            fs::read(path).map_err(|error| format!("failed to read service config: {error}"))?;
+        let config_path = Path::new(path);
+        let staging_root = config_path
+            .parent()
+            .ok_or_else(|| "service config has no protected parent directory".to_owned())?;
+        let _config_handle =
+            inspect_path(staging_root, config_path, path_policy::PathPurpose::Config)?;
+        let bytes = fs::read(config_path)
+            .map_err(|error| format!("failed to read service config: {error}"))?;
         let config = serde_json::from_slice::<ServiceConfig>(&bytes)
             .map_err(|error| format!("failed to parse service config: {error}"))?;
         validate_config(&config)?;
+        if config.staging_root != staging_root {
+            return Err(
+                "service config is not directly beneath its protected staging root".to_owned(),
+            );
+        }
         Ok(config)
     }
 
@@ -185,6 +290,22 @@ mod windows_service_host {
                 .is_none_or(|value| !value.eq_ignore_ascii_case("exe"))
         {
             return Err("PowerShell host must be an absolute executable path".to_owned());
+        }
+        if !config.staging_root.is_absolute()
+            || config.staging_root == config.staging_root.parent().unwrap_or(Path::new(""))
+        {
+            return Err("protected staging root must be an absolute per-cell directory".to_owned());
+        }
+        for (name, path) in [
+            ("collector", &config.collector),
+            ("key", &config.key_path),
+            ("output", &config.output_path),
+        ] {
+            if path.is_dir() || path.parent() != Some(config.staging_root.as_path()) {
+                return Err(format!(
+                    "{name} must be a direct child of the protected staging root"
+                ));
+            }
         }
         if !(1..=3).contains(&config.repetition) {
             return Err("repetition must be between 1 and 3".to_owned());

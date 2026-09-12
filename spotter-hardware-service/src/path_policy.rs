@@ -38,7 +38,6 @@ pub(crate) enum PathPurpose {
     ServiceExecutable,
     Key,
     OutputDirectory,
-    OutputObject,
     PowerShellHost,
 }
 
@@ -223,7 +222,6 @@ pub(crate) fn validate_path(
         | PathPurpose::Collector
         | PathPurpose::ServiceExecutable
         | PathPurpose::Key
-        | PathPurpose::OutputObject
         | PathPurpose::PowerShellHost => {
             if facts.object_kind != ObjectKind::File {
                 return Err(PolicyError::ExpectedFile);
@@ -399,7 +397,6 @@ mod tests {
             PathPurpose::Collector,
             PathPurpose::ServiceExecutable,
             PathPurpose::Key,
-            PathPurpose::OutputObject,
         ] {
             assert_eq!(
                 validate_path(r"C:\ProgramData\Cell", &facts, purpose),
