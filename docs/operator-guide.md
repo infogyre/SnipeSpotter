@@ -23,7 +23,7 @@ Double-click the MSI in Explorer and follow the wizard. Administrator elevation 
 
 ### What the installer does
 
-1. Installs `spotter-svc.exe`, `spotter-cli.exe`, and their PDBs to `%ProgramFiles%\infogyre\SnipeSpotter\bin\`.
+1. Installs `spotter-svc.exe` and `spotter-cli.exe` to `%ProgramFiles%\infogyre\SnipeSpotter\bin\`. The PDB debug symbols for both executables are not installed; they are published separately in the release symbols ZIP.
 2. Installs CycloneDX SBOM JSONs to `%ProgramFiles%\infogyre\SnipeSpotter\sbom\`.
 3. Registers `SnipeSpotter` as a Windows service with:
    - Executable path: `%ProgramFiles%\infogyre\SnipeSpotter\bin\spotter-svc.exe`
@@ -337,7 +337,7 @@ msiexec /x SnipeSpotter-<version>-x64.msi /qn /norestart /l*v uninstall.log
 ### What uninstall removes
 
 - Stops and removes the Windows service registration.
-- Removes `%ProgramFiles%\infogyre\SnipeSpotter\` (binaries, PDBs, SBOMs).
+- Removes `%ProgramFiles%\infogyre\SnipeSpotter\` (binaries, SBOMs).
 - Removes the `bin\` entry from system PATH.
 - Removes `%ProgramData%\infogyre\SnipeSpotter\` (settings, state, key, journal, logs).
 

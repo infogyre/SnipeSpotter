@@ -135,7 +135,8 @@ cargo build -p spotter-svc -p spotter-cli --release --locked --target x86_64-pc-
 # Determine the version
 $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
 
-# Stage binaries (must contain exactly: spotter-svc.exe, spotter-cli.exe, spotter_svc.pdb, spotter_cli.pdb)
+# Stage binaries and symbols inputs (must contain exactly: spotter-svc.exe, spotter-cli.exe, spotter_svc.pdb, spotter_cli.pdb)
+# Note: the PDBs are release-staging inputs for the public symbols ZIP only; the MSI does NOT install them.
 $stage = "release-stage"
 New-Item -ItemType Directory -Force $stage
 Copy-Item target/x86_64-pc-windows-msvc/release/spotter-svc.exe $stage
@@ -153,7 +154,7 @@ dotnet build installer/Product.wixproj -c Release -p:Platform=x64 -p:ProductVers
 # The MSI is at installer/bin/x64/Release/en-US/SnipeSpotter.msi
 ```
 
-The staging directory must contain exactly the expected executables and PDBs. Do not rebuild binaries from inside the packaging step. The CI workflow enforces this by downloading a pre-built artifact and verifying the inventory before packaging.
+The staging directory must contain exactly the expected executables and PDBs. Do not rebuild binaries from inside the packaging step. The CI workflow enforces this by downloading a pre-built artifact and verifying the inventory before packaging. PDBs are symbol-distribution inputs only: they enter the separately published public symbols ZIP and are never installed by the MSI. The installer change (SPOTR-28 policy) removed the PDB components from the installed payload while preserving staging and symbols-ZIP inputs; the lifecycle test asserts the installed tree contains no PDBs and the symbols ZIP contains both.
 
 ## MSI lifecycle validation
 
@@ -162,7 +163,8 @@ The lifecycle test is `scripts/test-msi-lifecycle.ps1`. On an elevated Windows r
 1. **Install**: Silently installs the MSI and verifies:
    - Service `SnipeSpotter` is registered with automatic start type and `LocalSystem` account
    - Service executable path matches `%ProgramFiles%\infogyre\SnipeSpotter\bin\spotter-svc.exe`
-   - All expected files exist: `bin\spotter-svc.exe`, `bin\spotter-cli.exe`, `bin\spotter_svc.pdb`, `bin\spotter_cli.pdb`, `sbom\*.cdx.json`, `settings.toml`
+   - All expected files exist: `bin\spotter-svc.exe`, `bin\spotter-cli.exe`, `sbom\*.cdx.json`, `settings.toml`
+   - `bin\spotter_svc.pdb` and `bin\spotter_cli.pdb` do NOT exist (PDBs ship only in the public symbols ZIP)
 2. **ACLs**: Verifies the protected Windows semantic contract for every runtime artifact. The data directory must have exactly one explicit self FullControl Allow and one explicit inherit-only ContainerInherit/ObjectInherit GenericAll Allow for each `SYSTEM` and built-in `Administrators` SID; each file must have exactly one explicit self FullControl Allow for each SID. Inherited and unauthorized Allow ACEs, duplicates, and mask/flag mismatches fail validation. Deny ACEs are preserved and are not counted as Allows.
 3. **PATH**: Verifies the `bin\` directory was added to the machine PATH.
 4. **Service health**: Starts the service, requires it to remain `Running` for the configured stability window, verifies the running process owner is `NT AUTHORITY\\SYSTEM`, verifies the fixed named pipe is present, invokes the installed CLI for JSON status, and requires an `Unconfigured` response before stopping it.

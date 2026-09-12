@@ -13,7 +13,7 @@ SnipeSpotter synchronizes Windows system and monitor inventory with an existing 
 - **Named-pipe IPC**: The CLI communicates with the service over a named pipe restricted to SYSTEM and built-in Administrators via a DACL, with at most 16 concurrent sessions and cooperative shutdown.
 - **Operation journaling**: Prepared operations are durably journaled before remote execution. Recovery reconciles server state before retrying uncertain mutations.
 - **Signed state**: Service state is HMAC-SHA256 signed with constant-time verification to detect tampering.
-- **WiX 6 MSI installer**: Installs binaries, PDBs, and CycloneDX SBOMs; registers the service as automatic LocalSystem without starting it; adds `bin\` to system PATH; creates ProgramData with restricted ACLs.
+- **WiX 6 MSI installer**: Installs binaries and CycloneDX SBOMs; registers the service as automatic LocalSystem without starting it; adds `bin\` to system PATH; creates ProgramData with restricted ACLs. PDB debug symbols are not installed; they ship only in the separately published public symbols ZIP.
 - **Configurable monitor check-in**: `Manual` policy never auto-checks in; `AutoNonPortable` checks in absent monitors on non-portable chassis after a configurable threshold.
 
 ## Workspace
