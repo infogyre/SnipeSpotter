@@ -1,4 +1,4 @@
-#![cfg(windows)]
+#![cfg(all(windows, feature = "test-support"))]
 #![expect(
     unsafe_code,
     reason = "Live named-pipe ACL inspection requires narrowly scoped Windows security descriptor calls"
@@ -123,7 +123,7 @@ fn unique_pipe_endpoint() -> String {
 }
 
 #[cfg(feature = "test-support")]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FixtureIdentityQuery {
     result: std::result::Result<(), FixtureIdentityFailure>,
     calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
@@ -406,12 +406,11 @@ async fn client_timeout_does_not_cancel_handler() -> Result<()> {
 
     let client_endpoint = endpoint;
     let client = tokio::task::spawn_blocking(move || {
-        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut transport = fixture_transport(
             client_endpoint,
             FixtureIdentityQuery {
                 result: Ok(()),
-                calls,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             },
         );
         transport.send(&ServiceCommand::GetStatus)
