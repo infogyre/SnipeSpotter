@@ -416,11 +416,12 @@ fn exchange_named_pipe(
         .open(endpoint)
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
     let mut pipe = BufReader::new(pipe);
+    let pipe_handle = HANDLE(pipe.get_ref().as_raw_handle());
     authenticate_serialize_write(
         command,
         || {
             identity_query
-                .query(HANDLE(pipe.get_ref().as_raw_handle()), service_name)
+                .query(pipe_handle, service_name)
                 .map(|_| ())
                 .map_err(anyhow::Error::new)
                 .context("service identity authentication failed")
