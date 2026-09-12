@@ -1,5 +1,13 @@
 # Remaining Jira findings: orchestration handoff
 
+> REV-2 contract amendment (2026-09-12, plan-reviewer recheck): the recovery state table's
+> `NeedsOperatorRecovery(reason, evidence_paths, validated_prefix)` example is superseded. The
+> approved non-replay contract exposes a redacted summary only —
+> `NeedsOperatorRecovery(reason, evidence_paths, validated_record_count)` — with no record-bearing
+> accessor or replayable prefix data crossing the recovery boundary. Diagnostic prefix evidence
+> remains preserved in quarantine artifacts for the administrator procedure; the recovery type
+> itself never carries records.
+
 ## Goal
 
 Address SPOTR-5, SPOTR-7, SPOTR-9, SPOTR-17 and SPOTR-28 through reviewed implementation and native verification; establish an evidence-based disposition for SPOTR-23/24 while leaving SPOTR-10 open until the first stable release. Deliver an isolated integration branch and issue-specific evidence report, not an automatically published release or main-branch merge.

@@ -49,14 +49,25 @@ Fixture work (lane E) may begin only after the owning lane's contract is recorde
 
 ## Lane ownership
 
-| Lane | Branch | Base (integration SHA) | Exclusive files | Shared requests |
-| --- | --- | --- | --- | --- |
-| A — IPC identity | `hardening/lane-a-ipc-identity` | (record at creation) | `spotter-cli/src/lib.rs` (NamedPipeTransport/exchange), `spotter-win32/src/pipe.rs`, `spotter-svc/src/ipc_server.rs`, `spotter-cli/tests/named_pipe.rs`, `spotter-cli/tests/binary_contract.rs` | core identity constants changes via orchestrator |
-| B — journal recovery | `hardening/lane-b-journal-recovery` | (record at creation) | `spotter-svc/src/operation_journal.rs`, `spotter-svc/src/sync_engine.rs`, `spotter-svc/src/atomic_file.rs`, `spotter-svc/tests/owner_fsm.rs` | `service.rs` + test-support `lib.rs` via orchestrator after B gate |
-| C — hardware host | `hardening/lane-c-hardware-host` | (record at creation) | `spotter-hardware-service/**`, `.github/workflows/hardware-experiment.yml`, `scripts/hardware/collect_hardware.ps1`, hardware tests | shared Windows/path modules via orchestrator |
-| D — MSI symbols | `hardening/lane-d-msi-symbols` | (record at creation) | `installer/Product.wxs`, `scripts/test-msi-lifecycle.ps1` | release.yml/elevated-windows.yml inventories via orchestrator |
-| E — token ownership | `hardening/lane-e-token-ownership` | (must contain A+B) | `spotter-core/src/ipc.rs`, `spotter-win32/src/dpapi.rs`, CLI token reader/transport, svc line buffering, `owner_ports.rs`, `config_io.rs` | all manifests + Cargo.lock via orchestrator |
-| F — docs/evidence | `hardening/lane-f-docs` | (after all lanes) | `README.md`, `docs/*.md`, disposition report | docs contract scripts via orchestrator |
+| Lane | Test registry mapping complete? | Branch | Base (integration SHA) | Exclusive files | Shared requests |
+| --- | --- | --- | --- | --- | --- |
+| A — IPC identity | REQUIRED BEFORE BRANCH | `hardening/lane-a-ipc-identity` | (record at creation) | `spotter-cli/src/lib.rs` (NamedPipeTransport/exchange), `spotter-win32/src/pipe.rs`, `spotter-svc/src/ipc_server.rs`, `spotter-cli/tests/named_pipe.rs`, `spotter-cli/tests/binary_contract.rs` | core identity constants changes via orchestrator |
+| B — journal recovery | REQUIRED BEFORE BRANCH | `hardening/lane-b-journal-recovery` | (record at creation) | `spotter-svc/src/operation_journal.rs`, `spotter-svc/src/sync_engine.rs`, `spotter-svc/src/atomic_file.rs`, `spotter-svc/tests/owner_fsm.rs` | `service.rs` + test-support `lib.rs` via orchestrator after B gate |
+| C — hardware host | REQUIRED BEFORE BRANCH | `hardening/lane-c-hardware-host` | (record at creation) | `spotter-hardware-service/**`, `.github/workflows/hardware-experiment.yml`, `scripts/hardware/collect_hardware.ps1`, hardware tests | shared Windows/path modules via orchestrator |
+| D — MSI symbols | REQUIRED BEFORE BRANCH | `hardening/lane-d-msi-symbols` | (record at creation) | `installer/Product.wxs`, `scripts/test-msi-lifecycle.ps1` | release.yml/elevated-windows.yml inventories via orchestrator |
+| E — token ownership | REQUIRED BEFORE BRANCH | `hardening/lane-e-token-ownership` | (must contain A+B) | `spotter-core/src/ipc.rs`, `spotter-win32/src/dpapi.rs`, CLI token reader/transport, svc line buffering, `owner_ports.rs`, `config_io.rs` | all manifests + Cargo.lock via orchestrator |
+| F — docs/evidence | REQUIRED BEFORE BRANCH | `hardening/lane-f-docs` | (after all lanes) | `README.md`, `docs/*.md`, disposition report | docs contract scripts via orchestrator |
+
+## Test registry mapping (required per lane before its branch is created)
+
+Each registered AC test must gain: crate test target path, feature flags, exact command, workflow
+job that runs it, expected evidence artifact, and status. Rows below are the registry columns
+template; lanes populate their rows before branch creation, and the orchestrator verifies the
+mapping is complete as a branch-creation precondition.
+
+| AC | Proposed test | Crate target | Features | Command | Workflow job | Evidence artifact | Status |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| (lanes populate before branch creation) | | | | | | | |
 
 ## Shared-edit log
 
