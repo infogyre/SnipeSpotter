@@ -377,6 +377,22 @@ impl IpcTransport for NamedPipeTransport {
     }
 }
 
+fn authenticate_serialize_write<A, S, W>(
+    command: &ServiceCommand,
+    authenticate: A,
+    serialize: S,
+    write: W,
+) -> Result<()>
+where
+    A: FnOnce() -> Result<()>,
+    S: FnOnce(&ServiceCommand) -> Result<Vec<u8>>,
+    W: FnOnce(&[u8]) -> Result<()>,
+{
+    authenticate()?;
+    let request = serialize(command)?;
+    write(&request)
+}
+
 #[cfg(windows)]
 fn exchange_named_pipe(
     command: &ServiceCommand,
@@ -390,32 +406,43 @@ fn exchange_named_pipe(
     use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::{Foundation::HANDLE, Storage::FileSystem::SECURITY_IDENTIFICATION};
 
-    // Identification SQOS limits a malicious pipe server's impersonation level. It does not
-    // authenticate the server or prevent token theft; SPOTR-5 therefore remains open.
+    // Identification SQOS limits a pipe server's impersonation level; the identity query below
+    // authenticates the connected server before any command bytes are serialized or written.
     let pipe = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .security_qos_flags(SECURITY_IDENTIFICATION.0)
         .open(endpoint)
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
-    let _identity = identity_query
-        .query(HANDLE(pipe.as_raw_handle()), service_name)
-        .map_err(anyhow::Error::new)
-        .context("service identity authentication failed")?;
-
-    let mut request = serde_json::to_vec(command).context("failed to encode service request")?;
-    request.push(b'\n');
-    if request.len() > IPC_MAX_LINE_BYTES {
-        bail!("service request exceeds 64 KiB")
-    }
-
     let mut pipe = BufReader::new(pipe);
-    pipe.get_mut()
-        .write_all(&request)
-        .context("failed to write service request")?;
-    pipe.get_mut()
-        .flush()
-        .context("failed to flush service request")?;
+    authenticate_serialize_write(
+        command,
+        || {
+            identity_query
+                .query(HANDLE(pipe.get_ref().as_raw_handle()), service_name)
+                .map(|_| ())
+                .map_err(anyhow::Error::new)
+                .context("service identity authentication failed")
+        },
+        |command| {
+            let mut request =
+                serde_json::to_vec(command).context("failed to encode service request")?;
+            request.push(b'\n');
+            if request.len() > IPC_MAX_LINE_BYTES {
+                bail!("service request exceeds 64 KiB")
+            }
+            Ok(request)
+        },
+        |request| {
+            pipe.get_mut()
+                .write_all(request)
+                .context("failed to write service request")?;
+            pipe.get_mut()
+                .flush()
+                .context("failed to flush service request")?;
+            Ok(())
+        },
+    )?;
 
     let mut response = Vec::new();
     let read = pipe
@@ -933,10 +960,18 @@ impl ServiceRegistrar for WindowsServiceRegistrar {
 /// Map a dispatch error to the stable CLI exit-code contract.
 #[must_use]
 pub fn exit_code(error: &anyhow::Error) -> i32 {
-    if error
-        .chain()
-        .any(<dyn std::error::Error>::is::<ServiceUnavailable>)
-    {
+    if error.chain().any(|cause| {
+        cause.is::<ServiceUnavailable>() || {
+            #[cfg(windows)]
+            {
+                cause.is::<ServiceIdentityError>()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+    }) {
         EXIT_SERVICE_UNAVAILABLE
     } else {
         1
@@ -1189,9 +1224,52 @@ mod tests {
     }
 
     #[test]
+    fn authentication_precedes_serialization() -> Result<()> {
+        use std::sync::{Arc, Mutex};
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let auth_events = Arc::clone(&events);
+        let serialize_events = Arc::clone(&events);
+        let write_events = Arc::clone(&events);
+        let error = authenticate_serialize_write(
+            &ServiceCommand::SetToken {
+                value: String::from("must-not-be-serialized"),
+            },
+            move || {
+                auth_events.lock().expect("event lock").push("auth");
+                bail!("fixture authentication failed")
+            },
+            move |_| {
+                serialize_events
+                    .lock()
+                    .expect("event lock")
+                    .push("serialize");
+                Ok(vec![b'\n'])
+            },
+            move |_| {
+                write_events.lock().expect("event lock").push("write");
+                Ok(())
+            },
+        )
+        .expect_err("failed authentication must reject before serialization");
+        assert!(error.to_string().contains("fixture authentication failed"));
+        assert_eq!(
+            *events.lock().expect("event lock"),
+            vec!["auth"],
+            "authentication failure must perform zero serialization and zero writes"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn unavailable_service_has_stable_exit_code() {
         let error = anyhow::Error::new(ServiceUnavailable);
         assert_eq!(exit_code(&error), EXIT_SERVICE_UNAVAILABLE);
+        #[cfg(windows)]
+        {
+            let identity_error = anyhow::Error::new(ServiceIdentityError::ServiceRestarting);
+            assert_eq!(exit_code(&identity_error), EXIT_SERVICE_UNAVAILABLE);
+        }
         assert_eq!(exit_code(&anyhow::anyhow!("other")), 1);
     }
 

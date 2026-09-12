@@ -11,9 +11,13 @@ use std::{
 use anyhow::{Context as _, Result};
 use spotter_cli::{IpcTransport, NamedPipeTransport};
 use spotter_core::ipc::{IpcResponse, ServiceCommand};
+use spotter_win32::pipe::{ServerIdentity, ServerIdentityQuery, ServiceIdentityError};
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, ERROR_PIPE_CONNECTED, ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree},
+        Foundation::{
+            CloseHandle, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, ERROR_SUCCESS, HANDLE, HLOCAL,
+            LocalFree,
+        },
         Security::{
             Authorization::{
                 ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo,
@@ -115,6 +119,72 @@ fn unique_pipe_endpoint() -> String {
         r"\\.\pipe\SnipeSpotter-test-{}-{}",
         std::process::id(),
         std::thread::current().name().unwrap_or("main")
+    )
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy)]
+struct FixtureIdentityQuery {
+    result: std::result::Result<(), FixtureIdentityFailure>,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug)]
+enum FixtureIdentityFailure {
+    Query,
+    ProcessExit,
+    PidMismatch,
+    UnexpectedSid,
+    UnexpectedPath,
+}
+
+#[cfg(feature = "test-support")]
+impl ServerIdentityQuery for FixtureIdentityQuery {
+    fn query(
+        &self,
+        _pipe: HANDLE,
+        _service_name: &str,
+    ) -> std::result::Result<ServerIdentity, ServiceIdentityError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.result {
+            Ok(()) => Ok(ServerIdentity {
+                process_id: std::process::id(),
+                account_sid: String::from("S-1-5-18"),
+                image_path: std::path::PathBuf::from(r"C:\SnipeSpotter\spotter-svc.exe"),
+            }),
+            Err(FixtureIdentityFailure::Query) => Err(ServiceIdentityError::IdentityQueryFailed {
+                source: anyhow::anyhow!("fixture query failure"),
+            }),
+            Err(FixtureIdentityFailure::ProcessExit) => {
+                Err(ServiceIdentityError::ServiceRestarting)
+            }
+            Err(FixtureIdentityFailure::PidMismatch) => {
+                Err(ServiceIdentityError::IdentityQueryFailed {
+                    source: anyhow::anyhow!("fixture PID mismatch"),
+                })
+            }
+            Err(FixtureIdentityFailure::UnexpectedSid) => {
+                Err(ServiceIdentityError::UnexpectedIdentity {
+                    observed_account: String::from("S-1-5-21-fixture"),
+                })
+            }
+            Err(FixtureIdentityFailure::UnexpectedPath) => {
+                Err(ServiceIdentityError::UnexpectedExecutable {
+                    observed_path: std::path::PathBuf::from(r"C:\fixture\counterfeit.exe"),
+                })
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-support")]
+fn fixture_transport(endpoint: String, query: FixtureIdentityQuery) -> NamedPipeTransport {
+    NamedPipeTransport::with_identity_query(
+        Duration::from_secs(5),
+        endpoint,
+        "SnipeSpotter-fixture",
+        query,
     )
 }
 
@@ -232,7 +302,14 @@ fn named_pipe_client_limits_impersonation_level() -> Result<()> {
         .recv_timeout(Duration::from_secs(5))
         .context("SQOS server thread did not start")?;
 
-    let mut transport = NamedPipeTransport::with_endpoint(Duration::from_secs(5), endpoint);
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut transport = fixture_transport(
+        endpoint,
+        FixtureIdentityQuery {
+            result: Ok(()),
+            calls: std::sync::Arc::clone(&calls),
+        },
+    );
     let response = transport.send(&ServiceCommand::GetStatus)?;
     assert_eq!(
         response,
@@ -329,8 +406,14 @@ async fn client_timeout_does_not_cancel_handler() -> Result<()> {
 
     let client_endpoint = endpoint;
     let client = tokio::task::spawn_blocking(move || {
-        let mut transport =
-            NamedPipeTransport::with_endpoint(Duration::from_millis(20), client_endpoint);
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut transport = fixture_transport(
+            client_endpoint,
+            FixtureIdentityQuery {
+                result: Ok(()),
+                calls,
+            },
+        );
         transport.send(&ServiceCommand::GetStatus)
     });
     tokio::time::timeout(Duration::from_secs(5), accepted_receiver)
@@ -390,8 +473,14 @@ async fn secured_server_and_production_client_roundtrip_on_unique_pipe() -> Resu
         loop {
             match live_pipe_acl_sddl(&endpoint) {
                 Ok(rendered) => {
-                    let mut transport =
-                        NamedPipeTransport::with_endpoint(Duration::from_secs(5), endpoint.clone());
+                    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let mut transport = fixture_transport(
+                        endpoint.clone(),
+                        FixtureIdentityQuery {
+                            result: Ok(()),
+                            calls,
+                        },
+                    );
                     match transport.send(&ServiceCommand::GetStatus) {
                         Ok(response) => return Ok((rendered, response)),
                         Err(_) if std::time::Instant::now() < deadline => {
@@ -422,5 +511,94 @@ async fn secured_server_and_production_client_roundtrip_on_unique_pipe() -> Resu
     );
     server.abort();
     let _ = server.await;
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+fn receive_request_bytes(endpoint: &str, ready: &mpsc::SyncSender<()>) -> Result<usize> {
+    let endpoint = endpoint
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let security = spotter_win32::pipe::create_admin_pipe_security_attributes()?;
+    let pipe = OwnedHandle(unsafe {
+        CreateNamedPipeW(
+            PCWSTR(endpoint.as_ptr()),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            Some(security.as_ptr()),
+        )
+    });
+    if pipe.0.is_invalid() {
+        return Err(anyhow::Error::new(std::io::Error::last_os_error()));
+    }
+    ready
+        .send(())
+        .map_err(|_| anyhow::anyhow!("failed to announce byte-counting server"))?;
+    let mut request = [0_u8; 4096];
+    let mut bytes_read = 0;
+    unsafe { ConnectNamedPipe(pipe.0, None) }.or_else(|error| {
+        if error.code() == ERROR_PIPE_CONNECTED.to_hresult() {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })?;
+    match unsafe { ReadFile(pipe.0, Some(&mut request), Some(&raw mut bytes_read), None) } {
+        Ok(()) => Ok(bytes_read as usize),
+        Err(error) if error.code() == ERROR_BROKEN_PIPE.to_hresult() => Ok(bytes_read as usize),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn server_identity_failures_reject_before_write() -> Result<()> {
+    for failure in [
+        FixtureIdentityFailure::Query,
+        FixtureIdentityFailure::PidMismatch,
+        FixtureIdentityFailure::ProcessExit,
+        FixtureIdentityFailure::UnexpectedSid,
+        FixtureIdentityFailure::UnexpectedPath,
+    ] {
+        let endpoint = unique_pipe_endpoint();
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+        let server_endpoint = endpoint.clone();
+        let server =
+            std::thread::spawn(move || receive_request_bytes(&server_endpoint, &ready_sender));
+        ready_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .with_context(|| format!("byte-counting server did not start for {failure:?}"))?;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut transport = fixture_transport(
+            endpoint,
+            FixtureIdentityQuery {
+                result: Err(failure),
+                calls: std::sync::Arc::clone(&calls),
+            },
+        );
+        let error = transport
+            .send(&ServiceCommand::SetToken {
+                value: String::from("must-not-be-serialized"),
+            })
+            .expect_err("identity failures must reject the request");
+        assert!(
+            error
+                .to_string()
+                .contains("service identity authentication failed")
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        drop(transport);
+        let received = server
+            .join()
+            .map_err(|_| anyhow::anyhow!("byte-counting server panicked"))??;
+        assert_eq!(received, 0, "identity failure must send zero request bytes");
+    }
     Ok(())
 }
