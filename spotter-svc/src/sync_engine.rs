@@ -550,7 +550,20 @@ pub(crate) fn commit_after_state_save_with(
 /// # Errors
 /// Returns an error when the journal cannot be loaded or atomically compacted.
 pub fn compact_after_state_commit(journal_path: &Path) -> Result<()> {
-    let records = operation_journal::load(journal_path)?;
+    let records = match operation_journal::recover_journal(journal_path)? {
+        operation_journal::RecoveryOutcome::Clean { records } => records,
+        operation_journal::RecoveryOutcome::NeedsOperatorRecovery(recovery) => anyhow::bail!(
+            "journal recovery is blocked: {} ({} validated records)",
+            recovery.reason(),
+            recovery.validated_record_count()
+        ),
+        operation_journal::RecoveryOutcome::PreservationFailed(failure) => {
+            anyhow::bail!("journal preservation failed: {failure}")
+        }
+        operation_journal::RecoveryOutcome::Corrupt { reason } => {
+            anyhow::bail!("journal is corrupt: {reason}")
+        }
+    };
     operation_journal::compact(journal_path, &records)
 }
 
@@ -569,7 +582,20 @@ pub async fn recover_pending<R: RemoteMutations + ?Sized>(
     journal_path: &Path,
     remote: &mut R,
 ) -> Result<Vec<String>> {
-    let records = operation_journal::load(journal_path)?;
+    let records = match operation_journal::recover_journal(journal_path)? {
+        operation_journal::RecoveryOutcome::Clean { records } => records,
+        operation_journal::RecoveryOutcome::NeedsOperatorRecovery(recovery) => anyhow::bail!(
+            "journal recovery is blocked: {} ({} validated records)",
+            recovery.reason(),
+            recovery.validated_record_count()
+        ),
+        operation_journal::RecoveryOutcome::PreservationFailed(failure) => {
+            anyhow::bail!("journal preservation failed: {failure}")
+        }
+        operation_journal::RecoveryOutcome::Corrupt { reason } => {
+            anyhow::bail!("journal is corrupt: {reason}")
+        }
+    };
     let pending = operation_journal::pending_with_evidence(&records)?;
     let mut observed = Vec::with_capacity(pending.len());
     for pending in pending {
@@ -1516,6 +1542,52 @@ mod tests {
         .expect("recovered candidate snapshots should apply");
 
         assert_eq!(state.matched_asset, a_state.matched_asset);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_tail_never_reissues_mutation() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("operations.jsonl");
+        let original = br#"{"phase":"prepared","operation_id":"checkout:1","operation":{"operation_id":"checkout:1"}}
+{"#;
+        std::fs::write(&path, original)?;
+        let mut remote = FakeRemote::default();
+        let error = recover_pending(&path, &mut remote)
+            .await
+            .expect_err("ambiguous journal tail must block replay");
+        assert!(error.to_string().contains("recovery is blocked"));
+        assert!(remote.calls.is_empty());
+        assert_eq!(std::fs::read(&path)?, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ambiguous_tail_blocks_all_recovery_callers() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("operations.jsonl");
+        let original = br#"{"phase":"prepared","operation_id":"checkout:1","operation":{"operation_id":"checkout:1"}}
+{"#;
+        std::fs::write(&path, original)?;
+        let marker = operation_journal::blocked_marker_path(&path);
+        let first = operation_journal::recover_journal(&path)?;
+        assert!(matches!(
+            first,
+            operation_journal::RecoveryOutcome::NeedsOperatorRecovery(_)
+        ));
+        assert!(marker.exists());
+
+        let mut remote = FakeRemote::default();
+        assert!(recover_pending(&path, &mut remote).await.is_err());
+        assert!(compact_after_state_commit(&path).is_err());
+        let current = spotter_core::Settings::default();
+        let mut candidate = current.clone();
+        candidate.snipeit.url = String::from("https://new.example");
+        assert!(
+            operation_journal::guard_remote_identity_change(&path, &current, &candidate).is_err()
+        );
+        assert!(remote.calls.is_empty());
+        assert_eq!(std::fs::read(&path)?, original);
+        Ok(())
     }
 
     #[tokio::test]

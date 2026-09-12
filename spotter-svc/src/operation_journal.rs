@@ -1090,6 +1090,34 @@ mod tests {
     }
 
     #[test]
+    fn blocked_marker_survives_restart_with_valid_looking_prefix() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("operations.jsonl");
+        let original = br#"{"phase":"prepared","operation_id":"checkout:1","operation":{"operation_id":"checkout:1"}}
+{"#;
+        fs::write(&path, original)?;
+
+        let first = recover_journal(&path)?;
+        assert!(matches!(first, RecoveryOutcome::NeedsOperatorRecovery(_)));
+        let marker = blocked_marker_path(&path);
+        assert!(marker.exists());
+
+        // A restart cannot make the prefix admissible by rewriting the journal bytes.
+        fs::write(&path, br#"{"phase":"prepared","operation_id":"checkout:1","operation":{"operation_id":"checkout:1"}}
+"#)?;
+        for _ in 0..3 {
+            let outcome = recover_journal(&path)?;
+            assert!(matches!(
+                outcome,
+                RecoveryOutcome::NeedsOperatorRecovery(recovery)
+                    if recovery.reason() == &RecoveryReason::BlockedMarkerPresent
+            ));
+        }
+        assert!(marker.exists());
+        Ok(())
+    }
+
+    #[test]
     fn quarantine_name_contains_exactly_sixteen_digest_hex_digits() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("operations.jsonl");
