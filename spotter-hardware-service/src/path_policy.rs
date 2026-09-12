@@ -56,7 +56,7 @@ pub(crate) struct PathFacts {
     pub(crate) ancestor_reparse: bool,
     pub(crate) owner: Owner,
     pub(crate) aces: Vec<AceFact>,
-    pub(crate) standard_user_writable_ancestor: bool,
+    pub(crate) ancestor_aces: Vec<AceFact>,
     pub(crate) object_kind: ObjectKind,
     pub(crate) exists: bool,
 }
@@ -146,6 +146,18 @@ pub(crate) fn is_contained_path(root: &str, candidate: &str) -> bool {
     candidate.len() >= root.len() && candidate[..root.len()] == root[..]
 }
 
+/// Return whether an output file is exactly one level below a directory inside the root.
+#[must_use]
+pub(crate) fn is_output_file_path(root: &str, candidate: &str) -> bool {
+    let Some(root) = path_components(root) else {
+        return false;
+    };
+    let Some(candidate) = path_components(candidate) else {
+        return false;
+    };
+    candidate.len() == root.len() + 2 && candidate[..root.len()] == root[..]
+}
+
 /// Return whether a PowerShell executable path belongs to an approved OS layout.
 #[must_use]
 pub(crate) fn is_allowlisted_powershell_layout(path: &str) -> bool {
@@ -160,6 +172,33 @@ pub(crate) fn is_allowlisted_powershell_layout(path: &str) -> bool {
     program_files
         && powershell_directory
         && components.last().is_some_and(|name| name == "pwsh.exe")
+}
+
+fn grants_unallowlisted_write(ace: AceFact) -> bool {
+    ace.allow
+        && ace.grants_write
+        && !matches!(ace.principal, Principal::Administrators | Principal::System)
+}
+
+/// Decide whether any observed ancestor grants write access to an unallowlisted principal.
+#[must_use]
+pub(crate) fn has_standard_user_writable_ancestor(ancestor_aces: &[AceFact]) -> bool {
+    ancestor_aces
+        .iter()
+        .copied()
+        .any(grants_unallowlisted_write)
+}
+
+/// Decide whether an observed owner is allowed for a path purpose.
+#[must_use]
+pub(crate) fn is_owner_allowed(owner: Owner, purpose: PathPurpose) -> bool {
+    match purpose {
+        PathPurpose::PowerShellHost => matches!(
+            owner,
+            Owner::Administrators | Owner::System | Owner::TrustedInstaller
+        ),
+        _ => matches!(owner, Owner::Administrators | Owner::System),
+    }
 }
 
 /// Evaluate facts collected from no-follow Windows handles.
@@ -181,7 +220,7 @@ pub(crate) fn validate_path(
     if facts.ancestor_reparse {
         return Err(PolicyError::AncestorReparse);
     }
-    if facts.standard_user_writable_ancestor {
+    if has_standard_user_writable_ancestor(&facts.ancestor_aces) {
         return Err(PolicyError::StandardUserWritableAncestor);
     }
 
@@ -193,14 +232,7 @@ pub(crate) fn validate_path(
         return Err(PolicyError::OutsideStagingRoot);
     }
 
-    let owner_allowed = match purpose {
-        PathPurpose::PowerShellHost => matches!(
-            facts.owner,
-            Owner::Administrators | Owner::System | Owner::TrustedInstaller
-        ),
-        _ => matches!(facts.owner, Owner::Administrators | Owner::System),
-    };
-    if !owner_allowed {
+    if !is_owner_allowed(facts.owner, purpose) {
         return Err(PolicyError::InvalidOwner);
     }
 
@@ -253,7 +285,7 @@ mod tests {
                     allow: true,
                 },
             ],
-            standard_user_writable_ancestor: false,
+            ancestor_aces: Vec::new(),
             object_kind: ObjectKind::File,
             exists: true,
         }
@@ -326,7 +358,11 @@ mod tests {
                     grants_write: true,
                     allow: true,
                 }),
-                "ancestor" => facts.standard_user_writable_ancestor = true,
+                "ancestor" => facts.ancestor_aces.push(AceFact {
+                    principal: Principal::Other,
+                    grants_write: true,
+                    allow: true,
+                }),
                 "ancestor-reparse" => facts.ancestor_reparse = true,
                 "reparse" => facts.reparse_tag = 0xA000_000C,
                 "containment" | "output" => {}
@@ -347,6 +383,11 @@ mod tests {
 
     #[test]
     fn trusted_installer_is_only_allowed_for_allowlisted_powershell_layout() {
+        assert!(is_owner_allowed(
+            Owner::TrustedInstaller,
+            PathPurpose::PowerShellHost
+        ));
+        assert!(!is_owner_allowed(Owner::TrustedInstaller, PathPurpose::Key));
         let mut facts = safe_file(r"C:\Program Files\PowerShell\7\pwsh.exe");
         facts.owner = Owner::TrustedInstaller;
         assert!(validate_path(r"C:\ProgramData\Cell", &facts, PathPurpose::PowerShellHost).is_ok());
@@ -443,6 +484,58 @@ mod tests {
             validate_path(r"C:\ProgramData\Cell", &facts, PathPurpose::Config),
             Err(PolicyError::UnexpectedWriteAce)
         );
+    }
+
+    #[test]
+    fn ancestor_write_decision_is_pure_and_uses_observed_ace_facts() {
+        let safe = vec![AceFact {
+            principal: Principal::Other,
+            grants_write: false,
+            allow: true,
+        }];
+        assert!(!has_standard_user_writable_ancestor(&safe));
+
+        let unsafe_ancestor = vec![AceFact {
+            principal: Principal::Other,
+            grants_write: true,
+            allow: true,
+        }];
+        assert!(has_standard_user_writable_ancestor(&unsafe_ancestor));
+
+        let mut facts = safe_file(r"C:\ProgramData\Cell\output\report.json");
+        facts.ancestor_aces = unsafe_ancestor;
+        assert_eq!(
+            validate_path(r"C:\ProgramData\Cell", &facts, PathPurpose::Config),
+            Err(PolicyError::StandardUserWritableAncestor)
+        );
+    }
+
+    #[test]
+    fn nested_output_file_is_contained_by_the_protected_root() {
+        assert!(is_contained_path(
+            r"C:\ProgramData\Cell",
+            r"C:\ProgramData\Cell\output\report.json"
+        ));
+    }
+
+    #[test]
+    fn output_file_path_is_bounded_to_the_protected_output_directory() {
+        assert!(is_output_file_path(
+            r"C:\ProgramData\Cell",
+            r"C:\ProgramData\Cell\output\report.json"
+        ));
+        assert!(!is_output_file_path(
+            r"C:\ProgramData\Cell",
+            r"C:\ProgramData\Cell\report.json"
+        ));
+        assert!(!is_output_file_path(
+            r"C:\ProgramData\Cell",
+            r"C:\ProgramData\Cell\output\nested\report.json"
+        ));
+        assert!(!is_output_file_path(
+            r"C:\ProgramData\Cell",
+            r"C:\ProgramData\Cell\output\..\report.json"
+        ));
     }
 
     #[test]

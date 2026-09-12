@@ -199,7 +199,7 @@ fn classify_sid(sid: PSID) -> Result<Principal, String> {
     Ok(Principal::Other)
 }
 
-fn classify_owner(sid: PSID, allow_trusted_installer: bool) -> Result<Owner, String> {
+fn classify_owner(sid: PSID) -> Result<Owner, String> {
     if sid.0.is_null() {
         return Err("protected path has no owner".to_owned());
     }
@@ -211,7 +211,7 @@ fn classify_owner(sid: PSID, allow_trusted_installer: bool) -> Result<Owner, Str
     if unsafe { IsWellKnownSid(sid, WinLocalSystemSid).as_bool() } {
         return Ok(Owner::System);
     }
-    if allow_trusted_installer && sid_string(sid)?.eq_ignore_ascii_case(TRUSTED_INSTALLER_SID) {
+    if sid_string(sid)?.eq_ignore_ascii_case(TRUSTED_INSTALLER_SID) {
         return Ok(Owner::TrustedInstaller);
     }
     Ok(Owner::Other)
@@ -273,10 +273,7 @@ impl Drop for SecurityDescriptor {
     }
 }
 
-fn security_facts(
-    handle: HANDLE,
-    allow_trusted_installer: bool,
-) -> Result<(Owner, Vec<AceFact>), String> {
+fn security_facts(handle: HANDLE) -> Result<(Owner, Vec<AceFact>), String> {
     let mut owner = PSID::default();
     let mut dacl = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -319,7 +316,7 @@ fn security_facts(
         return Err("protected handle has an absent or inconsistent DACL".to_owned());
     }
     // SAFETY: owner is borrowed from the descriptor returned by GetSecurityInfo.
-    let owner = classify_owner(owner, allow_trusted_installer)?;
+    let owner = classify_owner(owner)?;
     Ok((owner, ace_facts(descriptor_dacl)?))
 }
 
@@ -335,7 +332,7 @@ pub(crate) fn inspect_path(
 ) -> Result<RetainedHandle, String> {
     let components = component_paths(path)?;
     let mut handles = Vec::with_capacity(components.len());
-    let mut standard_user_writable_ancestor = false;
+    let mut ancestor_aces = Vec::new();
 
     for (index, component) in components.iter().enumerate() {
         let handle = match open_no_follow(component) {
@@ -366,7 +363,7 @@ pub(crate) fn inspect_path(
                 return Err(error);
             }
         };
-        let (owner, aces) = match security_facts(handle, purpose == PathPurpose::PowerShellHost) {
+        let (owner, aces) = match security_facts(handle) {
             Ok(facts) => facts,
             Err(error) => {
                 close_handles(handles.into_iter().chain(std::iter::once(handle)));
@@ -374,11 +371,7 @@ pub(crate) fn inspect_path(
             }
         };
         if index + 1 != components.len() {
-            standard_user_writable_ancestor |= aces.iter().any(|ace| {
-                ace.allow
-                    && ace.grants_write
-                    && !matches!(ace.principal, Principal::Administrators | Principal::System)
-            });
+            ancestor_aces.extend(aces);
         } else {
             let facts = PathFacts {
                 final_path: final_path.to_string_lossy().into_owned(),
@@ -386,7 +379,7 @@ pub(crate) fn inspect_path(
                 ancestor_reparse: false,
                 owner,
                 aces,
-                standard_user_writable_ancestor,
+                ancestor_aces,
                 object_kind: if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
                     ObjectKind::Directory
                 } else {

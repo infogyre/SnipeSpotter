@@ -154,12 +154,17 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "failed to protect staged hardware object ACL: $path" }
           }
           $bytes = New-Object byte[] 32
+          $keyHandle = $null
           try {
             [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-            [IO.File]::WriteAllText($keyPath, [Convert]::ToHexString($bytes).ToLowerInvariant())
+            $keyHandle = [IO.File]::Open($keyPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $keyHandle.Dispose()
+            $keyHandle = $null
             & icacls.exe $keyPath /inheritance:r /grant:r '*S-1-5-18:R' '*S-1-5-32-544:F' | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "failed to protect HMAC key ACL: $keyPath" }
+            [IO.File]::WriteAllText($keyPath, [Convert]::ToHexString($bytes).ToLowerInvariant())
           } finally {
+            if ($null -ne $keyHandle) { $keyHandle.Dispose() }
             $bytes = $null
           }
           "CELL_ROOT=$cellRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -271,6 +276,7 @@ jobs:
           }
 
           $cleanupFailures = @()
+          $serviceDeletionConfirmed = $false
           $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
           if ($null -ne $service -and $service.Status -ne 'Stopped') {
             try { Stop-Service -Name $serviceName -Force -ErrorAction Stop } catch { $cleanupFailures += $_.Exception.Message }
@@ -285,13 +291,21 @@ jobs:
               Wait-ForCondition -Description "LocalSystem service deletion" -Condition {
                 $null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
               }
+              $serviceDeletionConfirmed = $true
             } catch {
               $cleanupFailures += $_.Exception.Message
+              $cleanupFailures += "refusing to remove protected cell root while service deletion is unconfirmed"
             }
+          } else {
+            $serviceDeletionConfirmed = $true
           }
           $cellId = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
           $cellRoot = Join-Path ${env:ProgramData} "SnipeSpotterHardware\$cellId"
-          try { Remove-Item -LiteralPath $cellRoot -Recurse -Force -ErrorAction Stop } catch { if (Test-Path -LiteralPath $cellRoot) { $cleanupFailures += $_.Exception.Message } }
+          if ($serviceDeletionConfirmed) {
+            try { Remove-Item -LiteralPath $cellRoot -Recurse -Force -ErrorAction Stop } catch { if (Test-Path -LiteralPath $cellRoot) { $cleanupFailures += $_.Exception.Message } }
+          } else {
+            $cleanupFailures += "refusing to remove protected cell root while service deletion is unconfirmed"
+          }
           Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'hardware-reports') -Filter "${env:IMAGE}-*.json" -File -ErrorAction SilentlyContinue |
             ForEach-Object {
               try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop } catch { $cleanupFailures += $_.Exception.Message }

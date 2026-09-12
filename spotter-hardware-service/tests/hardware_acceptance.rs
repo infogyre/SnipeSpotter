@@ -2,9 +2,11 @@
 
 //! Native acceptance contracts for the protected hardware-host lane.
 //!
-//! The runner fixture owns the elevated actor and SCM orchestration. These tests keep the
-//! acceptance names in the hardware-service target and exercise the policy boundary directly,
-//! so a missing or weakened policy case cannot be hidden behind a passing process exit status.
+//! These tests require a Windows runner with the protected hardware experiment enabled. The
+//! elevated runner fixture owns SCM and ACL orchestration; policy rows are tested directly here.
+//! Linux-runnable copies of the pure policy rows live in `src/path_policy.rs` and are exercised by
+//! the regular package test command. Windows-only SCM behavior is asserted by the workflow
+//! contract tests rather than silently represented by synthetic passes.
 
 #[path = "../src/path_policy.rs"]
 mod path_policy;
@@ -31,7 +33,7 @@ fn safe_file(path: &str) -> PathFacts {
                 allow: true,
             },
         ],
-        standard_user_writable_ancestor: false,
+        ancestor_aces: Vec::new(),
         object_kind: ObjectKind::File,
         exists: true,
     }
@@ -63,7 +65,11 @@ fn hardware_host_rejects_unsafe_path_table() {
                 PathPurpose::Config
             }
             "ancestor" => {
-                facts.standard_user_writable_ancestor = true;
+                facts.ancestor_aces.push(AceFact {
+                    principal: Principal::Other,
+                    grants_write: true,
+                    allow: true,
+                });
                 PathPurpose::Config
             }
             "reparse" => {
@@ -133,44 +139,47 @@ fn hardware_key_acl_and_cleanup_contract() {
 }
 
 #[test]
-fn hardware_fixture_unprotected_swap_control() {
-    let mut original = b"original".to_vec();
-    let replacement = b"replacement";
-    original.copy_from_slice(b"original");
-    original.clear();
-    original.extend_from_slice(replacement);
-    assert_eq!(original.as_slice(), replacement);
-}
-
-#[test]
-fn hardware_fixture_actor_boundary() {
-    let facts = safe_file(r"C:\ProgramData\SnipeSpotterHardware\cell\collector.ps1");
-    assert!(facts.owner == Owner::Administrators);
-    assert!(facts.aces.iter().all(|ace| !ace.grants_write
-        || matches!(ace.principal, Principal::Administrators | Principal::System)));
-}
-
-#[test]
-fn hardware_fixture_cleanup_waits_for_scm() {
-    assert!(
-        include_str!("../../.github/workflows/hardware-experiment.yml")
-            .contains("Wait-ForCondition -Description \"LocalSystem service deletion\"")
-    );
-}
-
-#[test]
-fn hardware_host_blocks_validation_launch_swap() {
-    let facts = safe_file(r"C:\ProgramData\SnipeSpotterHardware\cell\collector.ps1");
+fn hardware_host_rejects_standard_user_writable_ancestor() {
+    let mut facts = safe_file(r"C:\ProgramData\SnipeSpotterHardware\cell\collector.ps1");
+    facts.ancestor_aces.push(AceFact {
+        principal: Principal::Other,
+        grants_write: true,
+        allow: true,
+    });
     assert_eq!(
         validate_path(
             r"C:\ProgramData\SnipeSpotterHardware\cell",
             &facts,
             PathPurpose::Collector,
         ),
+        Err(PolicyError::StandardUserWritableAncestor)
+    );
+}
+
+#[test]
+fn hardware_host_rejects_trusted_installer_for_non_host_objects() {
+    let mut facts = safe_file(r"C:\ProgramData\SnipeSpotterHardware\cell\hmac.key");
+    facts.owner = Owner::TrustedInstaller;
+    assert_eq!(
+        validate_path(
+            r"C:\ProgramData\SnipeSpotterHardware\cell",
+            &facts,
+            PathPurpose::Key,
+        ),
+        Err(PolicyError::InvalidOwner)
+    );
+}
+
+#[test]
+fn hardware_host_accepts_output_directory_nested_under_cell_root() {
+    let mut facts = safe_file(r"C:\ProgramData\SnipeSpotterHardware\cell\output");
+    facts.object_kind = ObjectKind::Directory;
+    assert_eq!(
+        validate_path(
+            r"C:\ProgramData\SnipeSpotterHardware\cell",
+            &facts,
+            PathPurpose::OutputDirectory,
+        ),
         Ok(())
     );
-    let source = include_str!("../src/main.rs");
-    assert!(source.contains("_launch_bound: LaunchBound"));
-    assert!(source.contains("launch_bound.collector.final_path()"));
-    assert!(source.contains("launch_bound.key.final_path()"));
 }

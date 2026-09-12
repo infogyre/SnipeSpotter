@@ -174,6 +174,15 @@ mod windows_service_host {
             output_directory_path,
             path_policy::PathPurpose::OutputDirectory,
         )?;
+        let output_file_name = output_file_name(config);
+        if Path::new(&output_file_name).components().count() != 1
+            || output_file_name == "."
+            || output_file_name == ".."
+        {
+            return Err(
+                "output path must name a single file in the protected output directory".to_owned(),
+            );
+        }
         let pwsh = inspect_path(
             &config.staging_root,
             &config.pwsh_path,
@@ -296,16 +305,30 @@ mod windows_service_host {
         {
             return Err("protected staging root must be an absolute per-cell directory".to_owned());
         }
-        for (name, path) in [
-            ("collector", &config.collector),
-            ("key", &config.key_path),
-            ("output", &config.output_path),
-        ] {
+        for (name, path) in [("collector", &config.collector), ("key", &config.key_path)] {
             if path.is_dir() || path.parent() != Some(config.staging_root.as_path()) {
                 return Err(format!(
                     "{name} must be a direct child of the protected staging root"
                 ));
             }
+        }
+        let output_directory = config
+            .output_path
+            .parent()
+            .ok_or_else(|| "output path has no protected parent directory".to_owned())?;
+        if !path_policy::is_output_file_path(
+            &config.staging_root.to_string_lossy(),
+            &config.output_path.to_string_lossy(),
+        ) || config.output_path.is_dir()
+        {
+            return Err(
+                "output path must name a file in the protected output directory".to_owned(),
+            );
+        }
+        if output_directory.parent() != Some(config.staging_root.as_path()) {
+            return Err(
+                "output directory must be a direct child of the protected staging root".to_owned(),
+            );
         }
         if !(1..=3).contains(&config.repetition) {
             return Err("repetition must be between 1 and 3".to_owned());
@@ -338,6 +361,49 @@ mod windows_service_host {
             return Err("service name is empty or contains unsupported characters".to_owned());
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod config_tests {
+        use super::*;
+
+        fn config_with_output(output_path: &str) -> ServiceConfig {
+            ServiceConfig {
+                service_name: "SpotterHardware".to_owned(),
+                collector: PathBuf::from(r"C:\ProgramData\Cell\collector.ps1"),
+                image: "windows-2022".to_owned(),
+                image_alias: "windows-2022".to_owned(),
+                context: "LocalSystem".to_owned(),
+                repetition: 1,
+                key_path: PathBuf::from(r"C:\ProgramData\Cell\hmac.key"),
+                output_path: PathBuf::from(output_path),
+                pwsh_path: PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+                staging_root: PathBuf::from(r"C:\ProgramData\Cell"),
+            }
+        }
+
+        #[test]
+        fn accepts_output_file_inside_protected_output_directory() {
+            assert!(
+                validate_config(&config_with_output(
+                    r"C:\ProgramData\Cell\output\report.json"
+                ))
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn rejects_output_file_outside_protected_output_directory() {
+            assert!(
+                validate_config(&config_with_output(r"C:\ProgramData\Cell\report.json")).is_err()
+            );
+            assert!(
+                validate_config(&config_with_output(
+                    r"C:\ProgramData\Cell\other\report.json"
+                ))
+                .is_err()
+            );
+        }
     }
 
     fn validate_config_path(path: &str) -> Result<(), String> {
