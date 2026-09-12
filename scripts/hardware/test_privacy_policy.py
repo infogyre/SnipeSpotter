@@ -99,10 +99,14 @@ class PrivacyPolicyTests(unittest.TestCase):
 
     def test_workflow_uses_one_key_for_both_contexts_and_cleans_it(self) -> None:
         workflow = (Path(__file__).resolve().parents[2] / ".github" / "workflows" / "hardware-experiment.yml").read_text(encoding="utf-8")
-        direct = workflow.index("-Context interactive-admin")
-        local_system = workflow.index("context = 'LocalSystem'")
+        direct = workflow.index("& $collector -Image $env:IMAGE")
+        local_system = workflow.index("$scOutput = & sc.exe create")
         self.assertLess(direct, local_system)
         self.assertIn("key_path = $keyPath", workflow)
+        self.assertIn("staging_root = $cellRoot", workflow)
+        self.assertIn("$cellRoot = Join-Path ${env:ProgramData}", workflow)
+        self.assertIn("$keyPath = Join-Path $cellRoot", workflow)
+        self.assertNotIn("$keyPath = Join-Path $env:RUNNER_TEMP", workflow)
         self.assertIn("/inheritance:r", workflow)
         self.assertLess(workflow.index("Invoke-ReportValidation -Context LocalSystem"), workflow.index("Upload validated redacted reports"))
         self.assertIn("cleanup failed", workflow)
