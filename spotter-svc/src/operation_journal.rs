@@ -233,17 +233,22 @@ pub fn recover_journal(journal_path: &Path) -> Result<RecoveryOutcome> {
             validated_record_count: 0,
         }));
     }
-    if !journal_path.exists() {
-        return Ok(RecoveryOutcome::Clean {
-            records: Vec::new(),
-        });
-    }
-    let bytes = fs::read(journal_path).with_context(|| {
-        format!(
-            "failed to read operation journal {}",
-            journal_path.display()
-        )
-    })?;
+    let bytes = match fs::read(journal_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecoveryOutcome::Clean {
+                records: Vec::new(),
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to read operation journal {}",
+                    journal_path.display()
+                )
+            });
+        }
+    };
     let ClassifiedBytes {
         outcome,
         normalize_terminal_newline,
@@ -322,10 +327,9 @@ fn preserve_non_clean(
 fn write_quarantine(journal_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let parent = journal_path.parent().unwrap_or_else(|| Path::new("."));
     ensure_safe_parent(parent)?;
-    let file_name = journal_path
+    journal_path
         .file_name()
-        .ok_or_else(|| anyhow::anyhow!("operation journal has no file name"))?
-        .to_string_lossy();
+        .ok_or_else(|| anyhow::anyhow!("operation journal has no file name"))?;
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -333,12 +337,8 @@ fn write_quarantine(journal_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let digest = sha256_hex(bytes);
     let digest = &digest[..16];
     for nonce in 0_u64..64 {
-        let suffix = if nonce == 0 {
-            format!("{QUARANTINE_PREFIX}{timestamp}-{digest}")
-        } else {
-            format!("{QUARANTINE_PREFIX}{timestamp}-{digest}-{nonce:016x}")
-        };
-        let path = parent.join(format!("{file_name}{suffix}"));
+        let path = quarantine_path(journal_path, timestamp, digest, nonce);
+
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(mut file) => {
                 file.write_all(bytes)?;
@@ -351,6 +351,20 @@ fn write_quarantine(journal_path: &Path, bytes: &[u8]) -> Result<PathBuf> {
         }
     }
     anyhow::bail!("failed to allocate a unique journal quarantine path")
+}
+
+fn quarantine_path(journal_path: &Path, timestamp: u128, digest: &str, nonce: u64) -> PathBuf {
+    let parent = journal_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = journal_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let suffix = if nonce == 0 {
+        format!("{QUARANTINE_PREFIX}{timestamp}-{digest}")
+    } else {
+        format!("{QUARANTINE_PREFIX}{timestamp}-{digest}-{nonce:016x}")
+    };
+    parent.join(format!("{file_name}{suffix}"))
 }
 
 fn write_blocked_marker(path: &Path, reason: &RecoveryReason, evidence: &[PathBuf]) -> Result<()> {
@@ -1143,5 +1157,74 @@ mod tests {
         assert!(error.to_string().contains("recovery is blocked"));
         assert_eq!(fs::read(&path)?, before);
         Ok(())
+    }
+
+    #[test]
+    fn malformed_journal_quarantines_original_without_leaking_summary_data() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("operations.jsonl");
+        let original = br#"{"phase":"prepared","operation_id":"sensitive-id","operation":{"token":"sensitive-body"}}
+not-json
+{"phase":"state_committed","operation_id":"sensitive-id"}
+"#;
+        fs::write(&path, original)?;
+
+        let outcome = recover_journal(&path)?;
+        assert!(matches!(
+            outcome,
+            RecoveryOutcome::Corrupt {
+                reason: RecoveryReason::MalformedMiddleRecord
+            }
+        ));
+        assert_eq!(fs::read(&path)?, original);
+        let quarantine = fs::read_dir(directory.path())?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| candidate != &path)
+            .ok_or_else(|| anyhow::anyhow!("quarantine artifact was not created"))?;
+        assert_eq!(fs::read(quarantine)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn journal_quarantine_collision_preserves_original() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("operations.jsonl");
+        let original = b"evidence bytes";
+        fs::write(&path, original)?;
+        let digest = &sha256_hex(original)[..16];
+        let first = quarantine_path(&path, 42, digest, 0);
+        fs::write(&first, b"existing evidence")?;
+
+        let second = write_quarantine_at(&path, original, 42, digest)?;
+        assert_ne!(second, first);
+        assert_eq!(fs::read(&path)?, original);
+        assert_eq!(fs::read(first)?, b"existing evidence");
+        assert_eq!(fs::read(second)?, original);
+        Ok(())
+    }
+
+    fn write_quarantine_at(
+        journal_path: &Path,
+        bytes: &[u8],
+        timestamp: u128,
+        digest: &str,
+    ) -> Result<PathBuf> {
+        let parent = journal_path.parent().unwrap_or_else(|| Path::new("."));
+        ensure_safe_parent(parent)?;
+        for nonce in 0_u64..64 {
+            let path = quarantine_path(journal_path, timestamp, digest, nonce);
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(bytes)?;
+                    file.sync_all()?;
+                    flush_parent(parent)?;
+                    return Ok(path);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        anyhow::bail!("failed to allocate a unique journal quarantine path")
     }
 }
