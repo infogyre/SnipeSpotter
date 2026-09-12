@@ -148,6 +148,24 @@ jobs:
           New-Item -ItemType Directory -Force packaged | Out-Null
           Copy-Item $msi.FullName "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64.msi"
           Compress-Archive -Path release-stage/* -DestinationPath "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64-symbols.zip"
+      - name: Verify symbols ZIP contains both PDBs
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = "packaged/SnipeSpotter-$env:RELEASE_VERSION-x64-symbols.zip"
+          $extract = Join-Path ([System.IO.Path]::GetTempPath()) "symbols-verify-$([System.Guid]::NewGuid().ToString('N'))"
+          try {
+            Expand-Archive -LiteralPath $zip -DestinationPath $extract -Force
+            foreach ($pdb in @('spotter_svc.pdb', 'spotter_cli.pdb')) {
+              if (-not (Test-Path -LiteralPath (Join-Path $extract $pdb) -PathType Leaf)) {
+                throw "symbols ZIP is missing required PDB: $pdb"
+              }
+            }
+          } finally {
+            if (Test-Path -LiteralPath $extract) { Remove-Item -LiteralPath $extract -Recurse -Force -ErrorAction SilentlyContinue }
+          }
       - name: Upload packaged artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
