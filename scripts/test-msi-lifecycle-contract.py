@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -240,13 +241,89 @@ def msi_file_table_excludes_pdbs() -> None:
         assert installed_file in PRODUCT_WXS
 
 
+def _symbols_archive_script(package: str) -> str:
+    archive_match = re.search(r"(?m)^\s*(Compress-Archive -Path release-stage/\* -DestinationPath [^\r\n]+)$", package)
+    assert archive_match, "release package must create the symbols ZIP from release-stage"
+    archive_start = archive_match.start()
+    setup_start = package.rfind("New-Item -ItemType Directory -Force packaged", 0, archive_start)
+    assert setup_start >= 0, "symbols archive must create the packaged output directory"
+
+    commands = ["$ErrorActionPreference = 'Stop'", "$env:RELEASE_VERSION = 'contract-test'"]
+    for line in package[setup_start:archive_start].splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if stripped.startswith("New-Item -ItemType Directory -Force packaged") or (
+            any(keyword in lowered for keyword in ("remove-item", "::delete", "clear-content"))
+            and "release-stage" in lowered
+        ):
+            commands.append(stripped)
+    commands.append(archive_match.group(1))
+    return "\n".join(commands)
+
+
+def _assert_symbols_archive_contains_both_pdbs(package: str) -> None:
+    archive_match = re.search(r"(?m)^\s*Compress-Archive -Path release-stage/\* -DestinationPath [^\r\n]+$", package)
+    assert archive_match, "release package must create the symbols ZIP from release-stage"
+    archive_start = archive_match.start()
+    prearchive = package[:archive_start]
+    for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
+        assert symbol in prearchive
+    assert "-symbols.zip" in archive_match.group(0)
+
+    for line in prearchive.splitlines():
+        lowered = line.lower()
+        if "release-stage" in lowered and "pdb" in lowered:
+            assert not any(keyword in lowered for keyword in ("remove-item", "::delete", "clear-content")), (
+                "release package must not delete staged PDBs before creating the symbols ZIP"
+            )
+
+    verifier_start = archive_match.end()
+    verifier = package[verifier_start:]
+    if "Expand-Archive" in verifier or "[io.compression.zipfile]" in verifier.lower():
+        for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
+            assert symbol in verifier
+        assert "-symbols.zip" in verifier
+
+    with tempfile.TemporaryDirectory(prefix="symbols-archive-contract-") as temporary_directory:
+        root = Path(temporary_directory)
+        stage = root / "release-stage"
+        stage.mkdir()
+        for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
+            (stage / symbol).write_bytes(b"contract fixture")
+        result = subprocess.run(
+            ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", _symbols_archive_script(package)],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        archive = root / "packaged" / "SnipeSpotter-contract-test-x64-symbols.zip"
+        assert archive.is_file(), "symbols archive command did not produce the expected ZIP"
+        with zipfile.ZipFile(archive) as produced:
+            entries = {Path(name).name for name in produced.namelist() if not name.endswith("/")}
+        assert {"spotter_svc.pdb", "spotter_cli.pdb"} <= entries
+
+
 def symbols_zip_retains_both_pdbs() -> None:
     workflow = (ROOT.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     package = workflow[workflow.index("  package:") : workflow.index("  lifecycle:")]
-    for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
-        assert symbol in package
-    assert "Compress-Archive -Path release-stage/* -DestinationPath" in package
-    assert "-symbols.zip" in package
+    _assert_symbols_archive_contains_both_pdbs(package)
+
+    deletion_mutation = package.replace(
+        "          Compress-Archive -Path release-stage/* -DestinationPath",
+        "          Remove-Item -LiteralPath release-stage/spotter_svc.pdb\n"
+        "          Compress-Archive -Path release-stage/* -DestinationPath",
+        1,
+    )
+    assert deletion_mutation != package
+    try:
+        _assert_symbols_archive_contains_both_pdbs(deletion_mutation)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("deleting a staged PDB before archive creation was accepted")
 
 
 def release_stage_retains_symbol_inputs() -> None:
