@@ -81,7 +81,7 @@ mapping is complete as a branch-creation precondition.
 
 | Requesting lane | Path | Resolution |
 | --- | --- | --- |
-| (none yet) | | |
+| D (lane-d-msi) | `.github/workflows/release.yml` `package` job | RESOLVED 2026-09-12: orchestrator took sole release-workflow ownership per the plan's shared-edit rule; applied commit `ae5d00a` — a new "Verify symbols ZIP contains both PDBs" step expands the produced ZIP to a temp dir, asserts `spotter_svc.pdb` and `spotter_cli.pdb` exist, throws before artifact upload on absence, and always cleans the temp dir. Workflow/lifecycle/docs contracts re-run and pass. Integration-controlled edit, not part of the reviewed lane D commit; goes through the normal code-review pass with lane F. |
 
 ## Test name registry
 
