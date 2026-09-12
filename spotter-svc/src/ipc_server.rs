@@ -117,18 +117,15 @@ pub async fn run_named_pipe(fsm: FsmHandle) -> Result<()> {
 /// Fixed bound on concurrently active pipe sessions; excess connections are
 /// accepted and promptly closed so saturation cannot queue unbounded tasks.
 #[cfg(windows)]
-#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
 pub const MAX_ACTIVE_PIPE_SESSIONS: usize = 16;
 
 /// Cooperative shutdown signal for the native accept loop.
 #[cfg(windows)]
-#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
 pub struct PipeServerGuard {
     shutdown: tokio_util::sync::CancellationToken,
 }
 
 #[cfg(windows)]
-#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
 impl PipeServerGuard {
     pub fn new() -> Self {
         Self {
@@ -188,7 +185,6 @@ pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> 
 }
 
 #[cfg(windows)]
-#[cfg_attr(not(feature = "test-support"), expect(dead_code))]
 pub async fn run_named_pipe_bounded(
     fsm: FsmHandle,
     pipe_name: impl Into<String>,
