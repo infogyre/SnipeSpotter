@@ -248,7 +248,6 @@ pub async fn run_named_pipe_bounded(
     // Cooperative shutdown: stop accepting, drain active sessions under a
     // bounded deadline, then abort leftovers and observe joins with a fixed
     // diagnostic. This ends response observation, never an FSM cancellation.
-    const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
     let drained = tokio::time::timeout(SHUTDOWN_DRAIN, async {
         while sessions.join_next().await.is_some() {}
     })
@@ -260,6 +259,10 @@ pub async fn run_named_pipe_bounded(
     }
     Ok(())
 }
+
+/// Fixed drain window for cooperative pipe shutdown before leftovers abort.
+#[cfg(windows)]
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[cfg(windows)]
 fn create_secured_server(
