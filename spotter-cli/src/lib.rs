@@ -377,6 +377,7 @@ impl IpcTransport for NamedPipeTransport {
     }
 }
 
+#[cfg(any(windows, test))]
 fn authenticate_serialize_write<A, S, W>(
     command: &ServiceCommand,
     authenticate: A,
