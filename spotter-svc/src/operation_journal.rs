@@ -207,12 +207,59 @@ pub fn classify_bytes(bytes: &[u8]) -> RecoveryOutcome {
 const MARKER_SUFFIX: &str = ".recovery-blocked";
 const QUARANTINE_PREFIX: &str = ".quarantine-";
 
+type QuarantineWriter = dyn Fn(&Path, &[u8]) -> Result<PathBuf>;
+type MarkerWriter = dyn Fn(&Path, &RecoveryReason, &[PathBuf]) -> Result<()>;
+type JournalReplacer = dyn Fn(&Path, &[u8]) -> Result<()>;
+
 /// Return the sticky blocked-marker path associated with an active journal.
 #[must_use]
 pub fn blocked_marker_path(journal_path: &Path) -> PathBuf {
     let mut name = journal_path.file_name().unwrap_or_default().to_os_string();
     name.push(MARKER_SUFFIX);
     journal_path.with_file_name(name)
+}
+
+/// Format bounded, redacted startup diagnostics for a journal recovery outcome.
+#[cfg_attr(
+    all(not(windows), not(test)),
+    expect(
+        dead_code,
+        reason = "the production caller is Windows-only; Linux tests exercise the formatter directly"
+    )
+)]
+#[must_use]
+pub(crate) fn recovery_notice(journal_path: &Path, outcome: &RecoveryOutcome) -> String {
+    let journal_name = journal_path.file_name().map_or_else(
+        || String::from("operations.jsonl"),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    match outcome {
+        RecoveryOutcome::NeedsOperatorRecovery(recovery) => {
+            let evidence_paths = recovery
+                .evidence_paths()
+                .iter()
+                .map(|path| {
+                    path.file_name().map_or_else(
+                        || String::from("unknown"),
+                        |name| name.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "journal={journal_name}; reason={}; evidence_paths={evidence_paths}; validated_record_count={}",
+                recovery.reason(),
+                recovery.validated_record_count()
+            )
+        }
+        RecoveryOutcome::PreservationFailed(failure) => format!(
+            "journal={journal_name}; preservation_failure={failure}; evidence_paths=unavailable; validated_record_count=0"
+        ),
+        RecoveryOutcome::Corrupt { reason } => format!(
+            "journal={journal_name}; reason={reason}; evidence_paths=unavailable; validated_record_count=0"
+        ),
+        RecoveryOutcome::Clean { .. } => String::from("clean"),
+    }
 }
 
 /// Classify and, when safe, durably repair a journal before any replay.
@@ -249,41 +296,55 @@ pub fn recover_journal(journal_path: &Path) -> Result<RecoveryOutcome> {
             });
         }
     };
+    Ok(recover_journal_with(
+        journal_path,
+        &bytes,
+        &marker_path,
+        &write_quarantine,
+        &write_blocked_marker,
+        &crate::atomic_file::write,
+    ))
+}
+
+fn recover_journal_with(
+    journal_path: &Path,
+    bytes: &[u8],
+    marker_path: &Path,
+    write_quarantine_fn: &QuarantineWriter,
+    write_marker_fn: &MarkerWriter,
+    replace_fn: &JournalReplacer,
+) -> RecoveryOutcome {
     let ClassifiedBytes {
         outcome,
         normalize_terminal_newline,
-    } = classify_bytes_internal(&bytes);
+    } = classify_bytes_internal(bytes);
     let RecoveryOutcome::Clean { records } = outcome else {
-        return Ok(preserve_non_clean(
+        return preserve_non_clean(
             journal_path,
-            &bytes,
+            bytes,
             outcome,
-            &marker_path,
-        ));
+            marker_path,
+            write_quarantine_fn,
+            write_marker_fn,
+        );
     };
     if !normalize_terminal_newline {
-        return Ok(RecoveryOutcome::Clean { records });
+        return RecoveryOutcome::Clean { records };
     }
 
-    let Ok(quarantine) = write_quarantine(journal_path, &bytes) else {
-        return Ok(RecoveryOutcome::PreservationFailed(
-            PreservationFailure::QuarantineWrite,
-        ));
+    let Ok(quarantine) = write_quarantine_fn(journal_path, bytes) else {
+        return RecoveryOutcome::PreservationFailed(PreservationFailure::QuarantineWrite);
     };
-    let mut normalized = bytes;
+    let mut normalized = bytes.to_vec();
     normalized.push(b'\n');
-    if crate::atomic_file::write(journal_path, &normalized).is_err() {
-        return Ok(RecoveryOutcome::PreservationFailed(
-            PreservationFailure::Replacement,
-        ));
+    if replace_fn(journal_path, &normalized).is_err() {
+        return RecoveryOutcome::PreservationFailed(PreservationFailure::Replacement);
     }
     if let RecoveryOutcome::Clean { records } = classify_bytes_internal(&normalized).outcome {
-        Ok(RecoveryOutcome::Clean { records })
+        RecoveryOutcome::Clean { records }
     } else {
         let _ = quarantine;
-        Ok(RecoveryOutcome::PreservationFailed(
-            PreservationFailure::Replacement,
-        ))
+        RecoveryOutcome::PreservationFailed(PreservationFailure::Replacement)
     }
 }
 
@@ -292,6 +353,8 @@ fn preserve_non_clean(
     bytes: &[u8],
     outcome: RecoveryOutcome,
     marker_path: &Path,
+    write_quarantine_fn: &QuarantineWriter,
+    write_marker_fn: &MarkerWriter,
 ) -> RecoveryOutcome {
     let (reason, validated_record_count) = match outcome {
         RecoveryOutcome::NeedsOperatorRecovery(recovery) => {
@@ -305,11 +368,11 @@ fn preserve_non_clean(
             unreachable!("clean outcome is handled before preservation")
         }
     };
-    let Ok(quarantine) = write_quarantine(journal_path, bytes) else {
+    let Ok(quarantine) = write_quarantine_fn(journal_path, bytes) else {
         return RecoveryOutcome::PreservationFailed(PreservationFailure::QuarantineWrite);
     };
     if reason == RecoveryReason::IncompleteUnterminatedSuffix
-        && write_blocked_marker(marker_path, &reason, std::slice::from_ref(&quarantine)).is_err()
+        && write_marker_fn(marker_path, &reason, std::slice::from_ref(&quarantine)).is_err()
     {
         return RecoveryOutcome::PreservationFailed(PreservationFailure::MarkerWrite);
     }
@@ -1010,6 +1073,30 @@ mod tests {
     }
 
     #[test]
+    fn recovery_notice_survives_pre_subscriber_window() {
+        let journal_path = Path::new("/var/lib/SnipeSpotter/operations.jsonl");
+        let quarantine =
+            journal_path.with_file_name("operations.jsonl.quarantine-1234-deadbeefdeadbeef");
+        let marker = blocked_marker_path(journal_path);
+        let outcome = RecoveryOutcome::NeedsOperatorRecovery(OperatorRecovery {
+            reason: RecoveryReason::IncompleteUnterminatedSuffix,
+            evidence_paths: vec![quarantine, marker],
+            validated_record_count: 3,
+        });
+
+        let notice = recovery_notice(journal_path, &outcome);
+        assert!(!notice.is_empty());
+        assert!(notice.len() < 512);
+        assert!(notice.contains("reason=incomplete unterminated journal suffix"));
+        assert!(notice.contains(
+            "evidence_paths=operations.jsonl.quarantine-1234-deadbeefdeadbeef,operations.jsonl.recovery-blocked"
+        ));
+        assert!(notice.contains("validated_record_count=3"));
+        assert!(!notice.contains("var/lib"));
+        assert!(!notice.contains('/'));
+    }
+
+    #[test]
     fn journal_recovery_classification_table() {
         let prepared = b"{\"phase\":\"prepared\",\"operation_id\":\"a\",\"operation\":{}}\n";
         assert!(
@@ -1035,6 +1122,137 @@ mod tests {
         let bytes = b"{\"phase\":\"prepared\",\"operation_id\":\"a\",\"operation\":{}}";
         let outcome = classify_bytes(bytes);
         assert!(matches!(outcome, RecoveryOutcome::Clean { records } if records.len() == 1));
+    }
+
+    #[test]
+    fn journal_preservation_failure_is_closed() {
+        let incomplete = br#"{"phase":"prepared","operation_id":"a","operation":{} }
+{"#;
+        let complete = br#"{"phase":"prepared","operation_id":"a","operation":{}}"#;
+        let marker_path = Path::new("operations.jsonl.recovery-blocked");
+        let journal_path = Path::new("operations.jsonl");
+        let failure_cases = [
+            (
+                "quarantine",
+                incomplete.as_slice(),
+                PreservationFailure::QuarantineWrite,
+            ),
+            (
+                "marker",
+                incomplete.as_slice(),
+                PreservationFailure::MarkerWrite,
+            ),
+            (
+                "replacement",
+                complete.as_slice(),
+                PreservationFailure::Replacement,
+            ),
+        ];
+        for (stage, original, expected) in failure_cases {
+            let quarantine = move |_path: &Path, _bytes: &[u8]| -> Result<PathBuf> {
+                if stage == "quarantine" {
+                    anyhow::bail!("injected quarantine failure")
+                }
+                Ok(PathBuf::from("operations.jsonl.quarantine-test"))
+            };
+            let marker = move |_path: &Path,
+                               _reason: &RecoveryReason,
+                               _evidence: &[PathBuf]|
+                  -> Result<()> {
+                if stage == "marker" {
+                    anyhow::bail!("injected marker failure")
+                }
+                Ok(())
+            };
+            let replace = move |_path: &Path, _bytes: &[u8]| -> Result<()> {
+                if stage == "replacement" {
+                    anyhow::bail!("injected replacement failure")
+                }
+                Ok(())
+            };
+            let outcome = recover_journal_with(
+                journal_path,
+                original,
+                marker_path,
+                &quarantine,
+                &marker,
+                &replace,
+            );
+            assert!(
+                matches!(outcome, RecoveryOutcome::PreservationFailed(failure) if failure == expected)
+            );
+        }
+    }
+
+    #[test]
+    fn journal_recovery_crash_boundary_table() {
+        let incomplete = br#"{"phase":"prepared","operation_id":"a","operation":{} }
+{"#;
+        let complete = br#"{"phase":"prepared","operation_id":"a","operation":{}}"#;
+        let journal_path = Path::new("operations.jsonl");
+        let marker_path = Path::new("operations.jsonl.recovery-blocked");
+        let boundaries = [
+            (
+                "preserve",
+                incomplete.as_slice(),
+                true,
+                false,
+                false,
+                PreservationFailure::QuarantineWrite,
+            ),
+            (
+                "marker",
+                incomplete.as_slice(),
+                false,
+                true,
+                false,
+                PreservationFailure::MarkerWrite,
+            ),
+            (
+                "normalize",
+                complete.as_slice(),
+                false,
+                false,
+                true,
+                PreservationFailure::Replacement,
+            ),
+        ];
+        for (boundary, original, fail_quarantine, fail_marker, fail_replace, expected) in boundaries
+        {
+            let quarantine = move |_path: &Path, _bytes: &[u8]| -> Result<PathBuf> {
+                if fail_quarantine {
+                    anyhow::bail!("crash boundary: {boundary} preserve")
+                }
+                Ok(PathBuf::from("operations.jsonl.quarantine-test"))
+            };
+            let marker = move |_path: &Path,
+                               _reason: &RecoveryReason,
+                               _evidence: &[PathBuf]|
+                  -> Result<()> {
+                if fail_marker {
+                    anyhow::bail!("crash boundary: {boundary} marker")
+                }
+                Ok(())
+            };
+            let replace = move |_path: &Path, _bytes: &[u8]| -> Result<()> {
+                if fail_replace {
+                    anyhow::bail!("crash boundary: {boundary} normalize")
+                }
+                Ok(())
+            };
+            let outcome = recover_journal_with(
+                journal_path,
+                original,
+                marker_path,
+                &quarantine,
+                &marker,
+                &replace,
+            );
+            assert!(
+                matches!(outcome, RecoveryOutcome::PreservationFailed(failure) if failure == expected),
+                "boundary={boundary}"
+            );
+        }
     }
 
     #[test]

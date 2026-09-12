@@ -686,7 +686,6 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     crate::windows_acl::apply_acl_contract(&root).context("failed to apply protected data ACL")?;
     apply_runtime_acl_contract(&root)?;
     let journal_path = root.join("operations.jsonl");
-    admit_journal_for_startup(&journal_path)?;
     crate::atomic_file::recover_stale_temporary_files(&root, std::process::id(), 300).inspect_err(
         |e| tracing::warn!(%e, root = %root.display(), "stale temporary-file recovery failed"),
     )?;
@@ -698,16 +697,17 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
         configured = !settings.snipeit.url.is_empty(),
         "settings loaded"
     );
+    let _log_guard = crate::logging::initialize(&root.join("logs"), &settings.logging)
+        .inspect_err(|e| tracing::error!(%e, "failed to initialize logging"))?;
+    apply_runtime_acl_contract(&root)?;
+    tracing::info!("logging initialized");
+    admit_journal_for_startup(&journal_path)?;
     let state_key = crate::state_io::load_or_create_key(&root.join("state-hmac-key.bin"))
         .inspect_err(|e| tracing::error!(%e, "failed to load state key"))?;
     tracing::info!("state key loaded");
     let persisted_state = crate::state_io::load_state(&root.join("state.toml"), &state_key)
         .inspect_err(|e| tracing::error!(%e, "failed to load state"))?;
     tracing::info!("persisted state loaded");
-    let _log_guard = crate::logging::initialize(&root.join("logs"), &settings.logging)
-        .inspect_err(|e| tracing::error!(%e, "failed to initialize logging"))?;
-    apply_runtime_acl_contract(&root)?;
-    tracing::info!("logging initialized");
     let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
     let status_handle = register_controls(&runtime.service_name, shutdown_sender)
         .inspect_err(|e| tracing::error!(%e, "failed to register controls"))?;
@@ -918,36 +918,9 @@ fn admit_journal_for_startup(journal_path: &Path) -> Result<()> {
     ) {
         return Ok(());
     }
-    let notice = recovery_notice(journal_path, &outcome);
+    let notice = crate::operation_journal::recovery_notice(journal_path, &outcome);
     tracing::error!(notice = %notice, "operation journal recovery blocked service startup");
     anyhow::bail!("operation journal recovery is not clean; service startup blocked")
-}
-
-fn recovery_notice(
-    journal_path: &Path,
-    outcome: &crate::operation_journal::RecoveryOutcome,
-) -> String {
-    // Keep startup diagnostics bounded and independent of journal payloads, quarantine names, and
-    // user-controlled data. The basename is enough to identify the durable gate without exposing
-    // a profile or machine path.
-    let journal_name = journal_path.file_name().map_or_else(
-        || String::from("operations.jsonl"),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    match outcome {
-        crate::operation_journal::RecoveryOutcome::NeedsOperatorRecovery(recovery) => format!(
-            "journal={journal_name}; reason={}; validated_record_count={}",
-            recovery.reason(),
-            recovery.validated_record_count()
-        ),
-        crate::operation_journal::RecoveryOutcome::PreservationFailed(failure) => {
-            format!("journal={journal_name}; preservation_failure={failure}")
-        }
-        crate::operation_journal::RecoveryOutcome::Corrupt { reason } => {
-            format!("journal={journal_name}; reason={reason}")
-        }
-        crate::operation_journal::RecoveryOutcome::Clean { .. } => String::from("clean"),
-    }
 }
 
 fn register_controls(
@@ -1150,14 +1123,18 @@ mod tests {
 {"#,
         )?;
         let outcome = crate::operation_journal::recover_journal(&journal_path)?;
-        let notice = recovery_notice(&journal_path, &outcome);
+        let notice = crate::operation_journal::recovery_notice(&journal_path, &outcome);
         assert!(notice.len() < 512);
         assert!(notice.contains("incomplete unterminated journal suffix"));
         assert!(notice.contains("journal=operations.jsonl"));
+        assert!(notice.contains("evidence_paths=operations.jsonl.quarantine-"));
+        assert!(notice.contains("operations.jsonl.recovery-blocked"));
         assert!(notice.contains("validated_record_count=1"));
         assert!(!notice.contains("operation_id"));
         assert!(!notice.contains("raw-body"));
         assert!(!notice.contains(directory.path().to_string_lossy().as_ref()));
+        assert!(!notice.contains("/"));
+        assert!(!notice.contains("\\\\"));
         Ok(())
     }
 
