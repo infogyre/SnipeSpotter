@@ -410,10 +410,10 @@ fn actual_binary_rejects_secret_and_unknown_selectors_before_transport() {
         if selector == "snipeit.api_token_encrypted" {
             assert_eq!(
                 stderr,
-                "error: use the set-token command to update the API token\\n"
+                "error: use the set-token command to update the API token\n"
             );
         } else {
-            assert_eq!(stderr, "error: unknown configuration field\\n");
+            assert_eq!(stderr, "error: unknown configuration field\n");
         }
     }
 }
