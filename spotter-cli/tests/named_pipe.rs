@@ -707,6 +707,92 @@ fn identity_fixture_actor_boundary() -> Result<()> {
 
 #[cfg(feature = "test-support")]
 #[test]
+fn installed_service_authenticates_and_reconnects() -> Result<()> {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use windows_service::{
+        service::{ServiceAccess, ServiceState},
+        service_manager::{ServiceManager, ServiceManagerAccess},
+    };
+
+    let manager = match ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    {
+        Ok(manager) => manager,
+        Err(error) => {
+            eprintln!(
+                "SKIPPED: installed_service_authenticates_and_reconnects: SCM unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let service = match manager.open_service(
+        spotter_core::identity::SERVICE_NAME,
+        ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(service) => service,
+        Err(error) => {
+            eprintln!(
+                "SKIPPED: installed_service_authenticates_and_reconnects: SnipeSpotter is not installed: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let status = match service.query_status() {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!(
+                "SKIPPED: installed_service_authenticates_and_reconnects: service status unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    if status.current_state != ServiceState::Running {
+        eprintln!(
+            "SKIPPED: installed_service_authenticates_and_reconnects: SnipeSpotter is not running ({:?})",
+            status.current_state
+        );
+        return Ok(());
+    }
+    drop(service);
+
+    let endpoint = spotter_core::PIPE_NAME;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut pipe = loop {
+        match OpenOptions::new().read(true).write(true).open(endpoint) {
+            Ok(pipe) => break pipe,
+            Err(error) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = error;
+            }
+            Err(error) => return Err(error).context("installed SnipeSpotter pipe did not open"),
+        }
+    };
+    let mut request = serde_json::to_vec(&ServiceCommand::GetStatus)?;
+    request.push(b'\n');
+    pipe.write_all(&request)?;
+    pipe.flush()?;
+    let mut response = String::new();
+    BufReader::new(pipe).read_line(&mut response)?;
+    assert!(
+        response.ends_with('\n'),
+        "genuine service response must be newline framed"
+    );
+
+    let mut reconnect = NamedPipeTransport::new(Duration::from_secs(10));
+    let first = reconnect.send(&ServiceCommand::GetStatus)?;
+    let second = reconnect.send(&ServiceCommand::GetStatus)?;
+    assert!(matches!(
+        first,
+        IpcResponse::Status { .. } | IpcResponse::StatusFull { .. }
+    ));
+    assert!(matches!(
+        second,
+        IpcResponse::Status { .. } | IpcResponse::StatusFull { .. }
+    ));
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
 fn identity_fixture_failure_cleanup() -> Result<()> {
     let endpoint = unique_pipe_endpoint();
     let (ready_sender, ready_receiver) = mpsc::sync_channel(0);

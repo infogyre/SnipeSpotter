@@ -12,13 +12,18 @@ use anyhow::{Context as _, Result, bail};
 use thiserror::Error;
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree, STILL_ACTIVE},
+        Foundation::{
+            CloseHandle, ERROR_NOT_ALL_ASSIGNED, HANDLE, HLOCAL, LocalFree, STILL_ACTIVE,
+        },
         Security::{
+            AdjustTokenPrivileges,
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
             },
-            GetTokenInformation, IsWellKnownSid, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
-            TOKEN_QUERY, TOKEN_USER, TokenUser, WinLocalSystemSid,
+            GetTokenInformation, IsWellKnownSid, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+            PSECURITY_DESCRIPTOR, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+            WinLocalSystemSid,
         },
     },
     core::{PCWSTR, PWSTR, w},
@@ -125,6 +130,8 @@ fn native_query(
         },
     };
 
+    enable_debug_privilege().map_err(identity_failure)?;
+
     let mut process_id = 0_u32;
     // SAFETY: `pipe` is the connected client handle and `process_id` is a writable out-parameter.
     unsafe { GetNamedPipeServerProcessId(pipe, &raw mut process_id) }.map_err(identity_failure)?;
@@ -195,7 +202,11 @@ fn native_query(
 
     let image_path = query_image_path(process.raw()).map_err(identity_failure)?;
     let expected_path = query_service_binary_path(service_name).map_err(identity_failure)?;
-    if !paths_equal_case_insensitive(&image_path, &expected_path) {
+    let image_path_canonical =
+        canonicalize_without_reparse(image_path.clone()).map_err(identity_failure)?;
+    let expected_path_canonical =
+        canonicalize_without_reparse(expected_path).map_err(identity_failure)?;
+    if !paths_equal_case_insensitive(&image_path_canonical, &expected_path_canonical) {
         return Err(ServiceIdentityError::UnexpectedExecutable {
             observed_path: image_path,
         });
@@ -303,10 +314,135 @@ pub fn paths_equal_case_insensitive(left: &std::path::Path, right: &std::path::P
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
+fn enable_debug_privilege() -> Result<()> {
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: The current process pseudo-handle is valid and `token` is writable output storage.
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &raw mut token,
+        )
+    }
+    .context("failed to open current-process token for SeDebugPrivilege")?;
+    let token = OwnedHandle(token);
+    if token.raw().is_invalid() {
+        bail!("Windows returned an invalid current-process token handle")
+    }
+
+    let mut luid = windows::Win32::Foundation::LUID::default();
+    // SAFETY: The fixed privilege name is NUL-terminated and `luid` is writable output storage.
+    unsafe { LookupPrivilegeValueW(None, SE_DEBUG_NAME, &raw mut luid) }
+        .context("failed to look up SeDebugPrivilege")?;
+    let privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    // SAFETY: `privileges` contains one initialized privilege and remains alive for the call.
+    unsafe {
+        AdjustTokenPrivileges(
+            token.raw(),
+            false,
+            Some(&raw const privileges),
+            0,
+            None,
+            None,
+        )
+    }
+    .context("failed to enable SeDebugPrivilege")?;
+    // AdjustTokenPrivileges can return success while setting ERROR_NOT_ALL_ASSIGNED when the
+    // caller's token lacks the privilege. Treat that state as an authentication failure.
+    // SAFETY: GetLastError reads the thread-local result from the immediately preceding API call.
+    if unsafe { windows::Win32::Foundation::GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+        bail!("SeDebugPrivilege is not assigned to the current process token")
+    }
+    Ok(())
+}
+
 fn canonicalize_without_reparse(path: PathBuf) -> Result<PathBuf> {
-    // The SCM path is trusted only as a configured profile. Existing canonicalization is performed
-    // without opening the process image through an attacker-controlled reparse path.
-    Ok(path)
+    use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+    use windows::Win32::{
+        Foundation::GENERIC_READ,
+        Storage::FileSystem::{
+            CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FileAttributeTagInfo, GetFileInformationByHandleEx,
+            GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
+        },
+    };
+
+    validate_path_components(&path)?;
+    let path_wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // Opening with OPEN_REPARSE_POINT inspects the named object itself instead of traversing a
+    // reparse link. FILE_NAME_NORMALIZED then expands DOS 8.3 aliases and emits a stable DOS path
+    // for both the SCM-configured executable and the observed process image.
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .context("failed to open executable for reparse-free canonicalization")?;
+    let handle = OwnedHandle(handle);
+
+    let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: `attributes` is the correctly sized writable output for FileAttributeTagInfo.
+    unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileAttributeTagInfo,
+            std::ptr::addr_of_mut!(attributes).cast(),
+            u32::try_from(std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>())?,
+        )
+    }
+    .context("failed to inspect executable reparse attributes")?;
+    if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        bail!("executable path is a reparse point")
+    }
+
+    let mut buffer = vec![0_u16; 32_768];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            handle.raw(),
+            &mut buffer,
+            windows::Win32::Storage::FileSystem::GETFINALPATHNAMEBYHANDLE_FLAGS(
+                FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0,
+            ),
+        )
+    };
+    let length = usize::try_from(length).context("normalized executable path length overflowed")?;
+    if length == 0 || length > buffer.len() {
+        bail!("failed to normalize executable path")
+    }
+    buffer.truncate(length);
+    Ok(PathBuf::from(OsString::from_wide(&buffer)))
+}
+
+fn validate_path_components(path: &std::path::Path) -> Result<()> {
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            continue;
+        };
+        let component = component.to_string_lossy();
+        if component.ends_with(['.', ' ']) {
+            bail!("executable path contains a trailing dot or space")
+        }
+    }
+    Ok(())
 }
 
 fn executable_from_command_line(command_line: &str) -> Result<String> {
@@ -451,6 +587,34 @@ mod tests {
             std::path::Path::new(r"C:\SnipeSpotter\spotter-svc.exe"),
             std::path::Path::new(r"c:\snipespotter\SPOTTER-SVC.EXE"),
         ));
+    }
+
+    #[test]
+    fn path_comparison_does_not_ignore_trailing_dot_or_space() {
+        assert!(!paths_equal_case_insensitive(
+            std::path::Path::new(r"C:\SnipeSpotter\spotter-svc.exe"),
+            std::path::Path::new(r"C:\SnipeSpotter\spotter-svc.exe."),
+        ));
+        assert!(!paths_equal_case_insensitive(
+            std::path::Path::new(r"C:\SnipeSpotter\spotter-svc.exe"),
+            std::path::Path::new(r"C:\SnipeSpotter\spotter-svc.exe "),
+        ));
+    }
+
+    #[test]
+    fn path_component_policy_rejects_trailing_dot_or_space() {
+        assert!(
+            validate_path_components(std::path::Path::new(r"C:\SnipeSpotter\spotter-svc.exe.",))
+                .is_err()
+        );
+        assert!(
+            validate_path_components(std::path::Path::new(r"C:\SnipeSpotter\spotter-svc.exe ",))
+                .is_err()
+        );
+        assert!(
+            validate_path_components(std::path::Path::new(r"C:\SnipeSpotter\spotter-svc.exe",))
+                .is_ok()
+        );
     }
 
     #[test]

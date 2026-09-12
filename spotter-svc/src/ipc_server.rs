@@ -290,6 +290,16 @@ fn create_secured_server(
     }
 }
 
+/// Test-support construction of one secured named-pipe instance, including the first-instance flag.
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub fn create_secured_server_for_tests(
+    pipe_name: &str,
+    first_instance: bool,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    create_secured_server(pipe_name, first_instance)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
