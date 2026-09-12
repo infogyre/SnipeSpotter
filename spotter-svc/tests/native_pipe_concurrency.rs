@@ -56,7 +56,7 @@ fn marker_path(label: &str) -> std::path::PathBuf {
 /// Minimal named-pipe client: connect, send one JSON command line, read one
 /// JSON response line. Mirrors the wire protocol exercised by the CLI.
 fn client_roundtrip(endpoint: &str, command: &ServiceCommand) -> Result<IpcResponse> {
-    use std::io::{Read as _, Write as _};
+    use std::io::{BufRead as _, Read as _, Write as _};
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut file = loop {
@@ -77,8 +77,9 @@ fn client_roundtrip(endpoint: &str, command: &ServiceCommand) -> Result<IpcRespo
     file.write_all(&request)?;
     file.flush()?;
     let mut response = Vec::new();
-    let mut limited = file.take((IPC_MAX_LINE_BYTES + 1) as u64);
-    let read = std::io::BufRead::read_until(&mut limited, b'\n', &mut response)
+    let mut limited = std::io::BufReader::new(file).take((IPC_MAX_LINE_BYTES + 1) as u64);
+    let read = limited
+        .read_until(b'\n', &mut response)
         .context("named-pipe client read failed")?;
     drop(limited);
     if read == 0 {
