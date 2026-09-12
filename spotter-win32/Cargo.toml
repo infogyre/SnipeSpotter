@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 spotter-core = { path = "../spotter-core", version = "=0.1.0" }
+thiserror = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 anyhow = { workspace = true }

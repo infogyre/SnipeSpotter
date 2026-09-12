@@ -15,6 +15,12 @@ use spotter_core::ipc::{IpcResponse, ServiceCommand, validate_config_field};
 use cli_output::{render_config, render_status, validate_selector};
 
 mod cli_output;
+mod command_line;
+
+pub use command_line::executable_from_command_line;
+
+#[cfg(windows)]
+use spotter_win32::pipe::{NativeServerIdentityQuery, ServerIdentityQuery, ServiceIdentityError};
 
 /// Exit status used when the Windows service IPC endpoint is unavailable.
 pub const EXIT_SERVICE_UNAVAILABLE: i32 = 2;
@@ -275,6 +281,10 @@ pub struct NamedPipeTransport {
     timeout: Duration,
     #[cfg(windows)]
     endpoint: String,
+    #[cfg(windows)]
+    identity_query: std::sync::Arc<dyn ServerIdentityQuery>,
+    #[cfg(windows)]
+    service_name: String,
 }
 
 impl NamedPipeTransport {
@@ -287,6 +297,10 @@ impl NamedPipeTransport {
             timeout,
             #[cfg(windows)]
             endpoint: String::from(spotter_core::PIPE_NAME),
+            #[cfg(windows)]
+            identity_query: std::sync::Arc::new(NativeServerIdentityQuery),
+            #[cfg(windows)]
+            service_name: String::from(spotter_core::identity::SERVICE_NAME),
         }
     }
 
@@ -297,6 +311,25 @@ impl NamedPipeTransport {
         Self {
             timeout,
             endpoint: endpoint.into(),
+            identity_query: std::sync::Arc::new(NativeServerIdentityQuery),
+            service_name: String::from(spotter_core::identity::SERVICE_NAME),
+        }
+    }
+
+    /// Construct an endpoint transport with an injected identity query for test-support builds.
+    #[must_use]
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn with_identity_query(
+        timeout: Duration,
+        endpoint: impl Into<String>,
+        service_name: impl Into<String>,
+        identity_query: impl ServerIdentityQuery + 'static,
+    ) -> Self {
+        Self {
+            timeout,
+            endpoint: endpoint.into(),
+            identity_query: std::sync::Arc::new(identity_query),
+            service_name: service_name.into(),
         }
     }
 
@@ -321,8 +354,15 @@ impl IpcTransport for NamedPipeTransport {
         let command = command.clone();
         let endpoint = self.endpoint.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let identity_query = std::sync::Arc::clone(&self.identity_query);
+        let service_name = self.service_name.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(exchange_named_pipe(&command, &endpoint));
+            let _ = sender.send(exchange_named_pipe(
+                &command,
+                &endpoint,
+                &service_name,
+                identity_query.as_ref(),
+            ));
         });
         receiver
             .recv_timeout(self.timeout)
@@ -338,11 +378,17 @@ impl IpcTransport for NamedPipeTransport {
 }
 
 #[cfg(windows)]
-fn exchange_named_pipe(command: &ServiceCommand, endpoint: &str) -> Result<IpcResponse> {
+fn exchange_named_pipe(
+    command: &ServiceCommand,
+    endpoint: &str,
+    service_name: &str,
+    identity_query: &dyn ServerIdentityQuery,
+) -> Result<IpcResponse> {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 
     use std::os::windows::fs::OpenOptionsExt as _;
-    use windows::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::{Foundation::HANDLE, Storage::FileSystem::SECURITY_IDENTIFICATION};
 
     // Identification SQOS limits a malicious pipe server's impersonation level. It does not
     // authenticate the server or prevent token theft; SPOTR-5 therefore remains open.
@@ -352,6 +398,11 @@ fn exchange_named_pipe(command: &ServiceCommand, endpoint: &str) -> Result<IpcRe
         .security_qos_flags(SECURITY_IDENTIFICATION.0)
         .open(endpoint)
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
+    let _identity = identity_query
+        .query(HANDLE(pipe.as_raw_handle()), service_name)
+        .map_err(anyhow::Error::new)
+        .context("service identity authentication failed")?;
+
     let mut request = serde_json::to_vec(command).context("failed to encode service request")?;
     request.push(b'\n');
     if request.len() > IPC_MAX_LINE_BYTES {
