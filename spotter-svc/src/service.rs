@@ -201,9 +201,8 @@ impl CommandOwner {
             return;
         };
         let configured = self.controller.state != crate::FsmState::Unconfigured;
-        let interval = std::time::Duration::from_secs(
-            u64::from(self.controller.settings.polling.interval_hours) * 3600,
-        );
+        let interval =
+            std::time::Duration::from_secs(self.controller.settings.polling.interval_hours * 3600);
         publisher.activate_configuration(configured, interval);
     }
 
@@ -840,14 +839,6 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     })?;
 
     set_status(&status_handle, ServiceState::Stopped, 0, Duration::ZERO)
-}
-
-/// Publishes the scheduler input for startup activation and arms the
-/// scheduler task with the loaded configuration.
-impl crate::status_publisher::StatusPublisher {
-    pub(crate) fn publish_schedule_input(&self, configured: bool, interval: std::time::Duration) {
-        self.activate_configuration(configured, interval);
-    }
 }
 
 pub(crate) async fn recover_owner_state(

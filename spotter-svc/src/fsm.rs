@@ -123,14 +123,6 @@ impl FsmHandle {
         Ok(project_status(&status, &schedule, full))
     }
 
-    #[cfg_attr(not(windows), expect(dead_code))]
-    async fn enqueue_serialized(
-        &self,
-        command: ServiceCommand,
-    ) -> Result<oneshot::Receiver<IpcResponse>> {
-        self.enqueue(command).await
-    }
-
     /// Enqueue one command and return its response receiver before waiting for completion.
     ///
     /// This is crate-visible so the test-support owner harness can exercise a disconnected

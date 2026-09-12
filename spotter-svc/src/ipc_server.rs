@@ -126,7 +126,15 @@ pub struct PipeServerGuard {
 }
 
 #[cfg(windows)]
+impl Default for PipeServerGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(windows)]
 impl PipeServerGuard {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             shutdown: tokio_util::sync::CancellationToken::new(),
@@ -137,11 +145,13 @@ impl PipeServerGuard {
         self.shutdown.cancel();
     }
 
+    #[must_use]
     pub fn subscribe(&self) -> tokio_util::sync::CancellationToken {
         self.shutdown.clone()
     }
 
     /// Alias kept for test readability: yields an independent token handle.
+    #[must_use]
     pub fn clone_token(&self) -> Self {
         Self {
             shutdown: self.shutdown.clone(),
@@ -149,7 +159,6 @@ impl PipeServerGuard {
     }
 }
 
-#[cfg(windows)]
 /// Run the secured named-pipe accept loop on an explicit endpoint with
 /// bounded concurrent sessions and cooperative shutdown.
 ///
@@ -157,8 +166,8 @@ impl PipeServerGuard {
 /// [`run_named_pipe`], which preserves the fixed product pipe identity.
 ///
 /// # Errors
-/// Returns an error when pipe creation fails or the shutdown drain exceeds
-/// its deadline.
+/// Returns an error when pipe creation fails or a client session fails.
+#[cfg(windows)]
 pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> Result<()> {
     // Sequential compatibility loop for the CLI named-pipe tests: connect,
     // serve inline, repeat. The production service uses
@@ -173,10 +182,10 @@ pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> 
         }
         let server = create_secured_server(&pipe_name)?;
         tokio::select! {
-            connected = server.connect() => {
-                connected.context("named-pipe client connect failed")?;
+            outcome = server.connect() => {
+                outcome.context("named-pipe client connect failed")?;
             }
-            _ = session_token.cancelled() => return Ok(()),
+            () = session_token.cancelled() => return Ok(()),
         }
         if let Err(error) = serve_one(server, &fsm).await {
             tracing::warn!(%error, "IPC client session failed");
@@ -184,6 +193,11 @@ pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> 
     }
 }
 
+/// Run the bounded named-pipe accept loop with cooperative shutdown.
+///
+/// # Errors
+/// Returns an error when pipe creation fails or the shutdown drain exceeds
+/// its deadline.
 #[cfg(windows)]
 pub async fn run_named_pipe_bounded(
     fsm: FsmHandle,
@@ -208,20 +222,20 @@ pub async fn run_named_pipe_bounded(
             while sessions.try_join_next().is_some() {}
             let server = create_secured_server(&pipe_name)?;
             tokio::select! {
-                connected = server.connect() => {
-                    connected.context("named-pipe client connect failed")?;
+                outcome = server.connect() => {
+                    outcome.context("named-pipe client connect failed")?;
                 }
-                _ = shutdown.cancelled() => break,
+                () = shutdown.cancelled() => break,
             }
             drop(server);
             continue;
         }
         let server = create_secured_server(&pipe_name)?;
         tokio::select! {
-            connected = server.connect() => {
-                connected.context("named-pipe client connect failed")?;
+            outcome = server.connect() => {
+                outcome.context("named-pipe client connect failed")?;
             }
-            _ = shutdown.cancelled() => break,
+            () = shutdown.cancelled() => break,
         }
         let fsm = fsm.clone();
         sessions.spawn(async move {

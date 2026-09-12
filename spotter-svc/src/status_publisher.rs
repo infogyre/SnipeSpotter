@@ -117,19 +117,6 @@ impl StatusPublisher {
         self.publish(state, snipeit_url, configured, persisted);
     }
 
-    /// Publish the committed-state snapshot for an in-place state change
-    /// (mutation start/finish) without touching the schedule generation.
-    #[cfg_attr(not(windows), expect(dead_code))]
-    pub(crate) fn publish_state_change(
-        &self,
-        state: &str,
-        snipeit_url: &str,
-        configured: bool,
-        persisted: &spotter_core::state::ServiceState,
-    ) {
-        self.publish(state, snipeit_url, configured, persisted);
-    }
-
     /// Advance the configuration generation and republish the scheduler input
     /// after settings persist and activate.
     #[cfg_attr(not(windows), expect(dead_code))]
