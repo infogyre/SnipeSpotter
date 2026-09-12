@@ -40,10 +40,27 @@ Baseline failures: NONE. No pre-existing failing test blocks any lane.
 
 | Lane | Contract file | plan-reviewer verdict | Operator confirmation | Status |
 | --- | --- | --- | --- | --- |
-| A — pipe identity (SPOTR-5) | pending | pending | pending | NOT STARTED |
-| B — journal recovery (SPOTR-7) | pending | pending | pending | NOT STARTED |
-| C — hardware host (SPOTR-9/24) | pending | pending | pending | NOT STARTED |
-| D — token ownership (SPOTR-17) | pending | pending | pending | NOT STARTED |
+| A — pipe identity (SPOTR-5) | `docs/plans/design-note.md` §A | APPROVED (REV-2, all findings resolved) | CONFIRMED 2026-09-12 | APPROVED FOR IMPLEMENTATION |
+| B — journal recovery (SPOTR-7) | `docs/plans/design-note.md` §B | APPROVED (REV-2, all findings resolved) | CONFIRMED 2026-09-12 | APPROVED FOR IMPLEMENTATION |
+| C — hardware host (SPOTR-9/24) | `docs/plans/design-note.md` §C | APPROVED (REV-2, all findings resolved) | CONFIRMED 2026-09-12 | APPROVED FOR IMPLEMENTATION |
+| D — token ownership (SPOTR-17) | `docs/plans/design-note.md` §D | APPROVED (REV-2, all findings resolved) | CONFIRMED 2026-09-12 | APPROVED FOR IMPLEMENTATION (after A+B integrate) |
+
+## Operator authorization record (2026-09-12)
+
+- Contracts A, B, C (and E's design): operator confirmed everything is approved.
+- External actions: push/PR authorized — "Once the PR is pushed and ready, then you may merge."
+  Merge permitted only after the PR is ready; integration branch goes up as a PR, not a direct
+  main push.
+- Jira: updates (comments) authorized at any time; issue CLOSURE only post-merge.
+
+### Ownership grants recorded for this wave
+
+- Lane B: granted sole ownership of the startup/recovery portions of `spotter-svc/src/service.rs`
+  (classification-first ordering per design note §B.3) and test-support `lib.rs` portions it needs.
+- Lane A: may edit `spotter-cli`/`spotter-svc`/`spotter-win32` crate manifests (feature additions on
+  the pinned workspace `windows` dep) and regenerate `Cargo.lock` — root `Cargo.toml` stays untouched.
+- Lane C: may edit `spotter-hardware-service` crate manifest and workflow/scripts; same root-manifest
+  prohibition. Lockfile changes resolve at serial integration.
 
 Fixture work (lane E) may begin only after the owning lane's contract is recorded here.
 
