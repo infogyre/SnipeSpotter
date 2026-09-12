@@ -242,17 +242,21 @@ def msi_file_table_excludes_pdbs() -> None:
 
 
 def _symbols_archive_script(package: str) -> str:
-    archive_match = re.search(r"(?m)^\s*(Compress-Archive -Path release-stage/\* -DestinationPath [^\r\n]+)$", package)
+    archive_match = re.search(
+        r"(?m)^\s*(Compress-Archive -Path release-stage/\* -DestinationPath [^\r\n]+)$",
+        package,
+        re.IGNORECASE,
+    )
     assert archive_match, "release package must create the symbols ZIP from release-stage"
     archive_start = archive_match.start()
-    setup_start = package.rfind("New-Item -ItemType Directory -Force packaged", 0, archive_start)
+    setup_start = package.lower().rfind("new-item -itemtype directory -force packaged", 0, archive_start)
     assert setup_start >= 0, "symbols archive must create the packaged output directory"
 
     commands = ["$ErrorActionPreference = 'Stop'", "$env:RELEASE_VERSION = 'contract-test'"]
     for line in package[setup_start:archive_start].splitlines():
         stripped = line.strip()
         lowered = stripped.lower()
-        if stripped.startswith("New-Item -ItemType Directory -Force packaged") or (
+        if lowered.startswith("new-item -itemtype directory -force packaged") or (
             any(keyword in lowered for keyword in ("remove-item", "::delete", "clear-content"))
             and "release-stage" in lowered
         ):
@@ -262,7 +266,11 @@ def _symbols_archive_script(package: str) -> str:
 
 
 def _assert_symbols_archive_contains_both_pdbs(package: str) -> None:
-    archive_match = re.search(r"(?m)^\s*Compress-Archive -Path release-stage/\* -DestinationPath [^\r\n]+$", package)
+    archive_match = re.search(
+        r"(?m)^\s*Compress-Archive -Path release-stage/\* -DestinationPath [^\r\n]+$",
+        package,
+        re.IGNORECASE,
+    )
     assert archive_match, "release package must create the symbols ZIP from release-stage"
     archive_start = archive_match.start()
     prearchive = package[:archive_start]
@@ -311,11 +319,12 @@ def symbols_zip_retains_both_pdbs() -> None:
     package = workflow[workflow.index("  package:") : workflow.index("  lifecycle:")]
     _assert_symbols_archive_contains_both_pdbs(package)
 
-    deletion_mutation = package.replace(
-        "          Compress-Archive -Path release-stage/* -DestinationPath",
-        "          Remove-Item -LiteralPath release-stage/spotter_svc.pdb\n"
-        "          Compress-Archive -Path release-stage/* -DestinationPath",
-        1,
+    deletion_mutation = re.sub(
+        r"(?m)^([ \t]*)(Compress-Archive -Path release-stage/\* -DestinationPath)",
+        r"\1Remove-Item -LiteralPath release-stage/spotter_svc.pdb\n\1\2",
+        package,
+        count=1,
+        flags=re.IGNORECASE,
     )
     assert deletion_mutation != package
     try:
