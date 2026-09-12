@@ -5,7 +5,11 @@
 )]
 
 use std::{
-    fs::OpenOptions, io::Write as _, os::windows::io::AsRawHandle as _, sync::mpsc, time::Duration,
+    fs::OpenOptions,
+    io::Write as _,
+    os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _},
+    sync::mpsc,
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result};
@@ -599,5 +603,157 @@ fn server_identity_failures_reject_before_write() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("byte-counting server panicked"))??;
         assert_eq!(received, 0, "identity failure must send zero request bytes");
     }
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn a0_probe_named_pipe_server_process_id() -> Result<()> {
+    use windows::Win32::System::Pipes::GetNamedPipeServerProcessId;
+
+    let endpoint = unique_pipe_endpoint();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let server_endpoint = endpoint.clone();
+    let server = std::thread::spawn(move || {
+        let endpoint = server_endpoint
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let security = spotter_win32::pipe::create_admin_pipe_security_attributes()?;
+        let pipe = OwnedHandle(unsafe {
+            CreateNamedPipeW(
+                PCWSTR(endpoint.as_ptr()),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                Some(security.as_ptr()),
+            )
+        });
+        if pipe.0.is_invalid() {
+            return Err(anyhow::Error::new(std::io::Error::last_os_error()));
+        }
+        ready_sender
+            .send(())
+            .map_err(|_| anyhow::anyhow!("failed to announce A.0 probe server"))?;
+        unsafe { ConnectNamedPipe(pipe.0, None) }.or_else(|error| {
+            if error.code() == ERROR_PIPE_CONNECTED.to_hresult() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })?;
+        Ok::<u32, anyhow::Error>(std::process::id())
+    });
+    ready_receiver.recv_timeout(Duration::from_secs(5))?;
+    let client = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .security_qos_flags(windows::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION.0)
+        .open(&endpoint)?;
+    let mut observed = 0_u32;
+    unsafe { GetNamedPipeServerProcessId(HANDLE(client.as_raw_handle()), &raw mut observed) }?;
+    let server_pid = server
+        .join()
+        .map_err(|_| anyhow::anyhow!("A.0 probe server panicked"))??;
+    assert_ne!(observed, 0, "a connected pipe must report a server PID");
+    assert_eq!(observed, server_pid, "server PID identity must be stable");
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn counterfeit_server_receives_no_request_bytes() -> Result<()> {
+    let endpoint = unique_pipe_endpoint();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let server_endpoint = endpoint.clone();
+    let server = std::thread::spawn(move || receive_request_bytes(&server_endpoint, &ready_sender));
+    ready_receiver.recv_timeout(Duration::from_secs(5))?;
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut transport = fixture_transport(
+        endpoint,
+        FixtureIdentityQuery {
+            result: Err(FixtureIdentityFailure::UnexpectedPath),
+            calls: std::sync::Arc::clone(&calls),
+        },
+    );
+    assert!(transport.send(&ServiceCommand::GetStatus).is_err());
+    drop(transport);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("server panicked"))??,
+        0
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn identity_fixture_actor_boundary() -> Result<()> {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fixture = FixtureIdentityQuery {
+        result: Ok(()),
+        calls: std::sync::Arc::clone(&calls),
+    };
+    let identity = fixture.query(HANDLE::default(), "SnipeSpotter-fixture")?;
+    assert_eq!(identity.account_sid, "S-1-5-18");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn identity_fixture_failure_cleanup() -> Result<()> {
+    let endpoint = unique_pipe_endpoint();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let server_endpoint = endpoint.clone();
+    let server = std::thread::spawn(move || receive_request_bytes(&server_endpoint, &ready_sender));
+    ready_receiver.recv_timeout(Duration::from_secs(5))?;
+    let mut transport = fixture_transport(
+        endpoint,
+        FixtureIdentityQuery {
+            result: Err(FixtureIdentityFailure::Query),
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        },
+    );
+    assert!(transport.send(&ServiceCommand::GetStatus).is_err());
+    drop(transport);
+    assert_eq!(
+        server
+            .join()
+            .map_err(|_| anyhow::anyhow!("server panicked"))??,
+        0
+    );
+    Ok(())
+}
+
+#[cfg(feature = "test-support")]
+#[test]
+fn server_exit_during_authentication_fails_closed() -> Result<()> {
+    let endpoint = unique_pipe_endpoint();
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(0);
+    let server_endpoint = endpoint.clone();
+    let server = std::thread::spawn(move || receive_request_bytes(&server_endpoint, &ready_sender));
+    ready_receiver.recv_timeout(Duration::from_secs(5))?;
+    let mut transport = fixture_transport(
+        endpoint,
+        FixtureIdentityQuery {
+            result: Err(FixtureIdentityFailure::ProcessExit),
+            calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        },
+    );
+    assert!(
+        transport
+            .send(&ServiceCommand::SetToken {
+                value: String::from("no-write")
+            })
+            .is_err()
+    );
+    drop(transport);
+    assert!(server.join().is_ok());
     Ok(())
 }
