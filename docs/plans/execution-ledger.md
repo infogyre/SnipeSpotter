@@ -146,6 +146,14 @@ Fill with command, SHA, pass/fail/skip, CI link. Host is Linux; all native Windo
 | --- | --- | --- | --- | --- |
 | 2026-09-11 | scope commit | 2682885523572e46f71dac5b2ee82c7c26e27620 | 237ef56f | first commit on integration branch |
 
+## Lane D (SPOTR-28) review + integration record
+
+- Round 1 (`c2b7c37`): PDB components removed from `installer/Product.wxs`; negative installed-file checks added to `scripts/test-msi-lifecycle.ps1`; five acceptance-matrix contract functions added to `scripts/test-msi-lifecycle-contract.py`. code-reviewer verdict: REQUEST_CHANGES — mutation test showed symbols-ZIP contents were not statically proven (staging-name checks pass even if PDBs are deleted immediately before `Compress-Archive`).
+- Round 2 (`04548d6`): `symbols_zip_retains_both_pdbs` now executes the workflow's real `Compress-Archive` command against synthetic staged PDBs, opens the produced ZIP with `zipfile`, asserts both PDBs present, rejects pre-archive deletion mutations, and binds any future post-archive verifier's coverage to both PDB names. Review finding closed at contract level.
+- Shared-edit request for orchestrator: `release.yml` `package` job should add a post-`Compress-Archive` PowerShell verifier (Expand-Archive to temp; assert `spotter_svc.pdb` and `spotter_cli.pdb` exist in the extraction; throw before artifact upload on absence). Deferred to release-workflow ownership — the contract test already binds a future verifier.
+- Remaining blocked native evidence: actual MSI build/install/upgrade/uninstall, built-MSI file-table inspection, installed-tree inspection, direct-SCM lifecycle on Windows runners. Tracked in Native Windows evidence log.
+- Integration status: PENDING (see Integration log after serial merge).
+
 ## Cleanup log
 
 | Worktree | Branch | Disposition |
