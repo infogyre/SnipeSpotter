@@ -279,7 +279,7 @@ def _assert_symbols_archive_contains_both_pdbs(package: str) -> None:
 
     verifier_start = archive_match.end()
     verifier = package[verifier_start:]
-    if "Expand-Archive" in verifier or "[io.compression.zipfile]" in verifier.lower():
+    if "expand-archive" in verifier.lower() or "[io.compression.zipfile]" in verifier.lower():
         for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
             assert symbol in verifier
         assert "-symbols.zip" in verifier
