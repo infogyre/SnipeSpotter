@@ -206,6 +206,68 @@ def test_product_and_atomic_writer_apply_the_same_protected_acl_contract() -> No
     assert "PROTECTED_DACL_SECURITY_INFORMATION" in WINDOWS_ACL
 
 
+def test_msi_installed_inventory_excludes_pdbs() -> None:
+    inventory_start = SCRIPT.index("    foreach ($relative in @(")
+    symbols_start = SCRIPT.index("    foreach ($symbol in @(", inventory_start)
+    inventory = SCRIPT[inventory_start:symbols_start]
+    for installed_artifact in (
+        "'bin\\spotter-svc.exe'",
+        "'bin\\spotter-cli.exe'",
+        "'sbom\\spotter-svc.cdx.json'",
+        "'sbom\\spotter-cli.cdx.json'",
+    ):
+        assert installed_artifact in inventory
+    assert "spotter_svc.pdb" not in inventory
+    assert "spotter_cli.pdb" not in inventory
+
+    symbols_start = SCRIPT.index("    foreach ($symbol in @(", inventory_start)
+    symbols_end = SCRIPT.index("    }", symbols_start) + len("    }")
+    symbols = SCRIPT[symbols_start:symbols_end]
+    for symbol in ("'bin\\spotter_svc.pdb'", "'bin\\spotter_cli.pdb'"):
+        assert symbol in symbols
+    assert "-not (Test-Path -LiteralPath $symbolPath -PathType Leaf)" in symbols
+
+
+def msi_file_table_excludes_pdbs() -> None:
+    assert "Pdb" not in PRODUCT_WXS
+    assert ".pdb" not in PRODUCT_WXS.lower()
+    for installed_file in (
+        'Source="$(var.StageDir)\\spotter-svc.exe"',
+        'Source="$(var.StageDir)\\spotter-cli.exe"',
+        'Source="$(var.StageDir)\\sbom\\spotter-svc.cdx.json"',
+        'Source="$(var.StageDir)\\sbom\\spotter-cli.cdx.json"',
+    ):
+        assert installed_file in PRODUCT_WXS
+
+
+def symbols_zip_retains_both_pdbs() -> None:
+    workflow = (ROOT.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    package = workflow[workflow.index("  package:") : workflow.index("  lifecycle:")]
+    for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
+        assert symbol in package
+    assert "Compress-Archive -Path release-stage/* -DestinationPath" in package
+    assert "-symbols.zip" in package
+
+
+def release_stage_retains_symbol_inputs() -> None:
+    workflow = (ROOT.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    build = workflow[workflow.index("      - name: Build release binaries") : workflow.index("      - name: Upload binaries")]
+    assert "$files = @('spotter-svc.exe', 'spotter-cli.exe', 'spotter_svc.pdb', 'spotter_cli.pdb')" in build
+    assert "Copy-Item -LiteralPath $path -Destination $stage" in build
+    assert "release-stage inventory differs from the closed expected set" in build
+
+
+def direct_scm_stage_retains_executables() -> None:
+    workflow = (ROOT.parent / ".github" / "workflows" / "elevated-windows.yml").read_text(encoding="utf-8")
+    direct_stage = workflow[workflow.index("      - name: Stage direct SCM service executable") : workflow.index("      - name: Validate direct CLI SCM lifecycle")]
+    assert "spotter-svc.exe" in direct_stage
+    assert "spotter-cli-test-support.exe" in direct_stage
+    assert "Expand-Archive" in direct_stage
+    assert "Join-Path $extract 'spotter-svc.exe'" in direct_stage
+    assert "Copy-Item -LiteralPath $serviceSource -Destination $servicePath -Force" in direct_stage
+    assert "Copy-Item -LiteralPath $source -Destination (Join-Path (Resolve-Path -LiteralPath packaged).Path 'spotter-cli-test-support.exe')" in direct_stage
+
+
 def test_startup_repairs_existing_runtime_artifact_acls_before_access() -> None:
     helper = SERVICE[SERVICE.index("fn apply_runtime_acl_contract"):SERVICE.index("fn service_main")]
     startup = SERVICE[SERVICE.index("fn run_service"):]
@@ -723,6 +785,11 @@ def main() -> None:
     test_lifecycle_collects_only_present_runtime_artifacts_and_uses_scoped_acl_commands()
     test_lifecycle_asserts_child_probe_result_not_parent_token()
     test_product_and_atomic_writer_apply_the_same_protected_acl_contract()
+    test_msi_installed_inventory_excludes_pdbs()
+    msi_file_table_excludes_pdbs()
+    symbols_zip_retains_both_pdbs()
+    release_stage_retains_symbol_inputs()
+    direct_scm_stage_retains_executables()
     test_acl_diagnostics_are_bounded_and_precede_any_repair()
     test_acl_diagnostic_capture_attempts_settings_after_root_failure()
     test_startup_repairs_existing_runtime_artifact_acls_before_access()

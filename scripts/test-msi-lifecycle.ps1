@@ -236,12 +236,14 @@ try {
     foreach ($relative in @(
         'bin\spotter-svc.exe',
         'bin\spotter-cli.exe',
-        'bin\spotter_svc.pdb',
-        'bin\spotter_cli.pdb',
         'sbom\spotter-svc.cdx.json',
         'sbom\spotter-cli.cdx.json'
     )) {
         Assert-True (Test-Path -LiteralPath (Join-Path $installRoot $relative) -PathType Leaf) "missing installed artifact: $relative"
+    }
+    foreach ($symbol in @('bin\spotter_svc.pdb', 'bin\spotter_cli.pdb')) {
+        $symbolPath = Join-Path $installRoot $symbol
+        Assert-True (-not (Test-Path -LiteralPath $symbolPath -PathType Leaf)) "unexpected installed symbol artifact: $symbol"
     }
     Assert-True (Test-Path -LiteralPath $settingsPath -PathType Leaf) 'settings.toml was not installed'
     if ($PreviousMsiPath) {
