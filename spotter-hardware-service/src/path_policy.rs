@@ -146,16 +146,17 @@ pub(crate) fn is_contained_path(root: &str, candidate: &str) -> bool {
     candidate.len() >= root.len() && candidate[..root.len()] == root[..]
 }
 
-/// Return whether an output file is exactly one level below a directory inside the root.
+/// Return whether a canonical output file has exactly the validated output directory as its parent.
 #[must_use]
-pub(crate) fn is_output_file_path(root: &str, candidate: &str) -> bool {
-    let Some(root) = path_components(root) else {
+pub(crate) fn is_output_file_path(output_directory: &str, candidate: &str) -> bool {
+    let Some(output_directory) = path_components(output_directory) else {
         return false;
     };
     let Some(candidate) = path_components(candidate) else {
         return false;
     };
-    candidate.len() == root.len() + 2 && candidate[..root.len()] == root[..]
+    candidate.len() == output_directory.len() + 1
+        && candidate[..output_directory.len()] == output_directory[..]
 }
 
 /// Return whether a PowerShell executable path belongs to an approved OS layout.
@@ -519,22 +520,19 @@ mod tests {
     }
 
     #[test]
-    fn output_file_path_is_bounded_to_the_protected_output_directory() {
+    fn output_file_path_requires_the_validated_output_directory() {
+        let output_directory = r"C:\ProgramData\Cell\Output";
         assert!(is_output_file_path(
-            r"C:\ProgramData\Cell",
-            r"C:\ProgramData\Cell\output\report.json"
+            output_directory,
+            r"c:\programdata\cell\output\report.json"
         ));
         assert!(!is_output_file_path(
-            r"C:\ProgramData\Cell",
-            r"C:\ProgramData\Cell\report.json"
+            output_directory,
+            r"C:\ProgramData\Cell\other\report.json"
         ));
         assert!(!is_output_file_path(
-            r"C:\ProgramData\Cell",
-            r"C:\ProgramData\Cell\output\nested\report.json"
-        ));
-        assert!(!is_output_file_path(
-            r"C:\ProgramData\Cell",
-            r"C:\ProgramData\Cell\output\..\report.json"
+            output_directory,
+            r"C:\ProgramData\Cell\Output\sub\report.json"
         ));
     }
 

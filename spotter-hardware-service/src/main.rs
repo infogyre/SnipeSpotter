@@ -165,16 +165,22 @@ mod windows_service_host {
             &config.key_path,
             path_policy::PathPurpose::Key,
         )?;
-        let output_directory_path = config
-            .output_path
-            .parent()
-            .ok_or_else(|| "output path has no protected parent directory".to_owned())?;
+        let output_directory_path = config.staging_root.join("output");
         let output_directory = inspect_path(
             &config.staging_root,
-            output_directory_path,
+            &output_directory_path,
             path_policy::PathPurpose::OutputDirectory,
         )?;
         let output_file_name = output_file_name(config);
+        let output_candidate = output_directory.final_path().join(&output_file_name);
+        if !path_policy::is_output_file_path(
+            &output_directory.final_path().to_string_lossy(),
+            &output_candidate.to_string_lossy(),
+        ) {
+            return Err(
+                "output path must name a single file in the protected output directory".to_owned(),
+            );
+        }
         if Path::new(&output_file_name).components().count() != 1
             || output_file_name == "."
             || output_file_name == ".."
@@ -312,22 +318,14 @@ mod windows_service_host {
                 ));
             }
         }
-        let output_directory = config
-            .output_path
-            .parent()
-            .ok_or_else(|| "output path has no protected parent directory".to_owned())?;
+        let output_directory = config.staging_root.join("output");
         if !path_policy::is_output_file_path(
-            &config.staging_root.to_string_lossy(),
+            &output_directory.to_string_lossy(),
             &config.output_path.to_string_lossy(),
         ) || config.output_path.is_dir()
         {
             return Err(
                 "output path must name a file in the protected output directory".to_owned(),
-            );
-        }
-        if output_directory.parent() != Some(config.staging_root.as_path()) {
-            return Err(
-                "output directory must be a direct child of the protected staging root".to_owned(),
             );
         }
         if !(1..=3).contains(&config.repetition) {
@@ -367,19 +365,26 @@ mod windows_service_host {
     mod config_tests {
         use super::*;
 
-        fn config_with_output(output_path: &str) -> ServiceConfig {
+        fn config_with_root_and_output(staging_root: &Path, output_path: PathBuf) -> ServiceConfig {
             ServiceConfig {
                 service_name: "SpotterHardware".to_owned(),
-                collector: PathBuf::from(r"C:\ProgramData\Cell\collector.ps1"),
+                collector: staging_root.join("collector.ps1"),
                 image: "windows-2022".to_owned(),
                 image_alias: "windows-2022".to_owned(),
                 context: "LocalSystem".to_owned(),
                 repetition: 1,
-                key_path: PathBuf::from(r"C:\ProgramData\Cell\hmac.key"),
-                output_path: PathBuf::from(output_path),
+                key_path: staging_root.join("hmac.key"),
+                output_path,
                 pwsh_path: PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
-                staging_root: PathBuf::from(r"C:\ProgramData\Cell"),
+                staging_root: staging_root.to_owned(),
             }
+        }
+
+        fn config_with_output(output_path: &str) -> ServiceConfig {
+            config_with_root_and_output(
+                Path::new(r"C:\ProgramData\Cell"),
+                PathBuf::from(output_path),
+            )
         }
 
         #[test]
@@ -397,12 +402,19 @@ mod windows_service_host {
             assert!(
                 validate_config(&config_with_output(r"C:\ProgramData\Cell\report.json")).is_err()
             );
-            assert!(
-                validate_config(&config_with_output(
-                    r"C:\ProgramData\Cell\other\report.json"
-                ))
-                .is_err()
-            );
+
+            let fixture_root = std::env::temp_dir().join(format!(
+                "spotter-hardware-output-policy-{}",
+                std::process::id()
+            ));
+            let other_directory = fixture_root.join("other");
+            std::fs::create_dir_all(&other_directory).expect("create output policy fixture");
+            let result = validate_config(&config_with_root_and_output(
+                &fixture_root,
+                other_directory.join("report.json"),
+            ));
+            std::fs::remove_dir_all(&fixture_root).expect("remove output policy fixture");
+            assert!(result.is_err());
         }
     }
 
