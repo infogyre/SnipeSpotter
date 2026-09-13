@@ -123,6 +123,52 @@ fn native_query(
     pipe: HANDLE,
     service_name: &str,
 ) -> std::result::Result<ServerIdentity, ServiceIdentityError> {
+    native_query_with_profile(pipe, service_name, None)
+}
+
+/// Same-account acceptance policy for test-support identity queries.
+///
+/// Test-support builds may authenticate a same-account test server whose
+/// executable matches the declared test registration. Production code never
+/// constructs this policy; it exists so same-account fixture tests remain
+/// meaningful supplements without weakening the production LocalSystem gate.
+#[derive(Clone, Debug, Default)]
+pub struct SameAccountPolicy {
+    /// Canonical expected executable path from the declared test registration.
+    pub expected_executable: Option<PathBuf>,
+}
+
+#[cfg(feature = "test-support")]
+/// Identity query accepting a same-account server under the declared profile.
+///
+/// All native checks still run (PID, liveness, token owner, image path);
+/// only the account and SCM-profile comparisons are relaxed to accept the
+/// calling user and the declared test executable.
+#[derive(Clone, Debug, Default)]
+pub struct SameAccountServerIdentityQuery {
+    pub policy: SameAccountPolicy,
+}
+
+#[cfg(feature = "test-support")]
+impl ServerIdentityQuery for SameAccountServerIdentityQuery {
+    fn query(
+        &self,
+        pipe: HANDLE,
+        service_name: &str,
+    ) -> std::result::Result<ServerIdentity, ServiceIdentityError> {
+        native_query_with_profile(
+            pipe,
+            service_name,
+            Some(self.policy.expected_executable.clone()),
+        )
+    }
+}
+
+fn native_query_with_profile(
+    pipe: HANDLE,
+    service_name: &str,
+    same_account_executable: Option<PathBuf>,
+) -> std::result::Result<ServerIdentity, ServiceIdentityError> {
     use windows::Win32::System::{
         Pipes::GetNamedPipeServerProcessId,
         Threading::{
@@ -196,12 +242,17 @@ fn native_query(
     let local_system = unsafe { IsWellKnownSid(token_user.User.Sid, WinLocalSystemSid).as_bool() };
     let observed_account =
         sid_to_string(token_user.User.Sid).unwrap_or_else(|_| String::from("unknown"));
-    if !local_system || observed_account != LOCAL_SYSTEM_SID {
+    let same_account = same_account_executable.is_some()
+        && observed_account == current_user_sid().map_err(identity_failure)?;
+    if !local_system && !same_account {
         return Err(ServiceIdentityError::UnexpectedIdentity { observed_account });
     }
 
     let image_path = query_image_path(process.raw()).map_err(identity_failure)?;
-    let expected_path = query_service_binary_path(service_name).map_err(identity_failure)?;
+    let expected_path = match same_account_executable {
+        Some(declared) => declared,
+        None => query_service_binary_path(service_name).map_err(identity_failure)?,
+    };
     let image_path_canonical =
         canonicalize_without_reparse(image_path.clone()).map_err(identity_failure)?;
     let expected_path_canonical =
@@ -242,6 +293,42 @@ fn sid_to_string(sid: windows::Win32::Security::PSID) -> Result<String> {
         let _ = LocalFree(Some(HLOCAL(string_sid.0.cast())));
     }
     Ok(value)
+}
+
+/// Return the SID string of the calling process's token owner (same-account checks).
+fn current_user_sid() -> Result<String> {
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle and `token` is a writable out-parameter.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) }
+        .context("failed to open current process token")?;
+    let token = OwnedHandle(token);
+    if token.raw().is_invalid() {
+        bail!("Windows returned an invalid current-process token handle");
+    }
+    let mut needed = 0_u32;
+    // SAFETY: The first call intentionally asks Windows for the required buffer size.
+    let _ = unsafe { GetTokenInformation(token.raw(), TokenUser, None, 0, &raw mut needed) };
+    if needed == 0 {
+        bail!("Windows returned no current-process token-user size");
+    }
+    let mut token_bytes = vec![0_u8; usize::try_from(needed)?];
+    // SAFETY: `token_bytes` has the size requested by Windows and remains writable for this call.
+    unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenUser,
+            Some(token_bytes.as_mut_ptr().cast()),
+            needed,
+            &raw mut needed,
+        )
+    }
+    .context("failed to read current-process token user")?;
+    // SAFETY: Windows writes a TOKEN_USER header at the beginning of the correctly sized buffer.
+    let token_user = unsafe { &*token_bytes.as_ptr().cast::<TOKEN_USER>() };
+    sid_to_string(token_user.User.Sid)
 }
 
 fn query_image_path(process: HANDLE) -> Result<PathBuf> {

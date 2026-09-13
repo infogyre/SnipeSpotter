@@ -747,18 +747,36 @@ pub fn transport_endpoint(cli: &Cli) -> Option<String> {
 #[cfg(feature = "test-support")]
 /// Build the transport implied by test-support overrides (endpoint + service name),
 /// or `None` when production defaults apply.
+///
+/// When a test service executable is declared, the identity gate runs under the
+/// same-account test policy (still fully native: PID, liveness, token owner,
+/// image-path comparison against the declared executable); production builds
+/// never take this branch.
 #[must_use]
 pub fn transport_transport(cli: &Cli, timeout: Duration) -> Option<NamedPipeTransport> {
     #[cfg(windows)]
     {
         let endpoint = cli.test_pipe_endpoint.clone()?;
-        Some(NamedPipeTransport::with_endpoint_and_service(
-            timeout,
-            endpoint,
-            cli.test_service_name
-                .clone()
-                .unwrap_or_else(|| String::from(spotter_core::identity::SERVICE_NAME)),
-        ))
+        let service_name = cli
+            .test_service_name
+            .clone()
+            .unwrap_or_else(|| String::from(spotter_core::identity::SERVICE_NAME));
+        let same_account = cli.test_service_executable.clone();
+        let transport = if let Some(executable) = same_account {
+            NamedPipeTransport::with_identity_query(
+                timeout,
+                endpoint,
+                service_name,
+                spotter_win32::pipe::SameAccountServerIdentityQuery {
+                    policy: spotter_win32::pipe::SameAccountPolicy {
+                        expected_executable: Some(executable),
+                    },
+                },
+            )
+        } else {
+            NamedPipeTransport::with_endpoint_and_service(timeout, endpoint, service_name)
+        };
+        Some(transport)
     }
     #[cfg(not(windows))]
     {
