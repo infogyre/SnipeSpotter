@@ -72,12 +72,32 @@ async fn serve_one_with_deadlines<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    serve_one_with_deadlines_and_buffer(
+        stream,
+        fsm,
+        read_timeout,
+        write_timeout,
+        Zeroizing::new(Vec::new()),
+    )
+    .await
+}
+
+async fn serve_one_with_deadlines_and_buffer<S, B>(
+    stream: S,
+    fsm: &FsmHandle,
+    read_timeout: std::time::Duration,
+    write_timeout: std::time::Duration,
+    mut line: B,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: std::ops::Deref<Target = Vec<u8>> + std::ops::DerefMut<Target = Vec<u8>>,
+{
     let mut stream = BufReader::new(stream);
-    let mut line = Zeroizing::new(Vec::new());
     let max_line_bytes = u64::try_from(IPC_MAX_LINE_BYTES)?;
     let read = tokio::time::timeout(read_timeout, async {
         let mut limited = (&mut stream).take(max_line_bytes);
-        limited.read_until(b'\n', &mut line).await
+        limited.read_until(b'\n', &mut *line).await
     })
     .await
     .context("IPC request read timed out")??;

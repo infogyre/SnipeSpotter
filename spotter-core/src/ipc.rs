@@ -330,6 +330,53 @@ mod tests {
     }
 
     #[test]
+    fn token_owner_clone_queue_cancel_cleanup() {
+        use secrecy::ExposeSecret as _;
+
+        let secret = String::from("queue-secret-value");
+        let command = ServiceCommand::SetToken {
+            value: SecretString::from(secret.as_str()),
+        };
+
+        // Clone redaction: the clone is itself a redacted owner and never
+        // renders the secret through Debug.
+        let cloned = command.clone();
+        let clone_debug = format!("{cloned:?}");
+        assert!(!clone_debug.contains(&secret));
+
+        // Queue/drop semantics: enqueuing a clone and dropping it (simulating
+        // a cancelled command) must drop the redacted owner, whose internal
+        // buffer is zeroized by SecretString's Drop. Observability contract:
+        // the value is unrecoverable through the type's safe API after the
+        // queued clone is dropped — Debug stays redacted and wire exposure
+        // exists only via an explicit ExposeSecret borrow while owned.
+        let queued = cloned.clone();
+        let queued_serialized =
+            serde_json::to_vec(&queued).expect("queued command serialization must succeed");
+        assert_eq!(
+            queued_serialized,
+            br#"{"cmd":"set_token","value":"queue-secret-value"}"#.as_slice()
+        );
+        let ServiceCommand::SetToken {
+            value: queued_value,
+        } = &queued
+        else {
+            panic!("queued command must be SetToken");
+        };
+        assert_eq!(queued_value.expose_secret().as_bytes(), secret.as_bytes());
+        drop(queued);
+        // After the queued clone's drop, the surviving handle stays redacted.
+        assert!(!format!("{cloned:?}").contains(&secret));
+
+        // Cancellation: dropping the original and every clone leaves no
+        // accessible plain-String API behind (no parallel plain API exists),
+        // and redaction is preserved for any handle outliving another's drop.
+        drop(command);
+        assert!(!format!("{cloned:?}").contains(&secret));
+        drop(cloned);
+    }
+
+    #[test]
     fn validates_boundaries_and_rejects_secret_field() {
         assert!(validate_config_field("snipeit.url", "https://example.test").is_ok());
         for invalid_url in [
