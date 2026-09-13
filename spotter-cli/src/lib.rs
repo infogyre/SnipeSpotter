@@ -429,6 +429,8 @@ where
 
 #[cfg(windows)]
 fn read_bounded_pipe_response(pipe: &mut impl std::io::BufRead, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::BufRead as _;
+
     let mut response = Vec::new();
     pipe.take(max_bytes)
         .read_until(b'\n', &mut response)
@@ -443,7 +445,7 @@ fn exchange_named_pipe(
     service_name: &str,
     identity_query: &dyn ServerIdentityQuery,
 ) -> Result<IpcResponse> {
-    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::io::Write as _;
 
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
