@@ -189,6 +189,8 @@ and Windows workspace test runs; SPOTR-23 controlled dispatch; any push/PR/dispa
 | 2026-09-13 | Lane B (SPOTR-7) | `hardening/lane-b-journal-recovery` @ `08bf414` | bd81526 | review rounds → APPROVED (0 findings); merged `37dc64e`; startup ordering + notice evidence basenames + authoritative tests |
 | 2026-09-13 | Lane C (SPOTR-9/24) | `hardening/lane-c-hardware-host` @ `8113257` | bd81526 | review rounds → APPROVED (0 findings); merged `bb9a6e8`; output containment pinned to validated output dir |
 | 2026-09-13 | Lane E (SPOTR-17) | `hardening/lane-e-token-ownership` @ `6d467fb` | bb9a6e8 (A+B+C integrated) | 5 impl commits + test-gap commit `e30dfff` + clippy fixes `d6b0fa2`/`f734032`/`6d467fb`; D.1–D.4 verified (wire shape byte-identical, DPAPI wipe-before-free, no plain-String token API); merged `0d456eb`; post-merge all gates green |
+| 2026-09-13 | Lane F (docs/evidence) | direct on integration branch | 0d456eb | `6fa545f` (7 doc paths + docs contract assertions, 3 tests OK); docs recovery-state fix `f3c2c91` (NeedsOperatorRecovery vs Corrupt distinction) |
+| 2026-09-13 | Final integrated review (AC.18) | — | 237ef56..f3c2c91 (55 commits) | Cross-lane seams clean; all local gates green; docs accurate; **READY-FOR-PR** verdict; blocked native/external evidence explicitly listed (see Native Windows evidence log) |
 
 ## Lane D (SPOTR-28) review + integration record
 
