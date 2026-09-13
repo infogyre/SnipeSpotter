@@ -428,11 +428,10 @@ where
 }
 
 #[cfg(windows)]
-fn read_bounded_pipe_response(
-    pipe: &mut std::io::Take<&mut std::io::BufReader<std::fs::File>>,
-) -> Result<Vec<u8>> {
+fn read_bounded_pipe_response(pipe: &mut impl std::io::BufRead, max_bytes: u64) -> Result<Vec<u8>> {
     let mut response = Vec::new();
-    pipe.read_until(b'\n', &mut response)
+    pipe.take(max_bytes)
+        .read_until(b'\n', &mut response)
         .context("failed to read service response")?;
     Ok(response)
 }
@@ -488,10 +487,7 @@ fn exchange_named_pipe(
                 .context("failed to flush service request")?;
             Ok(())
         },
-        || {
-            let max_bytes = u64::try_from(IPC_MAX_LINE_BYTES)?;
-            read_bounded_pipe_response(&mut pipe.take(max_bytes))
-        },
+        || read_bounded_pipe_response(pipe.get_mut(), u64::try_from(IPC_MAX_LINE_BYTES)?),
     )
 }
 
