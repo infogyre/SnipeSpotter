@@ -203,7 +203,7 @@ pub fn dispatch(
                 Some(transport.send(&ServiceCommand::GetConfig)?)
             }
             ConfigCommand::SetToken => Some(transport.send(&ServiceCommand::SetToken {
-                value: tokens.read_token()?,
+                value: tokens.read_token()?.into(),
             })?),
         },
         Command::Status { full } => Some(transport.send(if *full {
@@ -983,6 +983,7 @@ pub fn exit_code(error: &anyhow::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::SecretString;
     struct Fake {
         sent: Vec<ServiceCommand>,
     }
@@ -1235,7 +1236,7 @@ mod tests {
         let write_events = Arc::clone(&events);
         let error = authenticate_serialize_write(
             &ServiceCommand::SetToken {
-                value: String::from("must-not-be-serialized"),
+                value: SecretString::from("must-not-be-serialized"),
             },
             move || {
                 auth_events.lock().expect("event lock").push("auth");

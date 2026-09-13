@@ -13,6 +13,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result};
+use secrecy::SecretString;
 use spotter_cli::{IpcTransport, NamedPipeTransport};
 use spotter_core::ipc::{IpcResponse, ServiceCommand};
 use spotter_win32::pipe::{ServerIdentity, ServerIdentityQuery, ServiceIdentityError};
@@ -587,7 +588,7 @@ fn server_identity_failures_reject_before_write() -> Result<()> {
         );
         let error = transport
             .send(&ServiceCommand::SetToken {
-                value: String::from("must-not-be-serialized"),
+                value: SecretString::from("must-not-be-serialized"),
             })
             .expect_err("identity failures must reject the request");
         assert!(
@@ -835,7 +836,7 @@ fn server_exit_during_authentication_fails_closed() -> Result<()> {
     assert!(
         transport
             .send(&ServiceCommand::SetToken {
-                value: String::from("no-write")
+                value: SecretString::from("no-write")
             })
             .is_err()
     );

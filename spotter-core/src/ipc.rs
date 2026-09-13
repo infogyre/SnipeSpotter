@@ -2,7 +2,8 @@
 
 //! JSON-over-newline IPC protocol and pure client-side validation.
 
-use serde::{Deserialize, Serialize};
+use secrecy::{ExposeSecret as _, SecretString};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     config::{CheckinPolicy, Settings, SettingsValidationError, validate_snipeit_url},
@@ -12,17 +13,73 @@ use crate::{
 /// Maximum accepted IPC request or response line length.
 pub const IPC_MAX_LINE_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum ServiceCommand {
     GetConfig,
-    SetConfig { field: String, value: String },
-    SetToken { value: String },
+    SetConfig {
+        field: String,
+        value: String,
+    },
+    SetToken {
+        #[serde(
+            serialize_with = "serialize_secret_string",
+            deserialize_with = "deserialize_secret_string"
+        )]
+        value: SecretString,
+    },
     GetStatus,
     GetStatusFull,
     TriggerSync,
     CheckinAll,
-    CheckinSerial { serial: String },
+    CheckinSerial {
+        serial: String,
+    },
+}
+
+impl PartialEq for ServiceCommand {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::GetConfig, Self::GetConfig)
+            | (Self::GetStatus, Self::GetStatus)
+            | (Self::GetStatusFull, Self::GetStatusFull)
+            | (Self::TriggerSync, Self::TriggerSync)
+            | (Self::CheckinAll, Self::CheckinAll) => true,
+            (
+                Self::SetConfig {
+                    field: left_field,
+                    value: left_value,
+                },
+                Self::SetConfig {
+                    field: right_field,
+                    value: right_value,
+                },
+            ) => left_field == right_field && left_value == right_value,
+            (Self::SetToken { value: left }, Self::SetToken { value: right }) => {
+                left.expose_secret() == right.expose_secret()
+            }
+            (Self::CheckinSerial { serial: left }, Self::CheckinSerial { serial: right }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ServiceCommand {}
+
+fn serialize_secret_string<S>(value: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    value.expose_secret().serialize(serializer)
+}
+
+fn deserialize_secret_string<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(SecretString::from)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -225,7 +282,7 @@ mod tests {
                 value: String::from("4"),
             },
             ServiceCommand::SetToken {
-                value: String::from("secret"),
+                value: SecretString::from("secret"),
             },
             ServiceCommand::GetStatus,
             ServiceCommand::GetStatusFull,
@@ -248,6 +305,28 @@ mod tests {
         let json = serde_json::to_string(&response)?;
         assert_eq!(serde_json::from_str::<IpcResponse>(&json)?, response);
         Ok(())
+    }
+
+    #[test]
+    fn set_token_wire_shape_is_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+        let command = ServiceCommand::SetToken {
+            value: SecretString::from("secret"),
+        };
+        assert_eq!(
+            serde_json::to_vec(&command)?,
+            br#"{"cmd":"set_token","value":"secret"}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn set_token_debug_is_redacted() {
+        let command = ServiceCommand::SetToken {
+            value: SecretString::from("secret"),
+        };
+        let rendered = format!("{command:?}");
+        assert!(!rendered.contains("secret"));
+        assert!(rendered.contains("REDACTED"));
     }
 
     #[test]
