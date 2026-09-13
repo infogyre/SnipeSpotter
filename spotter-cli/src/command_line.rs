@@ -24,7 +24,7 @@ pub fn executable_from_command_line(command_line: &str) -> Result<String> {
         chars.next();
         let mut executable = String::new();
         let mut backslashes = 0usize;
-        while let Some(character) = chars.next() {
+        for character in chars.by_ref() {
             match character {
                 '\\' => backslashes += 1,
                 '"' => {
