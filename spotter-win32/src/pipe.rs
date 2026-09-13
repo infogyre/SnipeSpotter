@@ -31,7 +31,6 @@ use windows::{
 
 const SDDL_REVISION_1: u32 = 1;
 const ADMIN_PIPE_SDDL: PCWSTR = w!("D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-const LOCAL_SYSTEM_SID: &str = "S-1-5-18";
 
 /// Typed authentication failures for a service named-pipe connection.
 #[derive(Debug, Error)]
@@ -48,7 +47,7 @@ pub enum ServiceIdentityError {
     /// A required identity query failed.
     #[error("service identity query failed: {source}")]
     IdentityQueryFailed { source: anyhow::Error },
-    /// The connected process did not run as LocalSystem.
+    /// The connected process did not run as `LocalSystem`.
     #[error("unexpected service identity: observed account {observed_account}")]
     UnexpectedIdentity { observed_account: String },
     /// The connected process image did not match SCM configuration.
@@ -70,6 +69,9 @@ pub struct ServerIdentity {
 /// Query the identity bound to one connected named-pipe client handle.
 pub trait ServerIdentityQuery: Send + Sync {
     /// Authenticate the server represented by `pipe`.
+    ///
+    /// # Errors
+    /// Returns a [`ServiceIdentityError`] if the connected server cannot be authenticated.
     fn query(
         &self,
         pipe: HANDLE,
@@ -131,7 +133,7 @@ fn native_query(
 /// Test-support builds may authenticate a same-account test server whose
 /// executable matches the declared test registration. Production code never
 /// constructs this policy; it exists so same-account fixture tests remain
-/// meaningful supplements without weakening the production LocalSystem gate.
+/// meaningful supplements without weakening the production `LocalSystem` gate.
 #[derive(Clone, Debug, Default)]
 pub struct SameAccountPolicy {
     /// Canonical expected executable path from the declared test registration.
@@ -233,7 +235,9 @@ fn native_query_with_profile(
     }
     .map_err(identity_failure)?;
     // SAFETY: Windows writes a TOKEN_USER header at the beginning of the correctly sized buffer.
-    let token_user = unsafe { &*token_bytes.as_ptr().cast::<TOKEN_USER>() };
+    // `read_unaligned` copies the header while preserving its SID pointer, which points into the
+    // live `token_bytes` allocation retained for the rest of this function.
+    let token_user = unsafe { std::ptr::read_unaligned(token_bytes.as_ptr().cast::<TOKEN_USER>()) };
     // SAFETY: TokenUser.User.Sid points into the live token information buffer.
     let local_system = unsafe { IsWellKnownSid(token_user.User.Sid, WinLocalSystemSid).as_bool() };
     let observed_account =
@@ -250,9 +254,9 @@ fn native_query_with_profile(
         None => query_service_binary_path(service_name).map_err(identity_failure)?,
     };
     let image_path_canonical =
-        canonicalize_without_reparse(image_path.clone()).map_err(identity_failure)?;
+        canonicalize_without_reparse(&image_path).map_err(identity_failure)?;
     let expected_path_canonical =
-        canonicalize_without_reparse(expected_path).map_err(identity_failure)?;
+        canonicalize_without_reparse(&expected_path).map_err(identity_failure)?;
     if !paths_equal_case_insensitive(&image_path_canonical, &expected_path_canonical) {
         return Err(ServiceIdentityError::UnexpectedExecutable {
             observed_path: image_path,
@@ -323,7 +327,10 @@ fn current_user_sid() -> Result<String> {
     }
     .context("failed to read current-process token user")?;
     // SAFETY: Windows writes a TOKEN_USER header at the beginning of the correctly sized buffer.
-    let token_user = unsafe { &*token_bytes.as_ptr().cast::<TOKEN_USER>() };
+    // `read_unaligned` copies the header while preserving its SID pointer, which points into the
+    // live `token_bytes` allocation retained until `sid_to_string` returns.
+    let token_user = unsafe { std::ptr::read_unaligned(token_bytes.as_ptr().cast::<TOKEN_USER>()) };
+    // SAFETY: TokenUser.User.Sid points into the live token information buffer.
     sid_to_string(token_user.User.Sid)
 }
 
@@ -376,10 +383,14 @@ fn query_service_binary_path(service_name: &str) -> Result<PathBuf> {
         )
     }?;
     // SAFETY: Windows filled the buffer with QUERY_SERVICE_CONFIGW and its pointed strings.
+    // `read_unaligned` copies the header while preserving pointers into the live `buffer`
+    // allocation retained for the rest of this function.
     let config = unsafe {
-        &*buffer
-            .as_ptr()
-            .cast::<windows::Win32::System::Services::QUERY_SERVICE_CONFIGW>()
+        std::ptr::read_unaligned(
+            buffer
+                .as_ptr()
+                .cast::<windows::Win32::System::Services::QUERY_SERVICE_CONFIGW>(),
+        )
     };
     if config.lpBinaryPathName.is_null() {
         bail!("service configuration has no binary path");
@@ -387,7 +398,7 @@ fn query_service_binary_path(service_name: &str) -> Result<PathBuf> {
     // SAFETY: QueryServiceConfigW guarantees a NUL-terminated string within its returned buffer.
     let command_line = unsafe { config.lpBinaryPathName.to_string() }?;
     let executable = executable_from_command_line(&command_line)?;
-    Ok(canonicalize_without_reparse(PathBuf::from(executable))?)
+    canonicalize_without_reparse(std::path::Path::new(&executable))
 }
 
 /// Compare two Windows paths without case sensitivity.
@@ -447,7 +458,7 @@ fn enable_debug_privilege() -> Result<()> {
     Ok(())
 }
 
-fn canonicalize_without_reparse(path: PathBuf) -> Result<PathBuf> {
+fn canonicalize_without_reparse(path: &std::path::Path) -> Result<PathBuf> {
     use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
     use windows::Win32::{
         Foundation::GENERIC_READ,
@@ -459,7 +470,7 @@ fn canonicalize_without_reparse(path: PathBuf) -> Result<PathBuf> {
         },
     };
 
-    validate_path_components(&path)?;
+    validate_path_components(path)?;
     let path_wide = path
         .as_os_str()
         .encode_wide()
@@ -540,7 +551,7 @@ fn executable_from_command_line(command_line: &str) -> Result<String> {
         chars.next();
         let mut executable = String::new();
         let mut backslashes = 0usize;
-        while let Some(character) = chars.next() {
+        for character in chars.by_ref() {
             match character {
                 '\\' => backslashes += 1,
                 '"' if backslashes % 2 == 0 => {
@@ -628,7 +639,7 @@ impl Drop for SecurityAttributes {
 
 /// Build administrator-accessible named-pipe security attributes.
 ///
-/// The descriptor grants generic-all access to LocalSystem and the built-in Administrators group,
+/// The descriptor grants generic-all access to `LocalSystem` and the built-in Administrators group,
 /// while denying handle inheritance.
 ///
 /// # Errors
