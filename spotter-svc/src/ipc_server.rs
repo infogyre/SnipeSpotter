@@ -97,7 +97,7 @@ where
     let max_line_bytes = u64::try_from(IPC_MAX_LINE_BYTES)?;
     let read = tokio::time::timeout(read_timeout, async {
         let mut limited = (&mut stream).take(max_line_bytes);
-        limited.read_until(b'\n', &mut *line).await
+        limited.read_until(b'\n', &mut line).await
     })
     .await
     .context("IPC request read timed out")??;
