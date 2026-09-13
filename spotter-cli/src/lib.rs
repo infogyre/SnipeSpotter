@@ -434,7 +434,7 @@ fn exchange_named_pipe(
     service_name: &str,
     identity_query: &dyn ServerIdentityQuery,
 ) -> Result<IpcResponse> {
-    use std::io::{BufReader, Read as _, Write as _};
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
