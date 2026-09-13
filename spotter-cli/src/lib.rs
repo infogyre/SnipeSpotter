@@ -487,7 +487,7 @@ fn exchange_named_pipe(
                 .context("failed to flush service request")?;
             Ok(())
         },
-        || read_bounded_pipe_response(pipe.get_mut(), u64::try_from(IPC_MAX_LINE_BYTES)?),
+        || read_bounded_pipe_response(pipe, u64::try_from(IPC_MAX_LINE_BYTES)?),
     )
 }
 
