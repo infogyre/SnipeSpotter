@@ -459,6 +459,7 @@ fn exchange_named_pipe(
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
     let mut pipe = BufReader::new(pipe);
     let pipe_handle = HANDLE(pipe.get_ref().as_raw_handle());
+    let mut pipe_ref = &mut pipe;
     exchange_request(
         command,
         || {
@@ -479,15 +480,15 @@ fn exchange_named_pipe(
             Ok(request)
         },
         |request| {
-            pipe.get_mut()
+            pipe_ref
                 .write_all(request)
                 .context("failed to write service request")?;
-            pipe.get_mut()
+            pipe_ref
                 .flush()
                 .context("failed to flush service request")?;
             Ok(())
         },
-        || read_bounded_pipe_response(pipe, u64::try_from(IPC_MAX_LINE_BYTES)?),
+        || read_bounded_pipe_response(pipe_ref, u64::try_from(IPC_MAX_LINE_BYTES)?),
     )
 }
 
