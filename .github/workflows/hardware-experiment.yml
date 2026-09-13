@@ -109,7 +109,7 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Generate protected per-image repetition HMAC key
+      - name: Stage protected per-image repetition cell
         shell: pwsh
         env:
           IMAGE: ${{ matrix.image }}
@@ -117,16 +117,62 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Set-StrictMode -Version Latest
-          $keyPath = Join-Path $env:RUNNER_TEMP "snipespotter-hardware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION.key"
+          $cellId = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
+          $cellRoot = Join-Path ${env:ProgramData} "SnipeSpotterHardware\$cellId"
+          New-Item -ItemType Directory -Force -Path $cellRoot | Out-Null
+          & icacls.exe $cellRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to protect hardware cell root ACL: $cellRoot" }
+          $outputDirectory = Join-Path $cellRoot 'output'
+          New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null
+          & icacls.exe $outputDirectory /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "failed to protect hardware output ACL: $outputDirectory" }
+          $collector = Join-Path $cellRoot 'collector.ps1'
+          $supportExecutable = Join-Path $cellRoot 'spotter-hardware-service.exe'
+          $argumentsPath = Join-Path $cellRoot 'config.json'
+          $keyPath = Join-Path $cellRoot 'hmac.key'
+          $serviceName = "SpotterHardware-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
+          $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
+          if (-not [IO.Path]::IsPathFullyQualified($pwsh)) { throw "PowerShell host path is not absolute: $pwsh" }
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'scripts/hardware/collect_hardware.ps1') -Destination $collector -Force
+          cargo build --locked --release -p spotter-hardware-service --features hardware-experiment
+          Copy-Item -LiteralPath 'target/release/spotter-hardware-service.exe' -Destination $supportExecutable -Force
+          $arguments = [ordered]@{
+            service_name = $serviceName
+            collector = $collector
+            image = $env:IMAGE
+            image_alias = $env:IMAGE
+            context = 'LocalSystem'
+            repetition = [int]$env:REPETITION
+            key_path = $keyPath
+            output_path = (Join-Path $outputDirectory "$env:IMAGE-LocalSystem-$env:REPETITION.json")
+            pwsh_path = $pwsh
+            staging_root = $cellRoot
+          }
+          $arguments | ConvertTo-Json -Compress | Set-Content -LiteralPath $argumentsPath -Encoding utf8
+          foreach ($path in @($collector, $supportExecutable, $argumentsPath)) {
+            & icacls.exe $path /inheritance:r /grant:r '*S-1-5-18:R' '*S-1-5-32-544:F' | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "failed to protect staged hardware object ACL: $path" }
+          }
           $bytes = New-Object byte[] 32
+          $keyHandle = $null
           try {
             [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-            [IO.File]::WriteAllText($keyPath, [Convert]::ToHexString($bytes).ToLowerInvariant())
+            $keyHandle = [IO.File]::Open($keyPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $keyHandle.Dispose()
+            $keyHandle = $null
             & icacls.exe $keyPath /inheritance:r /grant:r '*S-1-5-18:R' '*S-1-5-32-544:F' | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "failed to protect HMAC key ACL: $keyPath" }
+            [IO.File]::WriteAllText($keyPath, [Convert]::ToHexString($bytes).ToLowerInvariant())
           } finally {
+            if ($null -ne $keyHandle) { $keyHandle.Dispose() }
             $bytes = $null
           }
+          "CELL_ROOT=$cellRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "KEY_PATH=$keyPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "COLLECTOR_PATH=$collector" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "SUPPORT_EXECUTABLE=$supportExecutable" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CONFIG_PATH=$argumentsPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OUTPUT_DIRECTORY=$outputDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Collect and validate direct and LocalSystem reports
         shell: pwsh
         env:
@@ -138,12 +184,14 @@ jobs:
           Set-StrictMode -Version Latest
           $reportDirectory = Join-Path $env:GITHUB_WORKSPACE 'hardware-reports'
           New-Item -ItemType Directory -Force -Path $reportDirectory | Out-Null
-          $keyPath = Join-Path $env:RUNNER_TEMP "snipespotter-hardware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION.key"
+          $keyPath = $env:KEY_PATH
+          $collector = $env:COLLECTOR_PATH
+          $argumentsPath = $env:CONFIG_PATH
+          $cellRoot = $env:CELL_ROOT
+          $outputDirectory = $env:OUTPUT_DIRECTORY
           if (-not (Test-Path -LiteralPath $keyPath -PathType Leaf)) { throw "HMAC key was not created: $keyPath" }
-          $collector = Join-Path $env:GITHUB_WORKSPACE 'scripts/hardware/collect_hardware.ps1'
           if ($env:IMAGE_ALIAS -ne $env:IMAGE) { throw 'matrix image alias does not match selected image' }
           $serviceName = "SpotterHardware-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
-          $argumentsPath = Join-Path $env:RUNNER_TEMP "$serviceName.json"
 
           function Wait-ForCondition {
             param([scriptblock]$Condition, [string]$Description, [int]$TimeoutSeconds = 120)
@@ -162,30 +210,15 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "report validation failed for $Context (exit code $LASTEXITCODE)" }
           }
 
-          $directOutput = Join-Path $reportDirectory "$env:IMAGE-interactive-admin-$env:REPETITION.json"
+          $directOutput = Join-Path $outputDirectory "$env:IMAGE-interactive-admin-$env:REPETITION.json"
           $directSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
           & $collector -Image $env:IMAGE -ImageAlias $env:IMAGE_ALIAS -Context interactive-admin -Repetition ([int]$env:REPETITION) -SessionId $directSessionId -HmacKeyPath $keyPath -OutputPath $directOutput
           if (-not $?) { throw 'hardware collector failed for interactive-admin' }
+          Copy-Item -LiteralPath $directOutput -Destination (Join-Path $reportDirectory "$env:IMAGE-interactive-admin-$env:REPETITION.json") -Force
           Invoke-ReportValidation -Context interactive-admin
 
-          cargo build --locked --release -p spotter-hardware-service --features hardware-experiment
-          $supportExecutable = Join-Path $env:RUNNER_TEMP 'spotter-hardware-service.exe'
-          Copy-Item -LiteralPath 'target/release/spotter-hardware-service.exe' -Destination $supportExecutable -Force
+          $supportExecutable = $env:SUPPORT_EXECUTABLE
           if (-not (Test-Path -LiteralPath $supportExecutable -PathType Leaf)) { throw "hardware support service was not built: $supportExecutable" }
-          $pwsh = (Get-Command pwsh -ErrorAction Stop).Source
-          if (-not [IO.Path]::IsPathFullyQualified($pwsh)) { throw "PowerShell host path is not absolute: $pwsh" }
-          $arguments = [ordered]@{
-            service_name = $serviceName
-            collector = $collector
-            image = $env:IMAGE
-            image_alias = $env:IMAGE_ALIAS
-            context = 'LocalSystem'
-            repetition = [int]$env:REPETITION
-            key_path = $keyPath
-            output_path = (Join-Path $reportDirectory "$env:IMAGE-LocalSystem-$env:REPETITION.json")
-            pwsh_path = $pwsh
-          }
-          $arguments | ConvertTo-Json -Compress | Set-Content -LiteralPath $argumentsPath -Encoding utf8
           $binPath = "`"$supportExecutable`" --service-name `"$serviceName`" --config `"$argumentsPath`""
           $scOutput = & sc.exe create $serviceName 'binPath=' $binPath 'obj=' 'LocalSystem' 'start=' 'demand' 'type=' 'own' 2>&1
           if ($LASTEXITCODE -ne 0) {
@@ -198,7 +231,8 @@ jobs:
               $configOutput = & sc.exe qc $serviceName 2>&1
               throw "failed to start LocalSystem service ${serviceName}: start=$($startOutput -join ' ') queryex=$($queryOutput -join ' ') qc=$($configOutput -join ' ')"
             }
-            Wait-ForCondition -Description "LocalSystem report" -Condition { Test-Path -LiteralPath $arguments.output_path -PathType Leaf }
+            Wait-ForCondition -Description "LocalSystem report" -Condition { Test-Path -LiteralPath (Join-Path $outputDirectory "$env:IMAGE-LocalSystem-$env:REPETITION.json") -PathType Leaf }
+            Copy-Item -LiteralPath (Join-Path $outputDirectory "$env:IMAGE-LocalSystem-$env:REPETITION.json") -Destination (Join-Path $reportDirectory "$env:IMAGE-LocalSystem-$env:REPETITION.json") -Force
             Wait-ForCondition -Description "LocalSystem service to stop" -Condition {
               $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
               $null -eq $service -or $service.Status -eq 'Stopped'
@@ -242,6 +276,7 @@ jobs:
           }
 
           $cleanupFailures = @()
+          $serviceDeletionConfirmed = $false
           $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
           if ($null -ne $service -and $service.Status -ne 'Stopped') {
             try { Stop-Service -Name $serviceName -Force -ErrorAction Stop } catch { $cleanupFailures += $_.Exception.Message }
@@ -256,16 +291,20 @@ jobs:
               Wait-ForCondition -Description "LocalSystem service deletion" -Condition {
                 $null -eq (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
               }
+              $serviceDeletionConfirmed = $true
             } catch {
               $cleanupFailures += $_.Exception.Message
+              $cleanupFailures += "refusing to remove protected cell root while service deletion is unconfirmed"
             }
+          } else {
+            $serviceDeletionConfirmed = $true
           }
-          foreach ($path in @(
-            (Join-Path $env:RUNNER_TEMP "$serviceName.json"),
-            (Join-Path $env:RUNNER_TEMP "spotter-hardware-service.exe"),
-            (Join-Path $env:RUNNER_TEMP "snipespotter-hardware-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION.key")
-          )) {
-            try { Remove-Item -LiteralPath $path -Force -ErrorAction Stop } catch { if (Test-Path -LiteralPath $path) { $cleanupFailures += $_.Exception.Message } }
+          $cellId = "$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT-$env:IMAGE-$env:REPETITION" -replace '[^A-Za-z0-9-]', '-'
+          $cellRoot = Join-Path ${env:ProgramData} "SnipeSpotterHardware\$cellId"
+          if ($serviceDeletionConfirmed) {
+            try { Remove-Item -LiteralPath $cellRoot -Recurse -Force -ErrorAction Stop } catch { if (Test-Path -LiteralPath $cellRoot) { $cleanupFailures += $_.Exception.Message } }
+          } else {
+            $cleanupFailures += "refusing to remove protected cell root while service deletion is unconfirmed"
           }
           Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'hardware-reports') -Filter "${env:IMAGE}-*.json" -File -ErrorAction SilentlyContinue |
             ForEach-Object {
