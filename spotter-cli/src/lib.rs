@@ -440,13 +440,26 @@ fn read_bounded_pipe_response(pipe: &mut impl std::io::BufRead, max_bytes: u64) 
 }
 
 #[cfg(windows)]
+fn write_bounded_pipe_request(
+    pipe: &mut std::io::BufReader<std::fs::File>,
+    request: &[u8],
+) -> Result<()> {
+    // BufReader does not implement Write on the pinned toolchain; the underlying
+    // File does, so writes flush through get_mut().
+    let file = pipe.get_mut();
+    std::io::Write::write_all(file, request).context("failed to write service request")?;
+    std::io::Write::flush(file).context("failed to flush service request")?;
+    Ok(())
+}
+
+#[cfg(windows)]
 fn exchange_named_pipe(
     command: &ServiceCommand,
     endpoint: &str,
     service_name: &str,
     identity_query: &dyn ServerIdentityQuery,
 ) -> Result<IpcResponse> {
-    use std::io::{BufReader, Write as _};
+    use std::io::BufReader;
 
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
@@ -462,8 +475,9 @@ fn exchange_named_pipe(
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
     let mut pipe = BufReader::new(pipe);
     let pipe_handle = HANDLE(pipe.get_ref().as_raw_handle());
-    let mut pipe_ref = &mut pipe;
-    exchange_request(
+    // Auth precedes serialization; the closures capture disjoint state so the
+    // pipe is borrowed by exactly one of the sequential helpers at a time.
+    authenticate_serialize_write(
         command,
         || {
             identity_query
@@ -472,7 +486,7 @@ fn exchange_named_pipe(
                 .map_err(anyhow::Error::new)
                 .context("service identity authentication failed")
         },
-        |command| {
+        |command: &ServiceCommand| {
             let mut request = Zeroizing::new(
                 serde_json::to_vec(command).context("failed to encode service request")?,
             );
@@ -482,17 +496,17 @@ fn exchange_named_pipe(
             }
             Ok(request)
         },
-        |request| {
-            pipe_ref
-                .write_all(request)
-                .context("failed to write service request")?;
-            pipe_ref
-                .flush()
-                .context("failed to flush service request")?;
-            Ok(())
-        },
-        || read_bounded_pipe_response(pipe_ref, u64::try_from(IPC_MAX_LINE_BYTES)?),
-    )
+        |request: &[u8]| write_bounded_pipe_request(&mut pipe, request),
+    )?;
+    let mut response = read_bounded_pipe_response(&mut pipe, u64::try_from(IPC_MAX_LINE_BYTES)?)?;
+    if response.is_empty() || !response.ends_with(b"\n") {
+        bail!("service response is empty, unterminated, or oversized")
+    }
+    response.pop();
+    if response.ends_with(b"\r") {
+        response.pop();
+    }
+    serde_json::from_slice(&response).context("invalid service response JSON")
 }
 
 /// Production no-echo token reader.
