@@ -486,8 +486,10 @@ fn flush_parent(parent: &Path) -> Result<()> {
             .with_context(|| format!("failed to open journal parent {}", parent.display()))?
     };
     #[cfg(not(windows))]
-    let handle = File::open(parent)
-        .with_context(|| format!("failed to open journal parent {}", parent.display()))?;
+    let handle = {
+        File::open(parent)
+            .with_context(|| format!("failed to open journal parent {}", parent.display()))?
+    };
     handle
         .sync_all()
         .with_context(|| format!("failed to flush journal parent {}", parent.display()))
