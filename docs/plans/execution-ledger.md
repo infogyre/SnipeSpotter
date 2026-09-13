@@ -185,6 +185,9 @@ and Windows workspace test runs; SPOTR-23 controlled dispatch; any push/PR/dispa
 | --- | --- | --- | --- | --- |
 | 2026-09-11 | scope commit | 2682885523572e46f71dac5b2ee82c7c26e27620 | 237ef56f | first commit on integration branch |
 | 2026-09-12 | Lane D (SPOTR-28) | lane-D branch `hardening/lane-d-msi-symbols` @ `21938ea` | d8b4afc | 4 review rounds → APPROVED (0 findings); merged `3ae0bf7`; post-merge contracts pass (lifecycle/workflow/docs/identity) |
+| 2026-09-13 | Lane A (SPOTR-5) | `hardening/lane-a-ipc-identity` @ `83029bf` | bd81526 | review rounds → APPROVED (0 findings); merged `a238563`; canonicalization via GetFinalPathNameByHandleW both sides, SeDebugPrivilege fail-closed, lifecycle tests added |
+| 2026-09-13 | Lane B (SPOTR-7) | `hardening/lane-b-journal-recovery` @ `08bf414` | bd81526 | review rounds → APPROVED (0 findings); merged `37dc64e`; startup ordering + notice evidence basenames + authoritative tests |
+| 2026-09-13 | Lane C (SPOTR-9/24) | `hardening/lane-c-hardware-host` @ `8113257` | bd81526 | review rounds → APPROVED (0 findings); merged `bb9a6e8`; output containment pinned to validated output dir |
 
 ## Lane D (SPOTR-28) review + integration record
 
