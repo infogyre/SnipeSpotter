@@ -161,12 +161,12 @@ impl LocalFreeGuard {
 
 impl Drop for LocalFreeGuard {
     fn drop(&mut self) {
-        let wiped_length = if !self.pointer.is_null() {
+        let wiped_length = if self.pointer.is_null() {
+            None
+        } else {
             usize::try_from(self.length)
                 .ok()
                 .filter(|length| *length != 0)
-        } else {
-            None
         };
         if let Some(length) = wiped_length {
             // SAFETY: DPAPI allocated this pointer with at least `length` bytes as reported by
@@ -232,12 +232,9 @@ mod tests {
 
     #[test]
     fn dpapi_wipe_guard_handles_null_and_zero_length_safely() {
-        let null_guard = LocalFreeGuard::new(std::ptr::null_mut(), 4);
-        drop(null_guard);
-
         use std::sync::{Mutex, OnceLock};
-
         static OBSERVED: OnceLock<Mutex<Vec<u8>>> = OnceLock::new();
+
         fn observe_zero_length(pointer: *mut u8, length: usize) {
             let mut bytes = OBSERVED
                 .get_or_init(|| Mutex::new(Vec::new()))
@@ -246,6 +243,9 @@ mod tests {
             // SAFETY: the callback runs before the test free hook.
             bytes.extend_from_slice(unsafe { slice::from_raw_parts(pointer, length.max(4)) });
         }
+
+        let null_guard = LocalFreeGuard::new(std::ptr::null_mut(), 4);
+        drop(null_guard);
         let mut allocation = vec![0xA5; 4].into_boxed_slice();
         let pointer = allocation.as_mut_ptr();
         let guard = LocalFreeGuard::new(pointer, 0)
@@ -280,7 +280,8 @@ mod tests {
         let ciphertext = encrypt(&[])?;
 
         assert!(!ciphertext.is_empty());
-        assert_eq!(&*decrypt(&ciphertext)?.as_slice(), &[] as &[u8]);
+        let decrypted = decrypt(&ciphertext)?;
+        assert_eq!(decrypted.as_slice(), &[] as &[u8]);
         Ok(())
     }
 }
