@@ -1757,6 +1757,7 @@ dependencies = [
  "windows-service",
  "wiremock",
  "wmi",
+ "zeroize",
 ]
 
 [[package]]

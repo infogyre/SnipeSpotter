@@ -512,7 +512,7 @@ async fn set_config_save_failure_preserves_redacted_active_settings() -> Result<
 }
 
 #[tokio::test]
-async fn set_token_save_failure_preserves_active_token_and_never_redacts_plaintext() -> Result<()> {
+async fn token_owner_service_failure_table() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let decrypted_tokens = Arc::new(Mutex::new(Vec::new()));
     let mut settings = Settings::default();

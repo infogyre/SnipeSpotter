@@ -12,6 +12,7 @@
 use anyhow::{Context as _, Result, bail};
 use spotter_core::ipc::{IPC_MAX_LINE_BYTES, IpcResponse, ServiceCommand};
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use zeroize::Zeroizing;
 
 use crate::fsm::FsmHandle;
 
@@ -72,7 +73,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let mut stream = BufReader::new(stream);
-    let mut line = Vec::new();
+    let mut line = Zeroizing::new(Vec::new());
     let max_line_bytes = u64::try_from(IPC_MAX_LINE_BYTES)?;
     let read = tokio::time::timeout(read_timeout, async {
         let mut limited = (&mut stream).take(max_line_bytes);
