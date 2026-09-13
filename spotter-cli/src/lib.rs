@@ -1011,7 +1011,13 @@ pub fn exit_code(error: &anyhow::Error) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use super::*;
+
     struct Fake {
         sent: Vec<ServiceCommand>,
     }
@@ -1290,149 +1296,121 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn ipc_secret_buffer_exit_path_table() -> Result<()> {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
+    fn ipc_serialization_failure(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = exchange_request(
+            command,
+            || Ok(()),
+            |_| -> Result<DropObservedRequest> { bail!("injected serialization failure") },
+            |_| Ok(()),
+            || Ok(br#"{\"type\":\"ok\",\"data\":{\"message\":\"ok\"}}\n"#.to_vec()),
+        )
+        .expect_err("serialization failure must reject");
+        assert!(error.to_string().contains("injected serialization failure"));
+        assert!(!dropped.load(Ordering::SeqCst));
+    }
 
-        let command = ServiceCommand::SetToken {
-            value: SecretString::from("table-secret"),
-        };
-        let cases: [(&str, Box<dyn FnOnce() -> Result<()>>); 7] = [
-            (
-                "serialization failure",
-                Box::new(|| {
-                    let dropped = Arc::new(AtomicBool::new(false));
-                    let error = exchange_request(
-                        &command,
-                        || Ok(()),
-                        |_| -> Result<DropObservedRequest> {
-                            bail!("injected serialization failure")
-                        },
-                        |_| Ok(()),
-                        || Ok(br#"{\"type\":\"ok\",\"data\":{\"message\":\"ok\"}}\n"#.to_vec()),
-                    )
-                    .expect_err("serialization failure must reject");
-                    assert!(error.to_string().contains("injected serialization failure"));
-                    assert!(!dropped.load(Ordering::SeqCst));
-                    Ok(())
-                }),
-            ),
-            (
-                "oversized request",
-                Box::new(|| {
-                    let dropped = Arc::new(AtomicBool::new(false));
-                    let error = authenticate_serialize_write(
-                        &command,
-                        || Ok(()),
-                        |_| {
-                            let mut bytes = vec![b'x'; IPC_MAX_LINE_BYTES];
-                            bytes.push(b'\n');
-                            Ok(drop_observed_request(bytes, &dropped))
-                        },
-                        |_| bail!("oversized request rejected"),
-                    )
-                    .expect_err("oversized request must reject before write");
-                    assert!(error.to_string().contains("oversized request"));
-                    assert!(dropped.load(Ordering::SeqCst));
-                    Ok(())
-                }),
-            ),
-            (
-                "unterminated request",
-                Box::new(|| {
-                    let dropped = Arc::new(AtomicBool::new(false));
-                    let error = exchange_request(
-                        &command,
-                        || Ok(()),
-                        |_| Ok(drop_observed_request(b"unterminated".to_vec(), &dropped)),
-                        |_| Ok(()),
-                        || Ok(Vec::new()),
-                    )
-                    .expect_err("unterminated response must reject");
-                    assert!(error.to_string().contains("unterminated"));
-                    assert!(dropped.load(Ordering::SeqCst));
-                    Ok(())
-                }),
-            ),
-            (
-                "write failure",
-                Box::new(|| {
-                    let dropped = Arc::new(AtomicBool::new(false));
-                    let error = authenticate_serialize_write(
-                        &command,
-                        || Ok(()),
-                        |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
-                        |_| bail!("injected write failure"),
-                    )
-                    .expect_err("write failure must reject");
-                    assert!(error.to_string().contains("injected write failure"));
-                    assert!(dropped.load(Ordering::SeqCst));
-                    Ok(())
-                }),
-            ),
-            (
-                "flush failure",
-                Box::new(|| {
-                    let dropped = Arc::new(AtomicBool::new(false));
-                    let error = authenticate_serialize_write(
-                        &command,
-                        || Ok(()),
-                        |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
-                        |_| bail!("injected flush failure"),
-                    )
-                    .expect_err("flush failure must reject");
-                    assert!(error.to_string().contains("injected flush failure"));
-                    assert!(dropped.load(Ordering::SeqCst));
-                    Ok(())
-                }),
-            ),
-            (
-                "read timeout",
-                Box::new(|| {
-                    let dropped = Arc::new(AtomicBool::new(false));
-                    let error = exchange_request(
-                        &command,
-                        || Ok(()),
-                        |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
-                        |_| Ok(()),
-                        || bail!("injected read timeout"),
-                    )
-                    .expect_err("read timeout must reject");
-                    assert!(error.to_string().contains("injected read timeout"));
-                    assert!(dropped.load(Ordering::SeqCst));
-                    Ok(())
-                }),
-            ),
-            (
-                "malformed response",
-                Box::new(|| {
-                    let dropped = Arc::new(AtomicBool::new(false));
-                    let error = exchange_request(
-                        &command,
-                        || Ok(()),
-                        |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
-                        |_| Ok(()),
-                        || Ok(b"not-json\n".to_vec()),
-                    )
-                    .expect_err("malformed response must reject");
-                    assert!(error.to_string().contains("invalid service response JSON"));
-                    assert!(dropped.load(Ordering::SeqCst));
-                    Ok(())
-                }),
-            ),
-        ];
+    fn ipc_oversized_request(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = authenticate_serialize_write(
+            command,
+            || Ok(()),
+            |_| {
+                let mut bytes = vec![b'x'; IPC_MAX_LINE_BYTES];
+                bytes.push(b'\n');
+                Ok(drop_observed_request(bytes, &dropped))
+            },
+            |_| bail!("oversized request rejected"),
+        )
+        .expect_err("oversized request must reject before write");
+        assert!(error.to_string().contains("oversized request"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 
-        for (case, run) in cases {
-            run().with_context(|| format!("case {case:?}"))?;
-        }
-        Ok(())
+    fn ipc_unterminated_request(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = exchange_request(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"unterminated".to_vec(), &dropped)),
+            |_| Ok(()),
+            || Ok(Vec::new()),
+        )
+        .expect_err("unterminated response must reject");
+        assert!(error.to_string().contains("unterminated"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_write_failure(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = authenticate_serialize_write(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+            |_| bail!("injected write failure"),
+        )
+        .expect_err("write failure must reject");
+        assert!(error.to_string().contains("injected write failure"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_flush_failure(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = authenticate_serialize_write(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+            |_| bail!("injected flush failure"),
+        )
+        .expect_err("flush failure must reject");
+        assert!(error.to_string().contains("injected flush failure"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_read_timeout(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = exchange_request(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+            |_| Ok(()),
+            || bail!("injected read timeout"),
+        )
+        .expect_err("read timeout must reject");
+        assert!(error.to_string().contains("injected read timeout"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_malformed_response(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = exchange_request(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+            |_| Ok(()),
+            || Ok(b"not-json\n".to_vec()),
+        )
+        .expect_err("malformed response must reject");
+        assert!(error.to_string().contains("invalid service response JSON"));
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[test]
-    fn authentication_precedes_serialization() -> Result<()> {
+    fn ipc_secret_buffer_exit_path_table() {
+        let command = ServiceCommand::SetToken {
+            value: SecretString::from("table-secret"),
+        };
+        ipc_serialization_failure(&command);
+        ipc_oversized_request(&command);
+        ipc_unterminated_request(&command);
+        ipc_write_failure(&command);
+        ipc_flush_failure(&command);
+        ipc_read_timeout(&command);
+        ipc_malformed_response(&command);
+    }
+
+    #[test]
+    fn authentication_precedes_serialization() {
         use std::sync::{Arc, Mutex};
         use zeroize::Zeroizing;
 
@@ -1467,7 +1445,6 @@ mod tests {
             vec!["auth"],
             "authentication failure must perform zero serialization and zero writes"
         );
-        Ok(())
     }
 
     #[test]
