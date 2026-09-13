@@ -8,9 +8,12 @@ use std::{thread, time::Instant};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
-#[cfg(windows)]
+use secrecy::{ExposeSecret as _, SecretString};
+#[cfg(any(windows, test))]
 use spotter_core::ipc::IPC_MAX_LINE_BYTES;
 use spotter_core::ipc::{IpcResponse, ServiceCommand, validate_config_field};
+#[cfg(any(windows, test))]
+use zeroize::Zeroizing;
 
 use cli_output::{render_config, render_status, validate_selector};
 
@@ -143,7 +146,7 @@ pub trait TokenReader {
     ///
     /// # Errors
     /// Returns an error when input cannot be read.
-    fn read_token(&mut self) -> Result<String>;
+    fn read_token(&mut self) -> Result<SecretString>;
 }
 
 pub trait ServiceRegistrar {
@@ -378,7 +381,36 @@ impl IpcTransport for NamedPipeTransport {
 }
 
 #[cfg(any(windows, test))]
-fn authenticate_serialize_write<A, S, W>(
+fn exchange_request<A, S, W, R, B>(
+    command: &ServiceCommand,
+    authenticate: A,
+    serialize: S,
+    write: W,
+    read_response: R,
+) -> Result<IpcResponse>
+where
+    A: FnOnce() -> Result<()>,
+    S: FnOnce(&ServiceCommand) -> Result<B>,
+    W: FnOnce(&[u8]) -> Result<()>,
+    R: FnOnce() -> Result<Vec<u8>>,
+    B: AsRef<[u8]>,
+{
+    authenticate()?;
+    let request = serialize(command)?;
+    write(request.as_ref())?;
+    let mut response = read_response()?;
+    if response.is_empty() || !response.ends_with(b"\n") {
+        bail!("service response is empty, unterminated, or oversized")
+    }
+    response.pop();
+    if response.ends_with(b"\r") {
+        response.pop();
+    }
+    serde_json::from_slice(&response).context("invalid service response JSON")
+}
+
+#[cfg(any(windows, test))]
+fn authenticate_serialize_write<A, S, W, B>(
     command: &ServiceCommand,
     authenticate: A,
     serialize: S,
@@ -386,12 +418,13 @@ fn authenticate_serialize_write<A, S, W>(
 ) -> Result<()>
 where
     A: FnOnce() -> Result<()>,
-    S: FnOnce(&ServiceCommand) -> Result<Vec<u8>>,
+    S: FnOnce(&ServiceCommand) -> Result<B>,
     W: FnOnce(&[u8]) -> Result<()>,
+    B: AsRef<[u8]>,
 {
     authenticate()?;
     let request = serialize(command)?;
-    write(&request)
+    write(request.as_ref())
 }
 
 #[cfg(windows)]
@@ -401,7 +434,7 @@ fn exchange_named_pipe(
     service_name: &str,
     identity_query: &dyn ServerIdentityQuery,
 ) -> Result<IpcResponse> {
-    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::io::{BufReader, Read as _, Write as _};
 
     use std::os::windows::fs::OpenOptionsExt as _;
     use std::os::windows::io::AsRawHandle as _;
@@ -417,7 +450,7 @@ fn exchange_named_pipe(
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
     let mut pipe = BufReader::new(pipe);
     let pipe_handle = HANDLE(pipe.get_ref().as_raw_handle());
-    authenticate_serialize_write(
+    exchange_request(
         command,
         || {
             identity_query
@@ -427,8 +460,9 @@ fn exchange_named_pipe(
                 .context("service identity authentication failed")
         },
         |command| {
-            let mut request =
-                serde_json::to_vec(command).context("failed to encode service request")?;
+            let mut request = Zeroizing::new(
+                serde_json::to_vec(command).context("failed to encode service request")?,
+            );
             request.push(b'\n');
             if request.len() > IPC_MAX_LINE_BYTES {
                 bail!("service request exceeds 64 KiB")
@@ -444,44 +478,39 @@ fn exchange_named_pipe(
                 .context("failed to flush service request")?;
             Ok(())
         },
-    )?;
-
-    let mut response = Vec::new();
-    let read = pipe
-        .take(u64::try_from(IPC_MAX_LINE_BYTES)?)
-        .read_until(b'\n', &mut response)
-        .context("failed to read service response")?;
-    if read == 0 || !response.ends_with(b"\n") {
-        bail!("service response is empty, unterminated, or oversized")
-    }
-    response.pop();
-    if response.ends_with(b"\r") {
-        response.pop();
-    }
-    serde_json::from_slice(&response).context("invalid service response JSON")
+        || {
+            let mut response = Vec::new();
+            pipe.take(u64::try_from(IPC_MAX_LINE_BYTES)?)
+                .read_until(b'\n', &mut response)
+                .context("failed to read service response")?;
+            Ok(response)
+        },
+    )
 }
 
 /// Production no-echo token reader.
 pub struct ConsoleTokenReader;
 
 impl TokenReader for ConsoleTokenReader {
-    fn read_token(&mut self) -> Result<String> {
+    fn read_token(&mut self) -> Result<SecretString> {
         use std::io::IsTerminal as _;
 
         let token = if std::io::stdin().is_terminal() {
-            rpassword::prompt_password("Snipe-IT API token: ")
-                .context("failed to read API token")?
+            SecretString::from(
+                rpassword::prompt_password("Snipe-IT API token: ")
+                    .context("failed to read API token")?,
+            )
         } else {
             read_piped_token(std::io::stdin().lock())?
         };
-        if token.is_empty() {
+        if token.expose_secret().is_empty() {
             bail!("API token must not be empty")
         }
         Ok(token)
     }
 }
 
-fn read_piped_token(mut input: impl std::io::BufRead) -> Result<String> {
+fn read_piped_token(mut input: impl std::io::BufRead) -> Result<SecretString> {
     use std::io::Read as _;
 
     const MAX_TOKEN_BYTES: u64 = 16 * 1024;
@@ -499,7 +528,7 @@ fn read_piped_token(mut input: impl std::io::BufRead) -> Result<String> {
         bytes.pop();
     }
     match String::from_utf8(bytes) {
-        Ok(token) => Ok(token),
+        Ok(token) => Ok(SecretString::from(token)),
         Err(error) => {
             let mut bytes = error.into_bytes();
             bytes.fill(0);
@@ -1006,6 +1035,37 @@ mod tests {
         }
     }
 
+    struct DropObservedRequest {
+        bytes: Zeroizing<Vec<u8>>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AsRef<[u8]> for DropObservedRequest {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for DropObservedRequest {
+        fn drop(&mut self) {
+            use zeroize::Zeroize as _;
+
+            self.bytes.zeroize();
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn drop_observed_request(
+        bytes: Vec<u8>,
+        dropped: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> DropObservedRequest {
+        DropObservedRequest {
+            bytes: Zeroizing::new(bytes),
+            dropped: std::sync::Arc::clone(dropped),
+        }
+    }
+
     struct RecordingRegistrar {
         installs: usize,
         uninstalls: usize,
@@ -1022,8 +1082,8 @@ mod tests {
         }
     }
     impl TokenReader for Fake {
-        fn read_token(&mut self) -> Result<String> {
-            Ok(String::from("secret"))
+        fn read_token(&mut self) -> Result<SecretString> {
+            Ok(SecretString::from("secret"))
         }
     }
     impl ServiceRegistrar for Fake {
@@ -1219,15 +1279,162 @@ mod tests {
 
     #[test]
     fn piped_token_is_trimmed_and_bounded() -> Result<()> {
-        assert_eq!(read_piped_token(&b"secret\r\n"[..])?, "secret");
+        use secrecy::ExposeSecret as _;
+
+        assert_eq!(
+            read_piped_token(&b"secret\r\n"[..])?.expose_secret(),
+            "secret"
+        );
         assert!(read_piped_token(&vec![b'x'; 16 * 1024 + 1][..]).is_err());
         assert!(read_piped_token(&[0xff][..]).is_err());
         Ok(())
     }
 
     #[test]
+    fn ipc_secret_buffer_exit_path_table() -> Result<()> {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let command = ServiceCommand::SetToken {
+            value: SecretString::from("table-secret"),
+        };
+        let cases: [(&str, Box<dyn FnOnce() -> Result<()>>); 7] = [
+            (
+                "serialization failure",
+                Box::new(|| {
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let error = exchange_request(
+                        &command,
+                        || Ok(()),
+                        |_| -> Result<DropObservedRequest> {
+                            bail!("injected serialization failure")
+                        },
+                        |_| Ok(()),
+                        || Ok(br#"{\"type\":\"ok\",\"data\":{\"message\":\"ok\"}}\n"#.to_vec()),
+                    )
+                    .expect_err("serialization failure must reject");
+                    assert!(error.to_string().contains("injected serialization failure"));
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    Ok(())
+                }),
+            ),
+            (
+                "oversized request",
+                Box::new(|| {
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let error = authenticate_serialize_write(
+                        &command,
+                        || Ok(()),
+                        |_| {
+                            let mut bytes = vec![b'x'; IPC_MAX_LINE_BYTES];
+                            bytes.push(b'\n');
+                            Ok(drop_observed_request(bytes, &dropped))
+                        },
+                        |_| bail!("oversized request rejected"),
+                    )
+                    .expect_err("oversized request must reject before write");
+                    assert!(error.to_string().contains("oversized request"));
+                    assert!(dropped.load(Ordering::SeqCst));
+                    Ok(())
+                }),
+            ),
+            (
+                "unterminated request",
+                Box::new(|| {
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let error = exchange_request(
+                        &command,
+                        || Ok(()),
+                        |_| Ok(drop_observed_request(b"unterminated".to_vec(), &dropped)),
+                        |_| Ok(()),
+                        || Ok(Vec::new()),
+                    )
+                    .expect_err("unterminated response must reject");
+                    assert!(error.to_string().contains("unterminated"));
+                    assert!(dropped.load(Ordering::SeqCst));
+                    Ok(())
+                }),
+            ),
+            (
+                "write failure",
+                Box::new(|| {
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let error = authenticate_serialize_write(
+                        &command,
+                        || Ok(()),
+                        |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+                        |_| bail!("injected write failure"),
+                    )
+                    .expect_err("write failure must reject");
+                    assert!(error.to_string().contains("injected write failure"));
+                    assert!(dropped.load(Ordering::SeqCst));
+                    Ok(())
+                }),
+            ),
+            (
+                "flush failure",
+                Box::new(|| {
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let error = authenticate_serialize_write(
+                        &command,
+                        || Ok(()),
+                        |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+                        |_| bail!("injected flush failure"),
+                    )
+                    .expect_err("flush failure must reject");
+                    assert!(error.to_string().contains("injected flush failure"));
+                    assert!(dropped.load(Ordering::SeqCst));
+                    Ok(())
+                }),
+            ),
+            (
+                "read timeout",
+                Box::new(|| {
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let error = exchange_request(
+                        &command,
+                        || Ok(()),
+                        |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+                        |_| Ok(()),
+                        || bail!("injected read timeout"),
+                    )
+                    .expect_err("read timeout must reject");
+                    assert!(error.to_string().contains("injected read timeout"));
+                    assert!(dropped.load(Ordering::SeqCst));
+                    Ok(())
+                }),
+            ),
+            (
+                "malformed response",
+                Box::new(|| {
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let error = exchange_request(
+                        &command,
+                        || Ok(()),
+                        |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+                        |_| Ok(()),
+                        || Ok(b"not-json\n".to_vec()),
+                    )
+                    .expect_err("malformed response must reject");
+                    assert!(error.to_string().contains("invalid service response JSON"));
+                    assert!(dropped.load(Ordering::SeqCst));
+                    Ok(())
+                }),
+            ),
+        ];
+
+        for (case, run) in cases {
+            run().with_context(|| format!("case {case:?}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn authentication_precedes_serialization() -> Result<()> {
         use std::sync::{Arc, Mutex};
+        use zeroize::Zeroizing;
 
         let events = Arc::new(Mutex::new(Vec::new()));
         let auth_events = Arc::clone(&events);
@@ -1235,7 +1442,7 @@ mod tests {
         let write_events = Arc::clone(&events);
         let error = authenticate_serialize_write(
             &ServiceCommand::SetToken {
-                value: String::from("must-not-be-serialized"),
+                value: SecretString::from("must-not-be-serialized"),
             },
             move || {
                 auth_events.lock().expect("event lock").push("auth");
@@ -1246,7 +1453,7 @@ mod tests {
                     .lock()
                     .expect("event lock")
                     .push("serialize");
-                Ok(vec![b'\n'])
+                Ok(Zeroizing::new(vec![b'\n']))
             },
             move |_| {
                 write_events.lock().expect("event lock").push("write");

@@ -512,7 +512,7 @@ async fn set_config_save_failure_preserves_redacted_active_settings() -> Result<
 }
 
 #[tokio::test]
-async fn set_token_save_failure_preserves_active_token_and_never_redacts_plaintext() -> Result<()> {
+async fn token_owner_service_failure_table() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let decrypted_tokens = Arc::new(Mutex::new(Vec::new()));
     let mut settings = Settings::default();
@@ -543,7 +543,7 @@ async fn set_token_save_failure_preserves_active_token_and_never_redacts_plainte
 
     let response = fsm
         .request(ServiceCommand::SetToken {
-            value: String::from("new-plaintext-token"),
+            value: SecretString::from("new-plaintext-token"),
         })
         .await?;
     assert!(
@@ -662,7 +662,7 @@ async fn real_owner_commands_execute_through_fsm() -> Result<()> {
             value: String::from("https://example.test"),
         },
         ServiceCommand::SetToken {
-            value: String::from("test-token"),
+            value: SecretString::from("test-token"),
         },
         ServiceCommand::GetStatus,
         ServiceCommand::GetStatusFull,
@@ -1171,7 +1171,7 @@ async fn owner_staged_onboarding_sequence_persists_without_activation() -> Resul
         );
     }
     let response = fsm.request(ServiceCommand::SetToken {
-        value: String::from("operator-secret"),
+        value: SecretString::from("operator-secret"),
     });
     let response = response.await?;
     assert!(

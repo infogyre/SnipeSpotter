@@ -4,6 +4,8 @@
 
 use std::{ffi::OsString, fs, path::Path, sync::Arc, sync::mpsc, time::Duration};
 
+use secrecy::ExposeSecret as _;
+
 use crate::owner_ports::{
     Clock, HardwareDiscovery, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
 };
@@ -148,7 +150,7 @@ impl CommandOwner {
                 .set_config(&field, &value)
                 .unwrap_or_else(protocol_error),
             ServiceCommand::SetToken { value } => self
-                .set_token(value.as_bytes())
+                .set_token(value.expose_secret().as_bytes())
                 .unwrap_or_else(protocol_error),
             ServiceCommand::GetStatus => self.status(false),
             ServiceCommand::GetStatusFull => self.status(true),
