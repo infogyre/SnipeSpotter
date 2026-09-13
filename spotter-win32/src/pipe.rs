@@ -156,11 +156,7 @@ impl ServerIdentityQuery for SameAccountServerIdentityQuery {
         pipe: HANDLE,
         service_name: &str,
     ) -> std::result::Result<ServerIdentity, ServiceIdentityError> {
-        native_query_with_profile(
-            pipe,
-            service_name,
-            Some(self.policy.expected_executable.clone()),
-        )
+        native_query_with_profile(pipe, service_name, self.policy.expected_executable.clone())
     }
 }
 
