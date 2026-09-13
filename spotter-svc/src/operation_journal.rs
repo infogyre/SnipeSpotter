@@ -471,14 +471,16 @@ fn ensure_safe_parent(parent: &Path) -> Result<()> {
 }
 
 fn flush_parent(parent: &Path) -> Result<()> {
-    // Windows requires FILE_FLAG_BACKUP_SEMANTICS to open a directory handle;
-    // a plain File::open on a directory fails with access denied there (the
+    // Windows requires FILE_FLAG_BACKUP_SEMANTICS to open a directory handle,
+    // and FlushFileBuffers on a directory needs write access to succeed; a
+    // plain File::open on a directory fails with access denied there (the
     // same constraint atomic_file.rs handles for its own parent flush).
     #[cfg(windows)]
     let handle = {
         use std::os::windows::fs::OpenOptionsExt as _;
         OpenOptions::new()
             .read(true)
+            .write(true)
             .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
             .open(parent)
             .with_context(|| format!("failed to open journal parent {}", parent.display()))?
