@@ -10,8 +10,9 @@ SnipeSpotter synchronizes Windows system and monitor inventory with an existing 
 - **WMI monitor discovery**: Queries `WmiMonitorID` in `root\wmi` for connected monitor manufacturer codes, product codes, serials, and manufacture dates.
 - **DPAPI token protection**: API tokens are encrypted with machine-scope DPAPI by the LocalSystem service. Plaintext never persists to disk.
 - **HTTPS-only Snipe-IT access**: Every production URL entry point enforces HTTPS with OS trust-store validation before any network I/O; no insecure opt-out exists.
-- **Named-pipe IPC**: The CLI communicates with the service over a named pipe restricted to SYSTEM and built-in Administrators via a DACL, with at most 16 concurrent sessions and cooperative shutdown.
-- **Operation journaling**: Prepared operations are durably journaled before remote execution. Recovery reconciles server state before retrying uncertain mutations.
+- **Authenticated named-pipe IPC**: The CLI authenticates each connected server before serializing or writing a request by binding its PID, LocalSystem owner SID, and canonical image path to the SCM registration. The service claims the first pipe instance; this defends standard-user counterfeit endpoints and restart races, but not an administrator controlling SCM, replacing the service binary, or inspecting the machine.
+- **Evidence-preserving operation journaling**: Prepared operations are durably journaled before remote execution. Clean journals recover normally; ambiguous or corrupt journals are quarantined, marked blocked, and kept out of replay until an administrator validates the remote outcome and repairs the evidence.
+
 - **Signed state**: Service state is HMAC-SHA256 signed with constant-time verification to detect tampering.
 - **WiX 6 MSI installer**: Installs binaries and CycloneDX SBOMs; registers the service as automatic LocalSystem without starting it; adds `bin\` to system PATH; creates ProgramData with restricted ACLs. PDB debug symbols are not installed; they ship only in the separately published public symbols ZIP.
 - **Configurable monitor check-in**: `Manual` policy never auto-checks in; `AutoNonPortable` checks in absent monitors on non-portable chassis after a configurable threshold.

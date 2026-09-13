@@ -35,7 +35,7 @@ Double-click the MSI in Explorer and follow the wizard. Administrator elevation 
 
 The installer creates the initial tree, but runtime startup is the security boundary: the service reapplies the protected contract to the root and existing runtime artifacts, and the atomic writer applies it to temporary files and reapplies it to each replaced destination. A standard user is not an allowed principal for the root, settings, state, HMAC key, journal, or logs.
 
-The service is registered but not started during installation. When started, it remains `Running` while unconfigured and serves the administrator-only named pipe so the CLI can complete configuration; `Unconfigured` is an operating state, not a service-health failure. It will start on the next boot, or you can start it manually after installation.
+The service is registered but not started during installation. When started, it remains `Running` while unconfigured and serves the administrator-only named pipe so the CLI can complete configuration; `Unconfigured` is an operating state, not a service-health failure. The CLI authenticates the connected pipe server before sending any request bytes by checking its server PID, LocalSystem owner SID, and SCM-registered executable image. This prevents a standard user from supplying a counterfeit endpoint during startup or a restart race. It does not protect against an administrator controlling SCM, replacing the service binary, or inspecting the machine. The service will start on the next boot, or you can start it manually after installation.
 
 ### Major upgrade
 
@@ -76,7 +76,7 @@ The `config set-token` command prompts for the token with no echo. For automatio
 $token | spotter-cli config set-token
 ```
 
-The service encrypts the token with machine-scope DPAPI. Re-enter it after an OS reinstall or when moving configuration to another computer.
+The service encrypts the token with machine-scope DPAPI. Application-owned token buffers use best-effort zeroizing owners; DPAPI output is wiped over its reported `cbData` bytes before `LocalFree`. This does not claim that library-owned input/deserialization or allocator copies can be erased. Re-enter the token after an OS reinstall or when moving configuration to another computer.
 
 ### Post-configuration
 
@@ -199,6 +199,8 @@ Existing HTTP installations fail closed with a bounded, actionable message; the 
 
 The client uses the OS certificate trust store (Windows machine trust). Install your CA chain through normal machine administration; no insecure bypass exists.
 
+The named-pipe DACL still grants access only to SYSTEM and built-in Administrators. Authentication is per connection, uses the connected server process identity and SCM image path, and fails closed before serialization or writing when the service is unavailable, restarting, unqueryable, not LocalSystem, or running an unexpected executable.
+
 ### checkin
 
 ```powershell
@@ -298,6 +300,20 @@ If the service logs an HMAC verification failure:
 2. Preserve `state.toml`, the journal directory, and logs for diagnosis.
 3. Do not delete a pending journal blindly. Recovery processes pending prepared and observed operations in durable prepared order, reconciles remote assignment, and keeps evidence until signed state is saved and the operation is committed.
 4. If the state is unrecoverable, you may delete `state.toml` and `state-hmac-key.bin` to reset state. The next sync will rebuild monitor state from Snipe-IT.
+
+### Blocked operation journal recovery
+
+Journal admission runs before configuration branching, DPAPI decryption, remote-client construction, owner recovery, and IPC startup. A `NeedsOperatorRecovery`, `PreservationFailed`, or `Corrupt` result stops the service, leaves remote activity disabled, and writes a bounded log notice containing only the classification, evidence paths, and validated record count. The original journal bytes are not silently discarded. When preservation succeeds, the service retains a sibling quarantine file such as `operations.jsonl.quarantine-<unix-millis>-<hash>` and a sticky `operations.jsonl.recovery-blocked` marker. Quarantines are retained indefinitely.
+
+Use this administrator procedure:
+
+1. Stop the service: `sc stop SnipeSpotter`.
+2. Read the service log and locate the exact quarantine and marker paths named by the recovery notice. Preserve both files and the original `operations.jsonl` while investigating.
+3. Inspect the quarantined bytes with the service stopped. Validate the remote outcome directly in Snipe-IT; do not infer it from a partial local record and do not retry a mutation blindly.
+4. If the remote outcome is confirmed applied, either restore a manually repaired journal containing only complete, newline-terminated records or remove the journal and marker to start clean. Removing the marker without reconciling the remote outcome is not recovery.
+5. Restart the service and confirm it reaches `Running`. Marker absence plus a valid journal is the only accepted clean state; a valid-looking journal beside the marker remains blocked.
+
+The blocked recovery result exposes no journal records, so ambiguous evidence cannot be replayed automatically. If quarantine or marker creation failed, leave the original bytes untouched and escalate with the service log; do not treat that outcome as clean.
 
 Settings, state, keys, and journal compaction use same-directory replacement. The writer guarantees complete old-or-new destination content across the tested process-interruption points; it does not guarantee survival across physical power loss. It is a single-writer design. A failed write cleans up only its own temporary file, while startup cleanup removes stale temporary files only when the PID/nonce sidecar matches, the owner is dead, and the age threshold has elapsed. Leave files with missing or malformed metadata, a live/current owner, or insufficient age in place for diagnosis.
 
