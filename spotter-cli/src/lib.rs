@@ -22,7 +22,13 @@ mod command_line;
 
 pub use command_line::executable_from_command_line;
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "test-support"))]
+use spotter_win32::pipe::{
+    NativeServerIdentityQuery, SameAccountServerIdentityQuery, ServerIdentityQuery,
+    ServiceIdentityError,
+};
+
+#[cfg(all(windows, not(feature = "test-support")))]
 use spotter_win32::pipe::{NativeServerIdentityQuery, ServerIdentityQuery, ServiceIdentityError};
 
 /// Exit status used when the Windows service IPC endpoint is unavailable.
@@ -604,7 +610,11 @@ pub struct ProcessElevationChecker;
 
 impl ElevationChecker for ProcessElevationChecker {
     fn is_elevated(&self) -> bool {
-        #[cfg(windows)]
+        #[cfg(all(windows, feature = "test-support"))]
+        {
+            spotter_win32::elevation::is_elevated()
+        }
+        #[cfg(all(windows, not(feature = "test-support")))]
         {
             spotter_win32::elevation::is_elevated()
         }
