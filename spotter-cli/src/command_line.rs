@@ -76,7 +76,7 @@ mod tests {
             executable_from_command_line(
                 r#"  "C:\Program Files\SnipeSpotter\spotter-svc.exe" --service-name custom"#
             )?,
-            r#"C:\Program Files\SnipeSpotter\spotter-svc.exe"#
+            r"C:\Program Files\SnipeSpotter\spotter-svc.exe"
         );
         Ok(())
     }
@@ -94,7 +94,7 @@ mod tests {
     fn preserves_escaped_quote_in_executable() -> Result<()> {
         assert_eq!(
             executable_from_command_line(r#""C:\x\\\"quoted.exe" --arg"#)?,
-            r##"C:\x\"quoted.exe"##
+            r#"C:\x\"quoted.exe"#
         );
         Ok(())
     }
