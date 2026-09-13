@@ -8,9 +8,12 @@ use std::{thread, time::Instant};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use secrecy::{ExposeSecret as _, SecretString};
 #[cfg(windows)]
 use spotter_core::ipc::IPC_MAX_LINE_BYTES;
 use spotter_core::ipc::{IpcResponse, ServiceCommand, validate_config_field};
+#[cfg(any(windows, test))]
+use zeroize::Zeroizing;
 
 use cli_output::{render_config, render_status, validate_selector};
 
@@ -143,7 +146,7 @@ pub trait TokenReader {
     ///
     /// # Errors
     /// Returns an error when input cannot be read.
-    fn read_token(&mut self) -> Result<String>;
+    fn read_token(&mut self) -> Result<SecretString>;
 }
 
 pub trait ServiceRegistrar {
@@ -203,7 +206,7 @@ pub fn dispatch(
                 Some(transport.send(&ServiceCommand::GetConfig)?)
             }
             ConfigCommand::SetToken => Some(transport.send(&ServiceCommand::SetToken {
-                value: tokens.read_token()?.into(),
+                value: tokens.read_token()?,
             })?),
         },
         Command::Status { full } => Some(transport.send(if *full {
@@ -386,7 +389,7 @@ fn authenticate_serialize_write<A, S, W>(
 ) -> Result<()>
 where
     A: FnOnce() -> Result<()>,
-    S: FnOnce(&ServiceCommand) -> Result<Vec<u8>>,
+    S: FnOnce(&ServiceCommand) -> Result<Zeroizing<Vec<u8>>>,
     W: FnOnce(&[u8]) -> Result<()>,
 {
     authenticate()?;
@@ -427,8 +430,9 @@ fn exchange_named_pipe(
                 .context("service identity authentication failed")
         },
         |command| {
-            let mut request =
-                serde_json::to_vec(command).context("failed to encode service request")?;
+            let mut request = Zeroizing::new(
+                serde_json::to_vec(command).context("failed to encode service request")?,
+            );
             request.push(b'\n');
             if request.len() > IPC_MAX_LINE_BYTES {
                 bail!("service request exceeds 64 KiB")
@@ -465,23 +469,25 @@ fn exchange_named_pipe(
 pub struct ConsoleTokenReader;
 
 impl TokenReader for ConsoleTokenReader {
-    fn read_token(&mut self) -> Result<String> {
+    fn read_token(&mut self) -> Result<SecretString> {
         use std::io::IsTerminal as _;
 
         let token = if std::io::stdin().is_terminal() {
-            rpassword::prompt_password("Snipe-IT API token: ")
-                .context("failed to read API token")?
+            SecretString::from(
+                rpassword::prompt_password("Snipe-IT API token: ")
+                    .context("failed to read API token")?,
+            )
         } else {
             read_piped_token(std::io::stdin().lock())?
         };
-        if token.is_empty() {
+        if token.expose_secret().is_empty() {
             bail!("API token must not be empty")
         }
         Ok(token)
     }
 }
 
-fn read_piped_token(mut input: impl std::io::BufRead) -> Result<String> {
+fn read_piped_token(mut input: impl std::io::BufRead) -> Result<SecretString> {
     use std::io::Read as _;
 
     const MAX_TOKEN_BYTES: u64 = 16 * 1024;
@@ -499,7 +505,7 @@ fn read_piped_token(mut input: impl std::io::BufRead) -> Result<String> {
         bytes.pop();
     }
     match String::from_utf8(bytes) {
-        Ok(token) => Ok(token),
+        Ok(token) => Ok(SecretString::from(token)),
         Err(error) => {
             let mut bytes = error.into_bytes();
             bytes.fill(0);
@@ -983,7 +989,6 @@ pub fn exit_code(error: &anyhow::Error) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
     struct Fake {
         sent: Vec<ServiceCommand>,
     }
@@ -1023,8 +1028,8 @@ mod tests {
         }
     }
     impl TokenReader for Fake {
-        fn read_token(&mut self) -> Result<String> {
-            Ok(String::from("secret"))
+        fn read_token(&mut self) -> Result<SecretString> {
+            Ok(SecretString::from("secret"))
         }
     }
     impl ServiceRegistrar for Fake {
@@ -1220,7 +1225,12 @@ mod tests {
 
     #[test]
     fn piped_token_is_trimmed_and_bounded() -> Result<()> {
-        assert_eq!(read_piped_token(&b"secret\r\n"[..])?, "secret");
+        use secrecy::ExposeSecret as _;
+
+        assert_eq!(
+            read_piped_token(&b"secret\r\n"[..])?.expose_secret(),
+            "secret"
+        );
         assert!(read_piped_token(&vec![b'x'; 16 * 1024 + 1][..]).is_err());
         assert!(read_piped_token(&[0xff][..]).is_err());
         Ok(())
@@ -1229,6 +1239,7 @@ mod tests {
     #[test]
     fn authentication_precedes_serialization() -> Result<()> {
         use std::sync::{Arc, Mutex};
+        use zeroize::Zeroizing;
 
         let events = Arc::new(Mutex::new(Vec::new()));
         let auth_events = Arc::clone(&events);
@@ -1247,7 +1258,7 @@ mod tests {
                     .lock()
                     .expect("event lock")
                     .push("serialize");
-                Ok(vec![b'\n'])
+                Ok(Zeroizing::new(vec![b'\n']))
             },
             move |_| {
                 write_events.lock().expect("event lock").push("write");

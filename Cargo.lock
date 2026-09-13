@@ -1695,6 +1695,7 @@ dependencies = [
  "tokio",
  "windows",
  "windows-service",
+ "zeroize",
 ]
 
 [[package]]
