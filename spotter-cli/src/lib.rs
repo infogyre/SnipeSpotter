@@ -319,6 +319,25 @@ impl NamedPipeTransport {
         }
     }
 
+    /// Construct a transport for an explicit endpoint and service identity.
+    ///
+    /// Test-support builds use this so the identity gate authenticates against
+    /// the isolated test service registration instead of the production name.
+    #[must_use]
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn with_endpoint_and_service(
+        timeout: Duration,
+        endpoint: impl Into<String>,
+        service_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            timeout,
+            endpoint: endpoint.into(),
+            identity_query: std::sync::Arc::new(NativeServerIdentityQuery),
+            service_name: service_name.into(),
+        }
+    }
+
     /// Construct an endpoint transport with an injected identity query for test-support builds.
     #[must_use]
     #[cfg(all(windows, feature = "test-support"))]
@@ -726,6 +745,29 @@ pub fn transport_endpoint(cli: &Cli) -> Option<String> {
 }
 
 #[cfg(feature = "test-support")]
+/// Build the transport implied by test-support overrides (endpoint + service name),
+/// or `None` when production defaults apply.
+#[must_use]
+pub fn transport_transport(cli: &Cli, timeout: Duration) -> Option<NamedPipeTransport> {
+    #[cfg(windows)]
+    {
+        let endpoint = cli.test_pipe_endpoint.clone()?;
+        Some(NamedPipeTransport::with_endpoint_and_service(
+            timeout,
+            endpoint,
+            cli.test_service_name
+                .clone()
+                .unwrap_or_else(|| String::from(spotter_core::identity::SERVICE_NAME)),
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (cli, timeout);
+        None
+    }
+}
+
+#[cfg(feature = "test-support")]
 /// Return the validated transport timeout selected by test support, or the production default.
 #[must_use]
 pub fn transport_timeout(cli: &Cli) -> Duration {
@@ -738,6 +780,13 @@ pub fn transport_timeout(cli: &Cli) -> Duration {
         }
         _ => PRODUCTION_TRANSPORT_TIMEOUT,
     }
+}
+
+#[cfg(not(feature = "test-support"))]
+/// Return `None`: the production transport uses the fixed default identity.
+#[must_use]
+pub const fn transport_transport(_cli: &Cli, _timeout: Duration) -> Option<NamedPipeTransport> {
+    None
 }
 
 #[cfg(not(feature = "test-support"))]
