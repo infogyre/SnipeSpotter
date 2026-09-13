@@ -1768,6 +1768,7 @@ dependencies = [
  "spotter-core",
  "thiserror",
  "windows",
+ "zeroize",
 ]
 
 [[package]]
