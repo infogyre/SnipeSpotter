@@ -480,7 +480,8 @@ fn exchange_named_pipe(
         },
         || {
             let mut response = Vec::new();
-            pipe.take(u64::try_from(IPC_MAX_LINE_BYTES)?)
+            (&mut pipe)
+                .take(u64::try_from(IPC_MAX_LINE_BYTES)?)
                 .read_until(b'\n', &mut response)
                 .context("failed to read service response")?;
             Ok(response)
