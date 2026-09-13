@@ -303,17 +303,17 @@ If the service logs an HMAC verification failure:
 
 ### Blocked operation journal recovery
 
-Journal admission runs before configuration branching, DPAPI decryption, remote-client construction, owner recovery, and IPC startup. A `NeedsOperatorRecovery`, `PreservationFailed`, or `Corrupt` result stops the service, leaves remote activity disabled, and writes a bounded log notice containing only the classification, evidence paths, and validated record count. The original journal bytes are not silently discarded. When preservation succeeds, the service retains a sibling quarantine file such as `operations.jsonl.quarantine-<unix-millis>-<hash>` and a sticky `operations.jsonl.recovery-blocked` marker. Quarantines are retained indefinitely.
+Journal admission runs before configuration branching, DPAPI decryption, remote-client construction, owner recovery, and IPC startup. A `NeedsOperatorRecovery`, `PreservationFailed`, or `Corrupt` result stops the service, leaves remote activity disabled, and writes a bounded log notice containing only the classification, evidence paths, and validated record count. The original journal bytes are not silently discarded. An incomplete unterminated JSON suffix with a valid prefix is the ambiguous case: when preservation succeeds, the service retains a sibling quarantine file such as `operations.jsonl.quarantine-<unix-millis>-<hash>` and creates the sticky `operations.jsonl.recovery-blocked` marker. Malformed records and invalid phase sequences are `Corrupt`: they are fail-closed with quarantined evidence when possible, but do not create a marker. Quarantines are retained indefinitely.
 
-Use this administrator procedure:
+Use this administrator procedure for `NeedsOperatorRecovery` or an existing recovery marker:
 
 1. Stop the service: `sc stop SnipeSpotter`.
-2. Read the service log and locate the exact quarantine and marker paths named by the recovery notice. Preserve both files and the original `operations.jsonl` while investigating.
+2. Read the service log and locate the exact quarantine and marker paths named by the recovery notice. For an ambiguous suffix, preserve both files and the original `operations.jsonl` while investigating; a `Corrupt` result has quarantine evidence but no marker.
 3. Inspect the quarantined bytes with the service stopped. Validate the remote outcome directly in Snipe-IT; do not infer it from a partial local record and do not retry a mutation blindly.
-4. If the remote outcome is confirmed applied, either restore a manually repaired journal containing only complete, newline-terminated records or remove the journal and marker to start clean. Removing the marker without reconciling the remote outcome is not recovery.
-5. Restart the service and confirm it reaches `Running`. Marker absence plus a valid journal is the only accepted clean state; a valid-looking journal beside the marker remains blocked.
+4. If the remote outcome is confirmed applied, either restore a manually repaired journal containing only complete, newline-terminated records or remove the journal and marker to start clean. Removing the marker without reconciling the remote outcome is not recovery. For `Corrupt`, repair or replace the journal based on the quarantined evidence; there is no marker to remove.
+5. Restart the service and confirm it reaches `Running`. Marker absence plus a valid journal is the only accepted clean state; a valid-looking journal beside an existing marker remains blocked.
 
-The blocked recovery result exposes no journal records, so ambiguous evidence cannot be replayed automatically. If quarantine or marker creation failed, leave the original bytes untouched and escalate with the service log; do not treat that outcome as clean.
+The blocked recovery result exposes no journal records, so ambiguous evidence cannot be replayed automatically. If quarantine, marker creation, or normalization failed, leave the original bytes untouched and escalate with the service log; do not treat that outcome as clean. A `Corrupt` result is also fail-closed and must not be treated as an operator-recovery marker case.
 
 Settings, state, keys, and journal compaction use same-directory replacement. The writer guarantees complete old-or-new destination content across the tested process-interruption points; it does not guarantee survival across physical power loss. It is a single-writer design. A failed write cleans up only its own temporary file, while startup cleanup removes stale temporary files only when the PID/nonce sidecar matches, the owner is dead, and the age threshold has elapsed. Leave files with missing or malformed metadata, a live/current owner, or insufficient age in place for diagnosis.
 

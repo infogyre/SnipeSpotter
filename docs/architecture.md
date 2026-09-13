@@ -172,10 +172,11 @@ Journal classification is the first durable-data gate. The marker is checked bef
 
 | State | Meaning and durable handling | Startup result |
 |---|---|---|
-| `Clean` | Empty or complete phase-valid records. A complete final JSON record without a newline is preserved, normalized atomically, and revalidated before admission. | Continue to normal recovery and owner startup. |
-| `NeedsOperatorRecovery` | An ambiguous unterminated suffix, malformed final evidence, invalid phase sequence, or a pre-existing blocked marker. The original bytes remain preserved in a sibling `operations.jsonl.quarantine-<timestamp>-<hash>` artifact, and `operations.jsonl.recovery-blocked` records only redacted reason/path/count metadata. | Block startup and all remote work. The recovery type exposes no journal records, so ambiguous evidence cannot be replayed. |
-| `PreservationFailed` | Quarantine, marker, normalization, or replacement I/O failed. | Keep the original evidence untouched and block startup; this is not downgraded to corruption or clean state. |
-| `Corrupt` | The bytes are malformed or semantically invalid and cannot be admitted as a valid sequence. | Preserve/quarantine when possible, then block startup with no replay. |
+| `Clean` | Empty or valid newline-terminated sequence; no repair. | Continue to normal recovery and owner startup. |
+| `Clean` | Valid complete JSON without a newline and a valid full sequence. Preserve the original, then atomically normalize the terminal newline and revalidate; retain the final record in the quarantine evidence. | Continue only after durable normalization and full sequence validation. |
+| `NeedsOperatorRecovery` | An incomplete unterminated JSON suffix with a valid prefix. Preserve the original, quarantine it, and create `operations.jsonl.recovery-blocked` with only redacted reason/path/count metadata. An existing marker also remains in this state. | Block startup, IPC, remote activity, compaction, and remote-identity changes. No journal records are exposed for replay. |
+| `Corrupt` | A malformed newline-terminated final record, malformed middle record, or invalid phase sequence (including a valid unterminated final JSON record). Preserve the original untouched and quarantine the evidence when possible; do not create a marker. | Fail closed: reject startup, replay, owner exposure, compaction, and remote-identity changes. |
+| `PreservationFailed` | Preservation, marker, normalization, or replacement I/O failed. Keep the original evidence untouched. | Fail closed and block startup; this is not downgraded to corruption or clean state. |
 
 Quarantine and marker creation use exclusive-create/no-follow semantics after parent validation and are synced before active-journal mutation. Quarantines are retained indefinitely by this change. The administrator procedure is documented in the [operator guide](operator-guide.md#blocked-operation-journal-recovery); the Jira evidence/disposition record is [retained here](plans/jira-evidence-report.md).
 
