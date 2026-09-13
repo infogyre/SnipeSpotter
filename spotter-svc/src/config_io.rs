@@ -7,6 +7,8 @@ use std::{fs, path::Path};
 use anyhow::{Context as _, Result};
 use secrecy::SecretString;
 use spotter_core::config::{BLANK_SETTINGS_TOML, Settings, validate_settings};
+#[cfg(windows)]
+use zeroize::Zeroize;
 
 #[derive(Debug)]
 pub struct DecryptedConfig {
@@ -53,8 +55,12 @@ pub fn save_settings(path: &Path, settings: &Settings) -> Result<()> {
 /// Returns an error when DPAPI decryption fails or plaintext is not UTF-8.
 #[cfg(windows)]
 pub fn decrypt_config(settings: &Settings) -> Result<DecryptedConfig> {
-    let token = spotter_win32::dpapi::decrypt(&settings.snipeit.api_token_encrypted)?;
-    let token = String::from_utf8(token).context("decrypted API token is not UTF-8")?;
+    let plaintext = spotter_win32::dpapi::decrypt(&settings.snipeit.api_token_encrypted)?;
+    let token = String::from_utf8(plaintext.to_vec()).map_err(|error| {
+        let mut bytes = error.into_bytes();
+        bytes.zeroize();
+        anyhow::anyhow!("decrypted API token is not UTF-8")
+    })?;
     Ok(DecryptedConfig {
         url: settings.snipeit.url.clone(),
         api_token: SecretString::from(token),

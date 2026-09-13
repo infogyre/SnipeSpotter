@@ -8,13 +8,25 @@ use std::{thread, time::Instant};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Parser, Subcommand};
-#[cfg(windows)]
+use secrecy::{ExposeSecret as _, SecretString};
+#[cfg(any(windows, test))]
 use spotter_core::ipc::IPC_MAX_LINE_BYTES;
 use spotter_core::ipc::{IpcResponse, ServiceCommand, validate_config_field};
+#[cfg(any(windows, test))]
+use zeroize::Zeroizing;
 
 use cli_output::{render_config, render_status, validate_selector};
 
 mod cli_output;
+mod command_line;
+
+pub use command_line::executable_from_command_line;
+
+#[cfg(windows)]
+use spotter_win32::pipe::{NativeServerIdentityQuery, ServerIdentityQuery, ServiceIdentityError};
+
+#[cfg(all(windows, feature = "test-support"))]
+use spotter_win32::pipe::SameAccountServerIdentityQuery;
 
 /// Exit status used when the Windows service IPC endpoint is unavailable.
 pub const EXIT_SERVICE_UNAVAILABLE: i32 = 2;
@@ -137,7 +149,7 @@ pub trait TokenReader {
     ///
     /// # Errors
     /// Returns an error when input cannot be read.
-    fn read_token(&mut self) -> Result<String>;
+    fn read_token(&mut self) -> Result<SecretString>;
 }
 
 pub trait ServiceRegistrar {
@@ -275,6 +287,10 @@ pub struct NamedPipeTransport {
     timeout: Duration,
     #[cfg(windows)]
     endpoint: String,
+    #[cfg(windows)]
+    identity_query: std::sync::Arc<dyn ServerIdentityQuery>,
+    #[cfg(windows)]
+    service_name: String,
 }
 
 impl NamedPipeTransport {
@@ -287,6 +303,10 @@ impl NamedPipeTransport {
             timeout,
             #[cfg(windows)]
             endpoint: String::from(spotter_core::PIPE_NAME),
+            #[cfg(windows)]
+            identity_query: std::sync::Arc::new(NativeServerIdentityQuery),
+            #[cfg(windows)]
+            service_name: String::from(spotter_core::identity::SERVICE_NAME),
         }
     }
 
@@ -297,6 +317,44 @@ impl NamedPipeTransport {
         Self {
             timeout,
             endpoint: endpoint.into(),
+            identity_query: std::sync::Arc::new(NativeServerIdentityQuery),
+            service_name: String::from(spotter_core::identity::SERVICE_NAME),
+        }
+    }
+
+    /// Construct a transport for an explicit endpoint and service identity.
+    ///
+    /// Test-support builds use this so the identity gate authenticates against
+    /// the isolated test service registration instead of the production name.
+    #[must_use]
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn with_endpoint_and_service(
+        timeout: Duration,
+        endpoint: impl Into<String>,
+        service_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            timeout,
+            endpoint: endpoint.into(),
+            identity_query: std::sync::Arc::new(NativeServerIdentityQuery),
+            service_name: service_name.into(),
+        }
+    }
+
+    /// Construct an endpoint transport with an injected identity query for test-support builds.
+    #[must_use]
+    #[cfg(all(windows, feature = "test-support"))]
+    pub fn with_identity_query(
+        timeout: Duration,
+        endpoint: impl Into<String>,
+        service_name: impl Into<String>,
+        identity_query: impl ServerIdentityQuery + 'static,
+    ) -> Self {
+        Self {
+            timeout,
+            endpoint: endpoint.into(),
+            identity_query: std::sync::Arc::new(identity_query),
+            service_name: service_name.into(),
         }
     }
 
@@ -321,8 +379,15 @@ impl IpcTransport for NamedPipeTransport {
         let command = command.clone();
         let endpoint = self.endpoint.clone();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let identity_query = std::sync::Arc::clone(&self.identity_query);
+        let service_name = self.service_name.clone();
         std::thread::spawn(move || {
-            let _ = sender.send(exchange_named_pipe(&command, &endpoint));
+            let _ = sender.send(exchange_named_pipe(
+                &command,
+                &endpoint,
+                &service_name,
+                identity_query.as_ref(),
+            ));
         });
         receiver
             .recv_timeout(self.timeout)
@@ -337,41 +402,130 @@ impl IpcTransport for NamedPipeTransport {
     }
 }
 
+#[cfg(any(windows, test))]
+#[expect(
+    dead_code,
+    reason = "kept for cross-platform test seams; unused on Windows lib builds"
+)]
+fn exchange_request<A, S, W, R, B>(
+    command: &ServiceCommand,
+    authenticate: A,
+    serialize: S,
+    write: W,
+    read_response: R,
+) -> Result<IpcResponse>
+where
+    A: FnOnce() -> Result<()>,
+    S: FnOnce(&ServiceCommand) -> Result<B>,
+    W: FnOnce(&[u8]) -> Result<()>,
+    R: FnOnce() -> Result<Vec<u8>>,
+    B: AsRef<[u8]>,
+{
+    authenticate()?;
+    let request = serialize(command)?;
+    write(request.as_ref())?;
+    let mut response = read_response()?;
+    if response.is_empty() || !response.ends_with(b"\n") {
+        bail!("service response is empty, unterminated, or oversized")
+    }
+    response.pop();
+    if response.ends_with(b"\r") {
+        response.pop();
+    }
+    serde_json::from_slice(&response).context("invalid service response JSON")
+}
+
+#[cfg(any(windows, test))]
+fn authenticate_serialize_write<A, S, W, B>(
+    command: &ServiceCommand,
+    authenticate: A,
+    serialize: S,
+    write: W,
+) -> Result<()>
+where
+    A: FnOnce() -> Result<()>,
+    S: FnOnce(&ServiceCommand) -> Result<B>,
+    W: FnOnce(&[u8]) -> Result<()>,
+    B: AsRef<[u8]>,
+{
+    authenticate()?;
+    let request = serialize(command)?;
+    write(request.as_ref())
+}
+
 #[cfg(windows)]
-fn exchange_named_pipe(command: &ServiceCommand, endpoint: &str) -> Result<IpcResponse> {
-    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+fn read_bounded_pipe_response(pipe: &mut impl std::io::BufRead, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::io::{BufRead as _, Read as _};
+
+    let mut response = Vec::new();
+    (&mut *pipe)
+        .take(max_bytes)
+        .read_until(b'\n', &mut response)
+        .context("failed to read service response")?;
+    Ok(response)
+}
+
+#[cfg(windows)]
+fn write_bounded_pipe_request(
+    pipe: &mut std::io::BufReader<std::fs::File>,
+    request: &[u8],
+) -> Result<()> {
+    // BufReader does not implement Write on the pinned toolchain; the underlying
+    // File does, so writes flush through get_mut().
+    let file = pipe.get_mut();
+    std::io::Write::write_all(file, request).context("failed to write service request")?;
+    std::io::Write::flush(file).context("failed to flush service request")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn exchange_named_pipe(
+    command: &ServiceCommand,
+    endpoint: &str,
+    service_name: &str,
+    identity_query: &dyn ServerIdentityQuery,
+) -> Result<IpcResponse> {
+    use std::io::BufReader;
 
     use std::os::windows::fs::OpenOptionsExt as _;
-    use windows::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::{Foundation::HANDLE, Storage::FileSystem::SECURITY_IDENTIFICATION};
 
-    // Identification SQOS limits a malicious pipe server's impersonation level. It does not
-    // authenticate the server or prevent token theft; SPOTR-5 therefore remains open.
+    // Identification SQOS limits a pipe server's impersonation level; the identity query below
+    // authenticates the connected server before any command bytes are serialized or written.
     let pipe = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .security_qos_flags(SECURITY_IDENTIFICATION.0)
         .open(endpoint)
         .map_err(|error| anyhow::Error::new(ServiceUnavailable).context(error))?;
-    let mut request = serde_json::to_vec(command).context("failed to encode service request")?;
-    request.push(b'\n');
-    if request.len() > IPC_MAX_LINE_BYTES {
-        bail!("service request exceeds 64 KiB")
-    }
-
     let mut pipe = BufReader::new(pipe);
-    pipe.get_mut()
-        .write_all(&request)
-        .context("failed to write service request")?;
-    pipe.get_mut()
-        .flush()
-        .context("failed to flush service request")?;
-
-    let mut response = Vec::new();
-    let read = pipe
-        .take(u64::try_from(IPC_MAX_LINE_BYTES)?)
-        .read_until(b'\n', &mut response)
-        .context("failed to read service response")?;
-    if read == 0 || !response.ends_with(b"\n") {
+    let pipe_handle = HANDLE(pipe.get_ref().as_raw_handle());
+    // Auth precedes serialization; the closures capture disjoint state so the
+    // pipe is borrowed by exactly one of the sequential helpers at a time.
+    authenticate_serialize_write(
+        command,
+        || {
+            identity_query
+                .query(pipe_handle, service_name)
+                .map(|_| ())
+                .map_err(anyhow::Error::new)
+                .context("service identity authentication failed")
+        },
+        |command: &ServiceCommand| {
+            let mut request = Zeroizing::new(
+                serde_json::to_vec(command).context("failed to encode service request")?,
+            );
+            request.push(b'\n');
+            if request.len() > IPC_MAX_LINE_BYTES {
+                bail!("service request exceeds 64 KiB")
+            }
+            Ok(request)
+        },
+        |request: &[u8]| write_bounded_pipe_request(&mut pipe, request),
+    )?;
+    let mut response = read_bounded_pipe_response(&mut pipe, u64::try_from(IPC_MAX_LINE_BYTES)?)?;
+    if response.is_empty() || !response.ends_with(b"\n") {
         bail!("service response is empty, unterminated, or oversized")
     }
     response.pop();
@@ -385,23 +539,25 @@ fn exchange_named_pipe(command: &ServiceCommand, endpoint: &str) -> Result<IpcRe
 pub struct ConsoleTokenReader;
 
 impl TokenReader for ConsoleTokenReader {
-    fn read_token(&mut self) -> Result<String> {
+    fn read_token(&mut self) -> Result<SecretString> {
         use std::io::IsTerminal as _;
 
         let token = if std::io::stdin().is_terminal() {
-            rpassword::prompt_password("Snipe-IT API token: ")
-                .context("failed to read API token")?
+            SecretString::from(
+                rpassword::prompt_password("Snipe-IT API token: ")
+                    .context("failed to read API token")?,
+            )
         } else {
             read_piped_token(std::io::stdin().lock())?
         };
-        if token.is_empty() {
+        if token.expose_secret().is_empty() {
             bail!("API token must not be empty")
         }
         Ok(token)
     }
 }
 
-fn read_piped_token(mut input: impl std::io::BufRead) -> Result<String> {
+fn read_piped_token(mut input: impl std::io::BufRead) -> Result<SecretString> {
     use std::io::Read as _;
 
     const MAX_TOKEN_BYTES: u64 = 16 * 1024;
@@ -419,7 +575,7 @@ fn read_piped_token(mut input: impl std::io::BufRead) -> Result<String> {
         bytes.pop();
     }
     match String::from_utf8(bytes) {
-        Ok(token) => Ok(token),
+        Ok(token) => Ok(SecretString::from(token)),
         Err(error) => {
             let mut bytes = error.into_bytes();
             bytes.fill(0);
@@ -596,6 +752,47 @@ pub fn transport_endpoint(cli: &Cli) -> Option<String> {
 }
 
 #[cfg(feature = "test-support")]
+/// Build the transport implied by test-support overrides (endpoint + service name),
+/// or `None` when production defaults apply.
+///
+/// When a test service executable is declared, the identity gate runs under the
+/// same-account test policy (still fully native: PID, liveness, token owner,
+/// image-path comparison against the declared executable); production builds
+/// never take this branch.
+#[must_use]
+pub fn transport_transport(cli: &Cli, timeout: Duration) -> Option<NamedPipeTransport> {
+    #[cfg(windows)]
+    {
+        let endpoint = cli.test_pipe_endpoint.clone()?;
+        let service_name = cli
+            .test_service_name
+            .clone()
+            .unwrap_or_else(|| String::from(spotter_core::identity::SERVICE_NAME));
+        let same_account = cli.test_service_executable.clone();
+        let transport = if let Some(executable) = same_account {
+            NamedPipeTransport::with_identity_query(
+                timeout,
+                endpoint,
+                service_name,
+                spotter_win32::pipe::SameAccountServerIdentityQuery {
+                    policy: spotter_win32::pipe::SameAccountPolicy {
+                        expected_executable: Some(executable),
+                    },
+                },
+            )
+        } else {
+            NamedPipeTransport::with_endpoint_and_service(timeout, endpoint, service_name)
+        };
+        Some(transport)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (cli, timeout);
+        None
+    }
+}
+
+#[cfg(feature = "test-support")]
 /// Return the validated transport timeout selected by test support, or the production default.
 #[must_use]
 pub fn transport_timeout(cli: &Cli) -> Duration {
@@ -608,6 +805,13 @@ pub fn transport_timeout(cli: &Cli) -> Duration {
         }
         _ => PRODUCTION_TRANSPORT_TIMEOUT,
     }
+}
+
+#[cfg(not(feature = "test-support"))]
+/// Return `None`: the production transport uses the fixed default identity.
+#[must_use]
+pub const fn transport_transport(_cli: &Cli, _timeout: Duration) -> Option<NamedPipeTransport> {
+    None
 }
 
 #[cfg(not(feature = "test-support"))]
@@ -882,10 +1086,18 @@ impl ServiceRegistrar for WindowsServiceRegistrar {
 /// Map a dispatch error to the stable CLI exit-code contract.
 #[must_use]
 pub fn exit_code(error: &anyhow::Error) -> i32 {
-    if error
-        .chain()
-        .any(<dyn std::error::Error>::is::<ServiceUnavailable>)
-    {
+    if error.chain().any(|cause| {
+        cause.is::<ServiceUnavailable>() || {
+            #[cfg(windows)]
+            {
+                cause.is::<ServiceIdentityError>()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+    }) {
         EXIT_SERVICE_UNAVAILABLE
     } else {
         1
@@ -894,7 +1106,13 @@ pub fn exit_code(error: &anyhow::Error) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     use super::*;
+
     struct Fake {
         sent: Vec<ServiceCommand>,
     }
@@ -918,6 +1136,37 @@ mod tests {
         }
     }
 
+    struct DropObservedRequest {
+        bytes: Zeroizing<Vec<u8>>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AsRef<[u8]> for DropObservedRequest {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for DropObservedRequest {
+        fn drop(&mut self) {
+            use zeroize::Zeroize as _;
+
+            self.bytes.zeroize();
+            self.dropped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn drop_observed_request(
+        bytes: Vec<u8>,
+        dropped: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> DropObservedRequest {
+        DropObservedRequest {
+            bytes: Zeroizing::new(bytes),
+            dropped: std::sync::Arc::clone(dropped),
+        }
+    }
+
     struct RecordingRegistrar {
         installs: usize,
         uninstalls: usize,
@@ -934,8 +1183,8 @@ mod tests {
         }
     }
     impl TokenReader for Fake {
-        fn read_token(&mut self) -> Result<String> {
-            Ok(String::from("secret"))
+        fn read_token(&mut self) -> Result<SecretString> {
+            Ok(SecretString::from("secret"))
         }
     }
     impl ServiceRegistrar for Fake {
@@ -1131,16 +1380,177 @@ mod tests {
 
     #[test]
     fn piped_token_is_trimmed_and_bounded() -> Result<()> {
-        assert_eq!(read_piped_token(&b"secret\r\n"[..])?, "secret");
+        use secrecy::ExposeSecret as _;
+
+        assert_eq!(
+            read_piped_token(&b"secret\r\n"[..])?.expose_secret(),
+            "secret"
+        );
         assert!(read_piped_token(&vec![b'x'; 16 * 1024 + 1][..]).is_err());
         assert!(read_piped_token(&[0xff][..]).is_err());
         Ok(())
+    }
+
+    fn ipc_serialization_failure(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = exchange_request(
+            command,
+            || Ok(()),
+            |_| -> Result<DropObservedRequest> { bail!("injected serialization failure") },
+            |_| Ok(()),
+            || Ok(br#"{\"type\":\"ok\",\"data\":{\"message\":\"ok\"}}\n"#.to_vec()),
+        )
+        .expect_err("serialization failure must reject");
+        assert!(error.to_string().contains("injected serialization failure"));
+        assert!(!dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_oversized_request(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = authenticate_serialize_write(
+            command,
+            || Ok(()),
+            |_| {
+                let mut bytes = vec![b'x'; IPC_MAX_LINE_BYTES];
+                bytes.push(b'\n');
+                Ok(drop_observed_request(bytes, &dropped))
+            },
+            |_| bail!("oversized request rejected"),
+        )
+        .expect_err("oversized request must reject before write");
+        assert!(error.to_string().contains("oversized request"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_unterminated_request(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = exchange_request(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"unterminated".to_vec(), &dropped)),
+            |_| Ok(()),
+            || Ok(Vec::new()),
+        )
+        .expect_err("unterminated response must reject");
+        assert!(error.to_string().contains("unterminated"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_write_failure(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = authenticate_serialize_write(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+            |_| bail!("injected write failure"),
+        )
+        .expect_err("write failure must reject");
+        assert!(error.to_string().contains("injected write failure"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_flush_failure(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = authenticate_serialize_write(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+            |_| bail!("injected flush failure"),
+        )
+        .expect_err("flush failure must reject");
+        assert!(error.to_string().contains("injected flush failure"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_read_timeout(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = exchange_request(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+            |_| Ok(()),
+            || bail!("injected read timeout"),
+        )
+        .expect_err("read timeout must reject");
+        assert!(error.to_string().contains("injected read timeout"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    fn ipc_malformed_response(command: &ServiceCommand) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let error = exchange_request(
+            command,
+            || Ok(()),
+            |_| Ok(drop_observed_request(b"request\n".to_vec(), &dropped)),
+            |_| Ok(()),
+            || Ok(b"not-json\n".to_vec()),
+        )
+        .expect_err("malformed response must reject");
+        assert!(error.to_string().contains("invalid service response JSON"));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn ipc_secret_buffer_exit_path_table() {
+        let command = ServiceCommand::SetToken {
+            value: SecretString::from("table-secret"),
+        };
+        ipc_serialization_failure(&command);
+        ipc_oversized_request(&command);
+        ipc_unterminated_request(&command);
+        ipc_write_failure(&command);
+        ipc_flush_failure(&command);
+        ipc_read_timeout(&command);
+        ipc_malformed_response(&command);
+    }
+
+    #[test]
+    fn authentication_precedes_serialization() {
+        use std::sync::{Arc, Mutex};
+        use zeroize::Zeroizing;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let auth_events = Arc::clone(&events);
+        let serialize_events = Arc::clone(&events);
+        let write_events = Arc::clone(&events);
+        let error = authenticate_serialize_write(
+            &ServiceCommand::SetToken {
+                value: SecretString::from("must-not-be-serialized"),
+            },
+            move || {
+                auth_events.lock().expect("event lock").push("auth");
+                bail!("fixture authentication failed")
+            },
+            move |_| {
+                serialize_events
+                    .lock()
+                    .expect("event lock")
+                    .push("serialize");
+                Ok(Zeroizing::new(vec![b'\n']))
+            },
+            move |_| {
+                write_events.lock().expect("event lock").push("write");
+                Ok(())
+            },
+        )
+        .expect_err("failed authentication must reject before serialization");
+        assert!(error.to_string().contains("fixture authentication failed"));
+        assert_eq!(
+            *events.lock().expect("event lock"),
+            vec!["auth"],
+            "authentication failure must perform zero serialization and zero writes"
+        );
     }
 
     #[test]
     fn unavailable_service_has_stable_exit_code() {
         let error = anyhow::Error::new(ServiceUnavailable);
         assert_eq!(exit_code(&error), EXIT_SERVICE_UNAVAILABLE);
+        #[cfg(windows)]
+        {
+            let identity_error = anyhow::Error::new(ServiceIdentityError::ServiceRestarting);
+            assert_eq!(exit_code(&identity_error), EXIT_SERVICE_UNAVAILABLE);
+        }
         assert_eq!(exit_code(&anyhow::anyhow!("other")), 1);
     }
 

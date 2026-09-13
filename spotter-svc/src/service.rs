@@ -4,6 +4,8 @@
 
 use std::{ffi::OsString, fs, path::Path, sync::Arc, sync::mpsc, time::Duration};
 
+use secrecy::ExposeSecret as _;
+
 use crate::owner_ports::{
     Clock, HardwareDiscovery, RemoteFactory, RemotePort, SecretProtector, SettingsStore, StateStore,
 };
@@ -148,7 +150,7 @@ impl CommandOwner {
                 .set_config(&field, &value)
                 .unwrap_or_else(protocol_error),
             ServiceCommand::SetToken { value } => self
-                .set_token(value.as_bytes())
+                .set_token(value.expose_secret().as_bytes())
                 .unwrap_or_else(protocol_error),
             ServiceCommand::GetStatus => self.status(false),
             ServiceCommand::GetStatusFull => self.status(true),
@@ -663,6 +665,11 @@ fn service_main(callback_arguments: Vec<OsString>) {
     let process_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if let Err(error) = run_service(&process_arguments, &callback_arguments) {
         tracing::error!(%error, "service terminated with an error");
+        eprintln!("SnipeSpotter service terminated with an error: {error}");
+        // A service callback has no Result channel back to the process entry point. Exit
+        // explicitly so SCM and service-hosting callers observe a failed startup instead of a
+        // clean callback return after the journal gate rejected durable data.
+        std::process::exit(1);
     }
 }
 
@@ -680,6 +687,7 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     tracing::info!(root = %root.display(), "using data directory");
     crate::windows_acl::apply_acl_contract(&root).context("failed to apply protected data ACL")?;
     apply_runtime_acl_contract(&root)?;
+    let journal_path = root.join("operations.jsonl");
     crate::atomic_file::recover_stale_temporary_files(&root, std::process::id(), 300).inspect_err(
         |e| tracing::warn!(%e, root = %root.display(), "stale temporary-file recovery failed"),
     )?;
@@ -691,16 +699,17 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
         configured = !settings.snipeit.url.is_empty(),
         "settings loaded"
     );
+    let _log_guard = crate::logging::initialize(&root.join("logs"), &settings.logging)
+        .inspect_err(|e| tracing::error!(%e, "failed to initialize logging"))?;
+    apply_runtime_acl_contract(&root)?;
+    tracing::info!("logging initialized");
+    admit_journal_for_startup(&journal_path)?;
     let state_key = crate::state_io::load_or_create_key(&root.join("state-hmac-key.bin"))
         .inspect_err(|e| tracing::error!(%e, "failed to load state key"))?;
     tracing::info!("state key loaded");
     let persisted_state = crate::state_io::load_state(&root.join("state.toml"), &state_key)
         .inspect_err(|e| tracing::error!(%e, "failed to load state"))?;
     tracing::info!("persisted state loaded");
-    let _log_guard = crate::logging::initialize(&root.join("logs"), &settings.logging)
-        .inspect_err(|e| tracing::error!(%e, "failed to initialize logging"))?;
-    apply_runtime_acl_contract(&root)?;
-    tracing::info!("logging initialized");
     let (shutdown_sender, shutdown_receiver) = mpsc::sync_channel(1);
     let status_handle = register_controls(&runtime.service_name, shutdown_sender)
         .inspect_err(|e| tracing::error!(%e, "failed to register controls"))?;
@@ -723,7 +732,6 @@ fn run_service(process_arguments: &[OsString], callback_arguments: &[OsString]) 
     tracing::info!("runtime entered");
     let configured = config_status(&settings).is_empty();
     let state_path = root.join("state.toml");
-    let journal_path = root.join("operations.jsonl");
     let mut persisted_state = persisted_state;
     if configured {
         tokio_runtime.block_on(recover_operations(
@@ -847,6 +855,7 @@ pub(crate) async fn recover_owner_state(
     remote: &mut dyn RemotePort,
     persisted_state: &mut PersistedServiceState,
 ) -> Result<()> {
+    admit_journal_for_startup(journal_path)?;
     recover_owner_state_with_finalization(
         journal_path,
         state_store,
@@ -901,6 +910,19 @@ async fn recover_operations(
         key: state_key.to_vec(),
     };
     recover_owner_state(journal_path, &state_store, &mut client, persisted_state).await
+}
+
+fn admit_journal_for_startup(journal_path: &Path) -> Result<()> {
+    let outcome = crate::operation_journal::recover_journal(journal_path)?;
+    if matches!(
+        outcome,
+        crate::operation_journal::RecoveryOutcome::Clean { .. }
+    ) {
+        return Ok(());
+    }
+    let notice = crate::operation_journal::recovery_notice(journal_path, &outcome);
+    tracing::error!(notice = %notice, "operation journal recovery blocked service startup");
+    anyhow::bail!("operation journal recovery is not clean; service startup blocked")
 }
 
 fn register_controls(
@@ -1091,6 +1113,48 @@ mod tests {
                 .is_err()
         );
         assert_eq!(owner.controller.settings, original);
+    }
+
+    #[test]
+    fn recovery_notice_is_bounded_and_redacted() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let journal_path = directory.path().join("operations.jsonl");
+        std::fs::write(
+            &journal_path,
+            br#"{"phase":"prepared","operation_id":"operation_id","operation":{"token":"raw-body"}}
+{"#,
+        )?;
+        let outcome = crate::operation_journal::recover_journal(&journal_path)?;
+        let notice = crate::operation_journal::recovery_notice(&journal_path, &outcome);
+        assert!(notice.len() < 512);
+        assert!(notice.contains("incomplete unterminated journal suffix"));
+        assert!(notice.contains("journal=operations.jsonl"));
+        assert!(notice.contains("evidence_paths=operations.jsonl.quarantine-"));
+        assert!(notice.contains("operations.jsonl.recovery-blocked"));
+        assert!(notice.contains("validated_record_count=1"));
+        assert!(!notice.contains("operation_id"));
+        assert!(!notice.contains("raw-body"));
+        assert!(!notice.contains(directory.path().to_string_lossy().as_ref()));
+        assert!(!notice.contains("/"));
+        assert!(!notice.contains("\\\\"));
+        Ok(())
+    }
+
+    #[test]
+    fn unconfigured_settings_and_blocked_marker_stop_before_ipc() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let journal_path = directory.path().join("operations.jsonl");
+        std::fs::write(
+            crate::operation_journal::blocked_marker_path(&journal_path),
+            b"operator recovery\n",
+        )?;
+        let settings = spotter_core::Settings::default();
+        assert!(!config_status(&settings).is_empty());
+        let error = admit_journal_for_startup(&journal_path)
+            .expect_err("blocked marker must stop an unconfigured service before IPC");
+        assert!(error.to_string().contains("startup blocked"));
+        assert!(!directory.path().join("ipc-listener-started").exists());
+        Ok(())
     }
 
     #[test]

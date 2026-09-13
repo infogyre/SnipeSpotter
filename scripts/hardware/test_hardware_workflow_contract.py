@@ -43,6 +43,9 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         self.assertIn("$deleteOutput = & sc.exe delete $serviceName 2>&1", cleanup)
         self.assertIn("Wait-ForCondition -Description \"LocalSystem service deletion\"", cleanup)
         self.assertIn("$deleteOutput -notmatch '1060|does not exist'", cleanup)
+        self.assertIn("$serviceDeletionConfirmed", cleanup)
+        self.assertIn("if ($serviceDeletionConfirmed)", cleanup)
+        self.assertIn("refusing to remove protected cell root", cleanup)
 
     def test_cleanup_defines_its_condition_wait_helper(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")

@@ -30,7 +30,7 @@ fn decrypt_config_roundtrips_fields_and_token_without_exposing_ciphertext() -> R
 }
 
 #[test]
-fn decrypt_config_rejects_dpapi_encrypted_invalid_utf8_without_leaking_bytes() -> Result<()> {
+fn decrypted_invalid_utf8_is_wiped() -> Result<()> {
     let plaintext = [0xFF, 0xFE, 0xFD];
     let ciphertext = spotter_win32::dpapi::encrypt(&plaintext)?;
     let settings = spotter_core::Settings {

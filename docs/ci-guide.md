@@ -104,9 +104,9 @@ These are the workflow checks that exist today; this guide does not imply additi
 4. **Release workflow runs automatically**: The tag push triggers `release.yml`, which:
    - **Verify job** (Ubuntu): Confirms the tag points to `main`, validates the tag version matches `Cargo.toml`, and verifies the locked workspace metadata. The Windows `build` job runs the workspace and production-owner integration tests.
    - **Build job** (Windows): Runs the workspace tests, including the already-required `hosted_hardware` integration tests, then builds only `spotter-svc.exe` and `spotter-cli.exe` with `cargo build --release --locked --target x86_64-pc-windows-msvc`, asserts exact `.exe` and underscore-named `.pdb` files exist, and uploads a closed artifact inventory. The experimental `spotter-hardware-service` host is not a release binary.
-   - **Package job** (Windows): Installs WiX 6, verifies `wix --version`, generates CycloneDX SBOMs, builds the MSI with explicit version/platform properties, renames it deterministically, and uploads packaged artifacts. The MSI does not contain or register `spotter-hardware-service`.
+   - **Package job** (Windows): Installs WiX 6, verifies `wix --version`, generates CycloneDX SBOMs, builds the MSI with explicit version/platform properties, renames it deterministically, and uploads packaged artifacts. The MSI does not contain or register `spotter-hardware-service`; PDBs remain in the release staging directory only so the separate symbols ZIP can retain them.
    - **Lifecycle job** (separate reusable elevated gate): After packaging, invokes `elevated-windows.yml` to validate MSI installation/service behavior and the direct SCM lifecycle. Publication cannot proceed unless this gate succeeds.
-   - **Aggregate job** (Ubuntu): The `Generate checksums and inventory` step downloads the packaged MSI and symbols ZIP, creates `SHA256SUMS`, and asserts the closed three-file inventory before uploading that aggregate as `release-inventory`.
+   - **Aggregate job** (Ubuntu): The `Generate checksums and inventory` step downloads the packaged MSI and symbols ZIP, creates `SHA256SUMS`, and asserts the closed three-file inventory before uploading that aggregate as `release-inventory`. The package job's `Verify symbols ZIP contains both PDBs` step extracts the produced archive and checks for both service and CLI PDBs before upload.
    - **Attest job**: For a tag publication, attests every file in the aggregate release inventory.
    - **Publish job**: The `Publish release assets` step directly creates the published release with `--draft=false` after aggregate inventory, lifecycle, and attestation succeed. There is no draft-promotion step.
 
@@ -135,7 +135,8 @@ cargo build -p spotter-svc -p spotter-cli --release --locked --target x86_64-pc-
 # Determine the version
 $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
 
-# Stage binaries (must contain exactly: spotter-svc.exe, spotter-cli.exe, spotter_svc.pdb, spotter_cli.pdb)
+# Stage binaries and symbols inputs (must contain exactly: spotter-svc.exe, spotter-cli.exe, spotter_svc.pdb, spotter_cli.pdb)
+# Note: the PDBs are release-staging inputs for the public symbols ZIP only; the MSI does NOT install them.
 $stage = "release-stage"
 New-Item -ItemType Directory -Force $stage
 Copy-Item target/x86_64-pc-windows-msvc/release/spotter-svc.exe $stage
@@ -153,7 +154,7 @@ dotnet build installer/Product.wixproj -c Release -p:Platform=x64 -p:ProductVers
 # The MSI is at installer/bin/x64/Release/en-US/SnipeSpotter.msi
 ```
 
-The staging directory must contain exactly the expected executables and PDBs. Do not rebuild binaries from inside the packaging step. The CI workflow enforces this by downloading a pre-built artifact and verifying the inventory before packaging.
+The staging directory must contain exactly the expected executables and PDBs. Do not rebuild binaries from inside the packaging step. The CI workflow enforces this by downloading a pre-built artifact and verifying the inventory before packaging. PDBs are symbol-distribution inputs only: they enter the separately published public symbols ZIP and are never installed by the MSI. The installer change (SPOTR-28 policy) removed the PDB components from the installed payload while preserving staging and symbols-ZIP inputs; the release verifier extracts the real ZIP and asserts that both PDBs are present, while the lifecycle test asserts the installed tree contains neither.
 
 ## MSI lifecycle validation
 
@@ -162,7 +163,8 @@ The lifecycle test is `scripts/test-msi-lifecycle.ps1`. On an elevated Windows r
 1. **Install**: Silently installs the MSI and verifies:
    - Service `SnipeSpotter` is registered with automatic start type and `LocalSystem` account
    - Service executable path matches `%ProgramFiles%\infogyre\SnipeSpotter\bin\spotter-svc.exe`
-   - All expected files exist: `bin\spotter-svc.exe`, `bin\spotter-cli.exe`, `bin\spotter_svc.pdb`, `bin\spotter_cli.pdb`, `sbom\*.cdx.json`, `settings.toml`
+   - All expected files exist: `bin\spotter-svc.exe`, `bin\spotter-cli.exe`, `sbom\*.cdx.json`, `settings.toml`
+   - `bin\spotter_svc.pdb` and `bin\spotter_cli.pdb` do NOT exist (PDBs ship only in the public symbols ZIP)
 2. **ACLs**: Verifies the protected Windows semantic contract for every runtime artifact. The data directory must have exactly one explicit self FullControl Allow and one explicit inherit-only ContainerInherit/ObjectInherit GenericAll Allow for each `SYSTEM` and built-in `Administrators` SID; each file must have exactly one explicit self FullControl Allow for each SID. Inherited and unauthorized Allow ACEs, duplicates, and mask/flag mismatches fail validation. Deny ACEs are preserved and are not counted as Allows.
 3. **PATH**: Verifies the `bin\` directory was added to the machine PATH.
 4. **Service health**: Starts the service, requires it to remain `Running` for the configured stability window, verifies the running process owner is `NT AUTHORITY\\SYSTEM`, verifies the fixed named pipe is present, invokes the installed CLI for JSON status, and requires an `Unconfigured` response before stopping it.
@@ -193,6 +195,8 @@ The direct SCM segment uses the test-support CLI and `SnipeSpotterDirect-$RunIde
 
 `hardware-experiment.yml` is protected and manually dispatched. Its `images` input drives the generated matrix; `windows-2022` and `windows-latest` are always required, while the optional `windows-2025` label is scheduled only when explicitly requested. The fixed `repetitions=3` input creates three repetitions per selected image. Each image/repetition cell runs both direct-admin and LocalSystem collection with one protected per-cell HMAC key, validates both reports before upload, records the requested image label/alias and exact runner metadata plus the numeric session ID from each process context, and removes keys and temporary reports during failure-safe cleanup. Unsupported optional images are reported in the preparation job's machine-readable `skipped_images` output. The workflow stops at `awaiting_operator_hardware_approval`; hosted observations are evidence only and do not implement release promotion or physical-hardware qualification.
 
+Each matrix cell stages its config, collector, support executable, key, and output directory beneath `%ProgramData%\SnipeSpotterHardware\<cell-id>`, a root protected for SYSTEM and Administrators. The key is created directly in that protected root with the retained `SYSTEM:(R)` / `Administrators:(F)` SPOTR-24 ACL; the workflow no longer creates secret material in `RUNNER_TEMP`. The host validates no-follow paths, containment, owners, effective write ACEs, and ancestors before consumption. TrustedInstaller is allowed only for the allowlisted system PowerShell layout, not for experiment inputs. Cleanup waits for SCM service deletion before removing the root. The approval checkpoint remains a post-observation evidence checkpoint and its policy description is unchanged.
+
 ### Runner policy
 
 If GitHub-hosted runner policy prevents a required SCM or MSI operation, treat that as a blocking CI infrastructure defect. First adapt the test to supported administrative mechanisms. If impossible, stop before release and require an operator decision about a dedicated Windows test runner. Do not silently downgrade lifecycle coverage to manual-only.
@@ -215,12 +219,12 @@ The hosted experiment is intentionally separate from the raw fixture scripts abo
 
 ### Approval and dispatch
 
-1. Create a protected GitHub environment named `hardware-experiment-approval` and require an operator reviewer. Do not put secrets in this environment; the experiment does not need credentials.
+1. Create the `hardware-experiment-approval` environment according to the repository's external policy. Do not put secrets in this environment; the experiment does not need credentials. The workflow's approval checkpoint remains post-observation and does not provide pre-run authorization or release promotion. The observed external environment configuration and policy limitation are recorded in [`docs/plans/spotr-23-evidence.md`](plans/spotr-23-evidence.md), not treated as a product guarantee.
 2. Dispatch the workflow with `operator_acknowledgement=APPROVE`, the default `images=windows-2022,windows-latest` (or include the explicitly approved optional `windows-2025` label), and `repetitions=3`.
-3. The job named `awaiting_operator_hardware_approval` runs after the Windows matrix and pauses at the protected environment. Its gate checks matrix/privacy success and rejects acknowledgements other than the exact word `APPROVE`; it is a post-observation evidence checkpoint, not pre-run authorization, physical-hardware validation, or an automatic hardware/release gate.
+3. The job named `awaiting_operator_hardware_approval` runs after the Windows matrix and uses the named environment. Its gate checks matrix/privacy success and rejects acknowledgements other than the exact word `APPROVE`; it is a post-observation evidence checkpoint, not pre-run authorization, physical-hardware validation, or an automatic hardware/release gate. Do not add a publish environment or change the release flow for SPOTR-10; the first-stable-release deferral is recorded in [`docs/plans/jira-evidence-report.md`](plans/jira-evidence-report.md).
 4. `windows-2022` and `windows-latest` are required. The preparation job reports optional `windows-2025` as skipped when it is not requested; an unknown image label is rejected rather than replacing either required image.
 
-The generated matrix runs three repetitions per selected image. Each image/repetition cell collects both direct-admin and LocalSystem reports with one shared protected HMAC key, derives the session ID inside each process context, validates both locally, and uploads only the redacted JSON reports with seven-day retention. The matrix has no package, release, publish, promotion, deployment, Snipe-IT, or physical-hardware step. A failing validator prevents upload; cleanup removes the key, service host files, and reports and fails if cleanup cannot complete. The reports are evidence about hosted virtual runner images only, not physical hardware. No runner-specific assertion, fixture, release gate, or physical matrix may be promoted without explicit operator approval after the checkpoint.
+The generated matrix runs three repetitions per selected image. Each image/repetition cell collects both direct-admin and LocalSystem reports with one shared protected HMAC key, derives the session ID inside each process context, validates both locally, and uploads only the redacted JSON reports with seven-day retention. The matrix has no package, release, publish, promotion, deployment, Snipe-IT, or physical-hardware step. A failing validator prevents upload; cleanup removes the protected per-cell root only after service deletion is confirmed, and fails if cleanup cannot complete. The reports are evidence about hosted virtual runner images only, not physical hardware. No runner-specific assertion, fixture, release gate, or physical matrix may be promoted without explicit operator approval after the checkpoint.
 
 ### Privacy gates
 

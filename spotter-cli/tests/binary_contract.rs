@@ -60,7 +60,8 @@ fn test_identity() -> TestIdentity {
         data_root: std::env::temp_dir().join(format!("SnipeSpotter-binary-{unique}")),
         pipe_endpoint: format!(r"\\.\pipe\SnipeSpotter-binary-{unique}"),
         mutex_name: format!(r"Global\SnipeSpotter-binary-{unique}"),
-        service_executable: PathBuf::from(r"C:\SnipeSpotter\spotter-svc.exe"),
+        service_executable: std::env::current_exe()
+            .expect("the running test binary must have an executable path"),
     }
 }
 

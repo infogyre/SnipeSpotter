@@ -13,10 +13,8 @@ use spotter_cli::{
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let timeout = spotter_cli::transport_timeout(&cli);
-    let mut transport = spotter_cli::transport_endpoint(&cli).map_or_else(
-        || NamedPipeTransport::new(timeout),
-        |endpoint| NamedPipeTransport::with_endpoint(timeout, endpoint),
-    );
+    let mut transport = spotter_cli::transport_transport(&cli, timeout)
+        .unwrap_or_else(|| NamedPipeTransport::new(timeout));
     let mut tokens = ConsoleTokenReader;
     let registration = match spotter_cli::registration_options(&cli) {
         Ok(options) => options,

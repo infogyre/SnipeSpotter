@@ -2,7 +2,7 @@
 
 ## Scope
 
-Phase 0 establishes the workspace, stable identity values, policy, and CI scaffolding. Do not implement Phase 1 behavior until the project phase explicitly changes.
+Phase 0 established the workspace, stable identity values, policy, and CI scaffolding. Phase 1 behavior is authorized for this branch (`hardening/remaining-jira-findings`): the operator explicitly approved remediating the already-implemented product's security findings (SPOTR-5, -7, -9, -17, -28) and hardening the experimental security boundaries, per the reviewed plan in `docs/plans/remaining-jira-findings.md`. Unrelated feature or phase expansion remains out of scope.
 
 ## Rust
 
