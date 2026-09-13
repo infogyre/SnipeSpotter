@@ -17,7 +17,10 @@ use std::time::Duration;
 use anyhow::Context as _;
 use anyhow::Result;
 use spotter_core::ipc::{IPC_MAX_LINE_BYTES, IpcResponse, ServiceCommand};
-use spotter_svc::ipc_server::{MAX_ACTIVE_PIPE_SESSIONS, PipeServerGuard, run_named_pipe_bounded};
+use spotter_svc::ipc_server::{
+    MAX_ACTIVE_PIPE_SESSIONS, PipeServerGuard, create_secured_server_for_tests,
+    run_named_pipe_bounded,
+};
 
 fn unique_pipe_endpoint(label: &str) -> String {
     format!(
@@ -104,6 +107,54 @@ fn bounded_roundtrip(endpoint: &str, command: &ServiceCommand) -> Result<IpcResp
     receiver
         .recv_timeout(Duration::from_secs(10))
         .map_err(|_| anyhow::anyhow!("named-pipe roundtrip exceeded its 10-second timecap"))?
+}
+
+#[tokio::test]
+async fn first_instance_claim_and_worker_lifetime() -> Result<()> {
+    let endpoint = unique_pipe_endpoint("first-instance");
+    let first = create_secured_server_for_tests(&endpoint, true)?;
+    let second = create_secured_server_for_tests(&endpoint, true);
+    assert!(
+        second.is_err(),
+        "a second first-instance claim must fail while the original server is alive"
+    );
+    drop(first);
+
+    let marker = marker_path("first-instance-worker");
+    let _ = std::fs::remove_file(&marker);
+    let marker_for_handler = marker.clone();
+    let fsm = spotter_svc::fsm::spawn(1, move |_| {
+        let marker = marker_for_handler.clone();
+        async move {
+            tokio::task::yield_now().await;
+            std::fs::write(&marker, b"worker-completed")
+                .expect("worker marker must be durably written");
+            IpcResponse::Ok {
+                message: String::from("worker-completed"),
+            }
+        }
+    })?;
+    let guard = PipeServerGuard::new();
+    let session_token = guard.subscribe();
+    let server_task = tokio::spawn(run_named_pipe_bounded(fsm, endpoint.clone(), session_token));
+    let _server = ServerGuard {
+        handle: server_task,
+        guard,
+    };
+    let response = tokio::task::spawn_blocking({
+        let endpoint = endpoint.clone();
+        move || bounded_roundtrip(&endpoint, &ServiceCommand::GetStatus)
+    })
+    .await??;
+    assert_eq!(
+        response,
+        IpcResponse::Ok {
+            message: String::from("worker-completed")
+        }
+    );
+    assert_eq!(std::fs::read(&marker)?, b"worker-completed");
+    let _ = std::fs::remove_file(marker);
+    Ok(())
 }
 
 #[tokio::test]

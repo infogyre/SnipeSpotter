@@ -176,11 +176,13 @@ pub async fn run_named_pipe_at(fsm: FsmHandle, pipe_name: impl Into<String>) -> 
     let pipe_name = pipe_name.into();
     let shutdown = PipeServerGuard::new();
     let session_token = shutdown.subscribe();
+    let mut first_instance = true;
     loop {
         if shutdown.shutdown.is_cancelled() {
             return Ok(());
         }
-        let server = create_secured_server(&pipe_name)?;
+        let server = create_secured_server(&pipe_name, first_instance)?;
+        first_instance = false;
         tokio::select! {
             outcome = server.connect() => {
                 outcome.context("named-pipe client connect failed")?;
@@ -209,6 +211,7 @@ pub async fn run_named_pipe_bounded(
     let pipe_name = pipe_name.into();
     let shutdown = session_token.clone();
     let mut sessions: JoinSet<Result<()>> = JoinSet::new();
+    let mut first_instance = true;
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -220,7 +223,7 @@ pub async fn run_named_pipe_bounded(
             // close any excess connection rather than queueing it. The connect
             // wait stays interruptible by shutdown.
             while sessions.try_join_next().is_some() {}
-            let server = create_secured_server(&pipe_name)?;
+            let server = create_secured_server(&pipe_name, false)?;
             tokio::select! {
                 outcome = server.connect() => {
                     outcome.context("named-pipe client connect failed")?;
@@ -230,7 +233,8 @@ pub async fn run_named_pipe_bounded(
             drop(server);
             continue;
         }
-        let server = create_secured_server(&pipe_name)?;
+        let server = create_secured_server(&pipe_name, first_instance)?;
+        first_instance = false;
         tokio::select! {
             outcome = server.connect() => {
                 outcome.context("named-pipe client connect failed")?;
@@ -267,6 +271,7 @@ const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(windows)]
 fn create_secured_server(
     pipe_name: &str,
+    first_instance: bool,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
     use spotter_win32::pipe::create_admin_pipe_security_attributes;
     use tokio::net::windows::named_pipe::ServerOptions;
@@ -277,11 +282,22 @@ fn create_secured_server(
     // descriptor. Both remain alive through this synchronous call, and CreateNamedPipeW consumes
     // the attributes only while creating the pipe handle; it does not retain the pointer.
     unsafe {
-        ServerOptions::new()
-            .first_pipe_instance(false)
+        let mut options = ServerOptions::new();
+        options.first_pipe_instance(first_instance);
+        options
             .create_with_security_attributes_raw(pipe_name, security.as_ptr().cast_mut().cast())
             .context("failed to create secured named pipe")
     }
+}
+
+/// Test-support construction of one secured named-pipe instance, including the first-instance flag.
+#[cfg(all(windows, feature = "test-support"))]
+#[doc(hidden)]
+pub fn create_secured_server_for_tests(
+    pipe_name: &str,
+    first_instance: bool,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    create_secured_server(pipe_name, first_instance)
 }
 
 #[cfg(test)]
