@@ -206,3 +206,8 @@ and Windows workspace test runs; SPOTR-23 controlled dispatch; any push/PR/dispa
 | Worktree | Branch | Disposition |
 | --- | --- | --- |
 | `spotter.hardening-lane-d-msi-symbols` | `hardening/lane-d-msi-symbols` | Removed 2026-09-12 via `wt remove --foreground --no-delete-branch --no-hooks` (clean, integrated at merge `3ae0bf7`, tip `21938ea` verified ancestor of integration HEAD). Branch RETAINED — not merged to `main`; no force-delete used. |
+| `spotter.hardening-lane-a-ipc-identity` | `hardening/lane-a-ipc-identity` | Removed 2026-09-14 via `wt remove --foreground --no-delete-branch` (clean, tip `83029bf` verified ancestor of integration HEAD `898dd5e`). Branch retained; no force. |
+| `spotter.hardening-lane-b-journal-recovery` | `hardening/lane-b-journal-recovery` | Removed 2026-09-14 via `wt remove --foreground --no-delete-branch` (clean, tip `08bf414` verified ancestor). Branch retained; no force. |
+| `spotter.hardening-lane-c-hardware-host` | `hardening/lane-c-hardware-host` | Removed 2026-09-14 via `wt remove --foreground --no-delete-branch` (clean, tip `8113257` verified ancestor). Branch retained; no force. |
+| `spotter.hardening-lane-e-token-ownership` | `hardening/lane-e-token-ownership` | Removed 2026-09-14 via `wt remove --foreground --no-delete-branch` (clean, tip `6d467fb` verified ancestor). Branch retained; no force. |
+| Primary `spotter.hardening-remaining-jira-findings` | `hardening/remaining-jira-findings` | RETAINED (2026-09-14): integration branch merged to `main` via PR #9 (`36559ec`) but branch kept for the post-merge ledger/evidence record (`898dd5e`); per plan, removal only with explicit main-integration authorization. Operator `.worktrees/hardware-collector-fix` untouched. |
