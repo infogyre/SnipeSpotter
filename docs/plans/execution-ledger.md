@@ -91,7 +91,7 @@ mapping is complete as a branch-creation precondition.
 | AC.13–AC.15 (D) | msi_file_table_excludes_pdbs, test_msi_installed_inventory_excludes_pdbs, symbols_zip_retains_both_pdbs, release_stage_retains_symbol_inputs, direct_scm_stage_retains_executables, test_symbol_distribution_docs_match_inventory | `installer/Product.wxs` (WiX build), `scripts/test-msi-lifecycle-contract.py`, `scripts/test-msi-lifecycle.ps1` | n/a | `python3 scripts/test-msi-lifecycle-contract.py`; PowerShell MSI lifecycle on Windows runner | `checks.yml` job `package-contract` + `release.yml` job `lifecycle` (elevated) | built MSI file-table dump + symbols ZIP listing + CI logs | IN PROGRESS (lane D) |
 | AC.16 (F) | hardware_approval_environment_audit (manual) | n/a | n/a | authorized read-only GitHub environment query | manual | redacted metadata snapshot + administrator confirmation or explicit blocked note | IN PROGRESS |
 | AC.17 (F) | jira_disposition_audit (manual) | n/a | n/a | evidence report compilation | manual | `docs/plans/jira-evidence-report.md` | pending |
-| AC.18 (—) | workspace_handoff_audit (manual) | n/a | n/a | hash comparison + branch/base/path verification | manual | ledger Anchors section | PASS |
+| AC.18 (—) | workspace_handoff_audit (manual) | n/a | n/a | hash comparison + branch/base/path verification | manual | ledger Anchors section | PASS (pre-merge) + PR #9 merged `36559ec` (2026-09-14) with CI run 187 PASS |
 | (AC.18 gates) | fmt/test/clippy/workspace checks | workspace | n/a | see Anchors baseline + verification gates in plan | `checks.yml` `ci-success` aggregate | CI run link | PASS (baseline) |
 
 ## Shared-edit log
@@ -191,6 +191,7 @@ and Windows workspace test runs; SPOTR-23 controlled dispatch; any push/PR/dispa
 | 2026-09-13 | Lane E (SPOTR-17) | `hardening/lane-e-token-ownership` @ `6d467fb` | bb9a6e8 (A+B+C integrated) | 5 impl commits + test-gap commit `e30dfff` + clippy fixes `d6b0fa2`/`f734032`/`6d467fb`; D.1–D.4 verified (wire shape byte-identical, DPAPI wipe-before-free, no plain-String token API); merged `0d456eb`; post-merge all gates green |
 | 2026-09-13 | Lane F (docs/evidence) | direct on integration branch | 0d456eb | `6fa545f` (7 doc paths + docs contract assertions, 3 tests OK); docs recovery-state fix `f3c2c91` (NeedsOperatorRecovery vs Corrupt distinction) |
 | 2026-09-13 | Final integrated review (AC.18) | — | 237ef56..f3c2c91 (55 commits) | Cross-lane seams clean; all local gates green; docs accurate; **READY-FOR-PR** verdict; blocked native/external evidence explicitly listed (see Native Windows evidence log) |
+| 2026-09-14 | PR #9 merged to `main` | integration branch tip `9763686` (CI run 187 PASS incl. Windows workspace + elevated tests) | merge commit `36559ec50fb63d027f6cc2a90f90183f7b9d5eb6` | Pre-merge fixes: `b6eaf5d` (Windows lib-build dead_code/File-import gating), `9763686` (single_char_pattern in svc recovery notice test, caught by Windows CI lib-test clippy). Post-merge: Jira comments + closures of SPOTR-5/7/9/17/28 per operator authorization ("once the PR is pushed and ready, then you may merge"; "Jira tickets can be updated at any time, but can only be closed post-merge"). |
 
 ## Lane D (SPOTR-28) review + integration record
 
