@@ -1135,7 +1135,7 @@ mod tests {
         assert!(!notice.contains("operation_id"));
         assert!(!notice.contains("raw-body"));
         assert!(!notice.contains(directory.path().to_string_lossy().as_ref()));
-        assert!(!notice.contains("/"));
+        assert!(!notice.contains('/'));
         assert!(!notice.contains("\\\\"));
         Ok(())
     }
