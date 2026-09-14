@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -204,6 +205,153 @@ def test_product_and_atomic_writer_apply_the_same_protected_acl_contract() -> No
     assert "SetNamedSecurityInfoW" in WINDOWS_ACL
     assert "DACL_SECURITY_INFORMATION" in WINDOWS_ACL
     assert "PROTECTED_DACL_SECURITY_INFORMATION" in WINDOWS_ACL
+
+
+def test_msi_installed_inventory_excludes_pdbs() -> None:
+    inventory_start = SCRIPT.index("    foreach ($relative in @(")
+    symbols_start = SCRIPT.index("    foreach ($symbol in @(", inventory_start)
+    inventory = SCRIPT[inventory_start:symbols_start]
+    for installed_artifact in (
+        "'bin\\spotter-svc.exe'",
+        "'bin\\spotter-cli.exe'",
+        "'sbom\\spotter-svc.cdx.json'",
+        "'sbom\\spotter-cli.cdx.json'",
+    ):
+        assert installed_artifact in inventory
+    assert "spotter_svc.pdb" not in inventory
+    assert "spotter_cli.pdb" not in inventory
+
+    symbols_start = SCRIPT.index("    foreach ($symbol in @(", inventory_start)
+    symbols_end = SCRIPT.index("    }", symbols_start) + len("    }")
+    symbols = SCRIPT[symbols_start:symbols_end]
+    for symbol in ("'bin\\spotter_svc.pdb'", "'bin\\spotter_cli.pdb'"):
+        assert symbol in symbols
+    assert "-not (Test-Path -LiteralPath $symbolPath -PathType Leaf)" in symbols
+
+
+def msi_file_table_excludes_pdbs() -> None:
+    assert "Pdb" not in PRODUCT_WXS
+    assert ".pdb" not in PRODUCT_WXS.lower()
+    for installed_file in (
+        'Source="$(var.StageDir)\\spotter-svc.exe"',
+        'Source="$(var.StageDir)\\spotter-cli.exe"',
+        'Source="$(var.StageDir)\\sbom\\spotter-svc.cdx.json"',
+        'Source="$(var.StageDir)\\sbom\\spotter-cli.cdx.json"',
+    ):
+        assert installed_file in PRODUCT_WXS
+
+
+def _symbols_archive_script(package: str) -> str:
+    archive_match = re.search(
+        r"(?m)^\s*(Compress-Archive -Path release-stage/\* -DestinationPath [^\r\n]+)$",
+        package,
+        re.IGNORECASE,
+    )
+    assert archive_match, "release package must create the symbols ZIP from release-stage"
+    archive_start = archive_match.start()
+    setup_start = package.lower().rfind("new-item -itemtype directory -force packaged", 0, archive_start)
+    assert setup_start >= 0, "symbols archive must create the packaged output directory"
+
+    commands = ["$ErrorActionPreference = 'Stop'", "$env:RELEASE_VERSION = 'contract-test'"]
+    for line in package[setup_start:archive_start].splitlines():
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if lowered.startswith("new-item -itemtype directory -force packaged") or (
+            any(keyword in lowered for keyword in ("remove-item", "::delete", "clear-content"))
+            and "release-stage" in lowered
+        ):
+            commands.append(stripped)
+    commands.append(archive_match.group(1))
+    return "\n".join(commands)
+
+
+def _assert_symbols_archive_contains_both_pdbs(package: str) -> None:
+    archive_match = re.search(
+        r"(?m)^\s*Compress-Archive -Path release-stage/\* -DestinationPath [^\r\n]+$",
+        package,
+        re.IGNORECASE,
+    )
+    assert archive_match, "release package must create the symbols ZIP from release-stage"
+    archive_start = archive_match.start()
+    prearchive = package[:archive_start]
+    for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
+        assert symbol in prearchive
+    assert "-symbols.zip" in archive_match.group(0)
+
+    for line in prearchive.splitlines():
+        lowered = line.lower()
+        if "release-stage" in lowered and "pdb" in lowered:
+            assert not any(keyword in lowered for keyword in ("remove-item", "::delete", "clear-content")), (
+                "release package must not delete staged PDBs before creating the symbols ZIP"
+            )
+
+    verifier_start = archive_match.end()
+    verifier = package[verifier_start:]
+    if "expand-archive" in verifier.lower() or "[io.compression.zipfile]" in verifier.lower():
+        for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
+            assert symbol in verifier
+        assert "-symbols.zip" in verifier
+
+    with tempfile.TemporaryDirectory(prefix="symbols-archive-contract-") as temporary_directory:
+        root = Path(temporary_directory)
+        stage = root / "release-stage"
+        stage.mkdir()
+        for symbol in ("spotter_svc.pdb", "spotter_cli.pdb"):
+            (stage / symbol).write_bytes(b"contract fixture")
+        result = subprocess.run(
+            ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", _symbols_archive_script(package)],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        archive = root / "packaged" / "SnipeSpotter-contract-test-x64-symbols.zip"
+        assert archive.is_file(), "symbols archive command did not produce the expected ZIP"
+        with zipfile.ZipFile(archive) as produced:
+            entries = {Path(name).name for name in produced.namelist() if not name.endswith("/")}
+        assert {"spotter_svc.pdb", "spotter_cli.pdb"} <= entries
+
+
+def symbols_zip_retains_both_pdbs() -> None:
+    workflow = (ROOT.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    package = workflow[workflow.index("  package:") : workflow.index("  lifecycle:")]
+    _assert_symbols_archive_contains_both_pdbs(package)
+
+    deletion_mutation = re.sub(
+        r"(?m)^([ \t]*)(Compress-Archive -Path release-stage/\* -DestinationPath)",
+        r"\1Remove-Item -LiteralPath release-stage/spotter_svc.pdb\n\1\2",
+        package,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    assert deletion_mutation != package
+    try:
+        _assert_symbols_archive_contains_both_pdbs(deletion_mutation)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("deleting a staged PDB before archive creation was accepted")
+
+
+def release_stage_retains_symbol_inputs() -> None:
+    workflow = (ROOT.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    build = workflow[workflow.index("      - name: Build release binaries") : workflow.index("      - name: Upload binaries")]
+    assert "$files = @('spotter-svc.exe', 'spotter-cli.exe', 'spotter_svc.pdb', 'spotter_cli.pdb')" in build
+    assert "Copy-Item -LiteralPath $path -Destination $stage" in build
+    assert "release-stage inventory differs from the closed expected set" in build
+
+
+def direct_scm_stage_retains_executables() -> None:
+    workflow = (ROOT.parent / ".github" / "workflows" / "elevated-windows.yml").read_text(encoding="utf-8")
+    direct_stage = workflow[workflow.index("      - name: Stage direct SCM service executable") : workflow.index("      - name: Validate direct CLI SCM lifecycle")]
+    assert "spotter-svc.exe" in direct_stage
+    assert "spotter-cli-test-support.exe" in direct_stage
+    assert "Expand-Archive" in direct_stage
+    assert "Join-Path $extract 'spotter-svc.exe'" in direct_stage
+    assert "Copy-Item -LiteralPath $serviceSource -Destination $servicePath -Force" in direct_stage
+    assert "Copy-Item -LiteralPath $source -Destination (Join-Path (Resolve-Path -LiteralPath packaged).Path 'spotter-cli-test-support.exe')" in direct_stage
 
 
 def test_startup_repairs_existing_runtime_artifact_acls_before_access() -> None:
@@ -723,6 +871,11 @@ def main() -> None:
     test_lifecycle_collects_only_present_runtime_artifacts_and_uses_scoped_acl_commands()
     test_lifecycle_asserts_child_probe_result_not_parent_token()
     test_product_and_atomic_writer_apply_the_same_protected_acl_contract()
+    test_msi_installed_inventory_excludes_pdbs()
+    msi_file_table_excludes_pdbs()
+    symbols_zip_retains_both_pdbs()
+    release_stage_retains_symbol_inputs()
+    direct_scm_stage_retains_executables()
     test_acl_diagnostics_are_bounded_and_precede_any_repair()
     test_acl_diagnostic_capture_attempts_settings_after_root_failure()
     test_startup_repairs_existing_runtime_artifact_acls_before_access()

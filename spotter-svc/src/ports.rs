@@ -12,6 +12,7 @@ use spotter_core::{
     state::ServiceState as PersistedServiceState,
     sync::{ResolvedTaxonomy, SyncPlan},
 };
+use zeroize::Zeroizing;
 
 /// The outcome returned by journal-backed synchronization execution.
 pub type SyncOutcome = crate::sync_engine::ExecutionOutcome;
@@ -31,7 +32,7 @@ pub trait SecretProtector: Send + Sync {
     ///
     /// # Errors
     /// Returns an error when the ciphertext cannot be decrypted.
-    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
+    fn decrypt(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
 }
 
 /// Persist and load settings.

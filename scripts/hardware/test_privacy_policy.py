@@ -99,10 +99,14 @@ class PrivacyPolicyTests(unittest.TestCase):
 
     def test_workflow_uses_one_key_for_both_contexts_and_cleans_it(self) -> None:
         workflow = (Path(__file__).resolve().parents[2] / ".github" / "workflows" / "hardware-experiment.yml").read_text(encoding="utf-8")
-        direct = workflow.index("-Context interactive-admin")
-        local_system = workflow.index("context = 'LocalSystem'")
+        direct = workflow.index("& $collector -Image $env:IMAGE")
+        local_system = workflow.index("$scOutput = & sc.exe create")
         self.assertLess(direct, local_system)
         self.assertIn("key_path = $keyPath", workflow)
+        self.assertIn("staging_root = $cellRoot", workflow)
+        self.assertIn("$cellRoot = Join-Path ${env:ProgramData}", workflow)
+        self.assertIn("$keyPath = Join-Path $cellRoot", workflow)
+        self.assertNotIn("$keyPath = Join-Path $env:RUNNER_TEMP", workflow)
         self.assertIn("/inheritance:r", workflow)
         self.assertLess(workflow.index("Invoke-ReportValidation -Context LocalSystem"), workflow.index("Upload validated redacted reports"))
         self.assertIn("cleanup failed", workflow)
@@ -116,6 +120,38 @@ class PrivacyPolicyTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("ToHexString", workflow)
         self.assertNotIn("WriteAllBytes($keyPath", workflow)
+
+    def test_workflow_protects_key_before_writing_secret(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / "hardware-experiment.yml"
+        ).read_text(encoding="utf-8")
+        create = workflow.index("$keyHandle = [IO.File]::Open($keyPath")
+        protect = workflow.index("& icacls.exe $keyPath", create)
+        write = workflow.index("[IO.File]::WriteAllText($keyPath", create)
+        self.assertLess(create, protect)
+        self.assertLess(protect, write)
+        self.assertIn("[IO.FileMode]::CreateNew", workflow)
+        self.assertIn("'*S-1-5-18:R'", workflow)
+        self.assertIn("'*S-1-5-32-544:F'", workflow)
+
+    def test_cleanup_refuses_cell_root_deletion_after_service_wait_timeout(self) -> None:
+        workflow = (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / "hardware-experiment.yml"
+        ).read_text(encoding="utf-8")
+        cleanup = workflow.split("- name: Cleanup ephemeral reports", 1)[1]
+        self.assertIn("$serviceDeletionConfirmed", cleanup)
+        self.assertIn("if ($serviceDeletionConfirmed)", cleanup)
+        self.assertIn("refusing to remove protected cell root", cleanup)
+        self.assertLess(
+            cleanup.index('Wait-ForCondition -Description "LocalSystem service deletion"'),
+            cleanup.index("Remove-Item -LiteralPath $cellRoot"),
+        )
 
     def test_rejects_context_and_runtime_identity_mismatch(self) -> None:
         report = self.valid_report()

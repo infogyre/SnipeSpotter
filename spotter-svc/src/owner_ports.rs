@@ -6,6 +6,7 @@ use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
 use secrecy::SecretString;
 use spotter_core::{Settings, state::ServiceState};
+use zeroize::Zeroizing;
 
 pub use crate::ports::{HardwareDiscovery, RemoteReads};
 use crate::sync_engine::RemoteMutations;
@@ -66,9 +67,15 @@ impl SecretProtector for DpapiProtector {
     }
 
     fn decrypt(&self, ciphertext: &[u8]) -> Result<SecretString> {
-        let plaintext = spotter_win32::dpapi::decrypt(ciphertext)
-            .context("failed to decrypt API token with DPAPI")?;
-        let token = String::from_utf8(plaintext).context("decrypted API token is not UTF-8")?;
+        let plaintext = Zeroizing::new(
+            spotter_win32::dpapi::decrypt(ciphertext)
+                .context("failed to decrypt API token with DPAPI")?,
+        );
+        let token = String::from_utf8(plaintext.to_vec()).map_err(|error| {
+            let mut bytes = error.into_bytes();
+            zeroize::Zeroize::zeroize(&mut bytes);
+            anyhow::anyhow!("decrypted API token is not UTF-8")
+        })?;
         Ok(SecretString::from(token))
     }
 }

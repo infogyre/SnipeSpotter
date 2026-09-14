@@ -16,7 +16,11 @@ The diagnostic emits only:
 
 It never uploads raw SMBIOS bytes, serials, UUIDs, asset tags, monitor names, EDID, environment dumps, tokens, HMAC keys, or unbounded exception text. The validator rejects unknown fields, oversized values, token-like content, and key/firmware payloads before an artifact can be retained.
 
-The workflow generates one random 32-byte HMAC key per image/repetition cell, holds it only in the runner temp directory, shares it with both contexts in that cell, and never uploads it. The same protected key is used by that cell's direct and LocalSystem collectors, making equal fragments comparable between those contexts. It is removed during failure-safe cleanup and is not a stable cross-run identifier or fixture.
+The workflow creates one random 32-byte HMAC key per image/repetition cell directly in a protected per-cell root under `%ProgramData%\SnipeSpotterHardware\<cell-id>`, shares it with both contexts in that cell, and never uploads it. The key retains `SYSTEM:(R)` / `Administrators:(F)` under the accepted SPOTR-24 policy. Config, collector, support executable, key, and output are staged in that root; `RUNNER_TEMP` is not used as a plaintext staging area. The same protected key is used by that cell's direct and LocalSystem collectors, making equal fragments comparable between those contexts. It is removed during failure-safe cleanup after service deletion is confirmed and is not a stable cross-run identifier or fixture.
+
+## Protected staging and path policy
+
+The per-cell staging root is protected with inheritance disabled and explicit `SYSTEM`/`Administrators` control. The host opens path components without following reparse points, checks final-path containment, rejects unauthorized write access and writable ancestors, and validates the config before SCM registration and again immediately before launch. TrustedInstaller is accepted only for an allowlisted system PowerShell executable layout; ordinary experiment inputs must remain administrator- or SYSTEM-owned. The workflow consumes validated bound objects from the protected root, so a standard-user replacement attempt cannot substitute a collector, key, config, or output path. Administrators and the service's elevated context remain outside this boundary.
 
 ## Approval checkpoint
 

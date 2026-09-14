@@ -28,7 +28,13 @@ A report may contain only:
 - chassis class counts (`portable`, `desktop`, `server`, `enclosure`, `unknown`) and capped marker;
 - at most 16-character lowercase HMAC-SHA256 fragments.
 
-The collector may briefly hold raw values in process memory solely to classify lengths or compute HMAC fragments. It does not write, print, upload, or include those values in an exception. The workflow generates one random 32-byte key per image/repetition cell, protects the temporary key for SYSTEM and Administrators, and passes that same key to both direct and LocalSystem collectors in the cell so equal fragments are comparable. The key is never uploaded, is removed in failure-safe cleanup, and is not a stable cross-run identifier.
+The collector may briefly hold raw values in process memory solely to classify lengths or compute HMAC fragments. It does not write, print, upload, or include those values in an exception. The workflow creates one random 32-byte key per image/repetition cell directly inside the protected per-cell root `%ProgramData%\SnipeSpotterHardware\<cell-id>`, then passes that same key to both direct and LocalSystem collectors so equal fragments are comparable. The key is never uploaded, is removed in failure-safe cleanup, and is not a stable cross-run identifier.
+
+## Protected per-cell staging policy
+
+Each cell has an administrator-created root beneath `%ProgramData%\SnipeSpotterHardware\<cell-id>`. The root and `output\` directory have inheritance disabled and grant full control only to `SYSTEM` and built-in `Administrators`. The config, collector, and support executable are direct children of that root. Their effective write policy is also restricted to those principals. The key retains the accepted SPOTR-24 policy: `SYSTEM:(R)` and `Administrators:(F)`; this is an administrator-trust decision, not a claim to defend against administrators.
+
+The workflow does not create the key in `RUNNER_TEMP` and then move or ACL it. It uses exclusive creation directly in the protected root before writing key material, and it stages the config, collector, and support executable under the same root before the LocalSystem service consumes them. The host validates each component with no-follow handle inspection before config read, SCM registration, and launch. It verifies final-path containment, rejects reparse points and standard-user-writable ancestors, and rejects write ACEs for unallowlisted principals. TrustedInstaller is allowed only for the explicitly allowlisted system PowerShell layout (`Program Files\PowerShell` or `PowerShell-Core` ending in `pwsh.exe`); it is not a general allowlist for experiment inputs. Launch uses the validated bound paths, and cleanup waits for SCM deletion before removing the root.
 
 ## Explicitly prohibited data
 

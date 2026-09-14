@@ -10,7 +10,7 @@ fn dpapi_roundtrip_preserves_utf8_token() -> Result<()> {
     assert!(!ciphertext.is_empty());
     assert_ne!(ciphertext, plaintext.as_bytes());
     assert_eq!(
-        spotter_win32::dpapi::decrypt(&ciphertext)?,
+        &*spotter_win32::dpapi::decrypt(&ciphertext)?,
         plaintext.as_bytes()
     );
     Ok(())
@@ -30,6 +30,9 @@ fn dpapi_rejects_corrupt_truncated_and_random_ciphertext() -> Result<()> {
 #[test]
 fn dpapi_preserves_invalid_utf8_as_bytes_for_config_layer() -> Result<()> {
     let ciphertext = spotter_win32::dpapi::encrypt(&[0xFF, 0xFE])?;
-    assert_eq!(spotter_win32::dpapi::decrypt(&ciphertext)?, [0xFF, 0xFE]);
+    assert_eq!(
+        spotter_win32::dpapi::decrypt(&ciphertext)?.as_slice(),
+        &[0xFF, 0xFE]
+    );
     Ok(())
 }

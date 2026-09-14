@@ -37,6 +37,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
 base64 = { workspace = true }
 tokio-util = { workspace = true }
 rustls-pki-types = "=1.15.1"

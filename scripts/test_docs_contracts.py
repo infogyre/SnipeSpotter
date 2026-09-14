@@ -11,6 +11,10 @@ RELEASE = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="u
 CI_GUIDE = (ROOT / "docs" / "ci-guide.md").read_text(encoding="utf-8")
 README = (ROOT / "README.md").read_text(encoding="utf-8")
 MSI_LIFECYCLE = (ROOT / "scripts" / "test-msi-lifecycle.ps1").read_text(encoding="utf-8")
+ARCHITECTURE = (ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
+OPERATOR_GUIDE = (ROOT / "docs" / "operator-guide.md").read_text(encoding="utf-8")
+HARDWARE_POLICY = (ROOT / "docs" / "hardware-experiment-policy.md").read_text(encoding="utf-8")
+HARDWARE_QUALIFICATION = (ROOT / "docs" / "hardware-qualification.md").read_text(encoding="utf-8")
 
 
 def _job_ids(workflow: str) -> list[str]:
@@ -94,6 +98,47 @@ class DocumentationWorkflowContracts(unittest.TestCase):
         self.assertNotIn("actionlint", CI_GUIDE)
         self.assertNotIn("zizmor", CI_GUIDE)
         self.assertNotIn("Flips the draft release", CI_GUIDE)
+
+    def test_hardening_security_and_evidence_contract(self) -> None:
+        for claim in (
+            "server PID",
+            "LocalSystem owner SID",
+            "SCM",
+            "before serialization or writing",
+            "Does NOT defend against an administrator controlling SCM",
+            "Clean",
+            "NeedsOperatorRecovery",
+            "PreservationFailed",
+            "Corrupt",
+            "recovery-blocked",
+            "no journal records",
+            "Marker absence plus a valid journal is the only accepted clean state",
+            "PDBs are symbol-distribution inputs only",
+            "Verify symbols ZIP contains both PDBs",
+            "does not create the key in `RUNNER_TEMP`",
+            "SYSTEM:(R)",
+            "Administrators:(F)",
+            "TrustedInstaller",
+        ):
+            self.assertTrue(
+                any(
+                    claim in document
+                    for document in (
+                        README,
+                        ARCHITECTURE,
+                        OPERATOR_GUIDE,
+                        CI_GUIDE,
+                        HARDWARE_POLICY,
+                        HARDWARE_QUALIFICATION,
+                    )
+                ),
+                msg=f"documentation is missing required claim: {claim}",
+            )
+
+        self.assertIn("PDB debug symbols for both executables are not installed", OPERATOR_GUIDE)
+        self.assertIn("release symbols ZIP", OPERATOR_GUIDE)
+        self.assertIn("RUNNER_TEMP", CI_GUIDE)
+        self.assertIn("SPOTR-24", HARDWARE_POLICY + HARDWARE_QUALIFICATION + CI_GUIDE)
 
 
 if __name__ == "__main__":
