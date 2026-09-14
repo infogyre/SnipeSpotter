@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -487,6 +487,7 @@ fn flush_parent(parent: &Path) -> Result<()> {
     };
     #[cfg(not(windows))]
     let handle = {
+        use std::fs::File;
         File::open(parent)
             .with_context(|| format!("failed to open journal parent {}", parent.display()))?
     };

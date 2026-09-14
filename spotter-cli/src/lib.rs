@@ -403,9 +403,12 @@ impl IpcTransport for NamedPipeTransport {
 }
 
 #[cfg(any(windows, test))]
-#[expect(
-    dead_code,
-    reason = "kept for cross-platform test seams; unused on Windows lib builds"
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(
+        dead_code,
+        reason = "kept for cross-platform test seams; unused on Windows lib builds"
+    )
 )]
 fn exchange_request<A, S, W, R, B>(
     command: &ServiceCommand,
