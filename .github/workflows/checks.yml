@@ -80,6 +80,8 @@ jobs:
         run: cargo test -p spotter-svc --all-targets --features test-support --locked
       - name: CLI binary contract with test support
         run: cargo test -p spotter-cli --test binary_contract --features test-support --locked
+      - name: CLI named pipe identity fixtures with test support
+        run: cargo test -p spotter-cli --test named_pipe --features test-support --locked
       - name: Workspace clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Compile hardware experiment service host
