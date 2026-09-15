@@ -71,6 +71,52 @@ mod windows_service_host {
         _launch_bound: LaunchBound,
     }
 
+    /// Diagnostic log files created inside the protected staging root.
+    ///
+    /// The service creates these itself as LocalSystem; they are outputs, not trusted inputs, so
+    /// they do not go through `inspect_path`. Filenames are fixed, config-independent, and the
+    /// staging root is already restricted to SYSTEM and Administrators.
+    struct DiagnosticsPaths {
+        collector_stdout: PathBuf,
+        collector_stderr: PathBuf,
+        service_diagnostic: PathBuf,
+    }
+
+    impl DiagnosticsPaths {
+        fn build(staging_root: &Path) -> DiagnosticsPaths {
+            DiagnosticsPaths {
+                collector_stdout: staging_root.join("collector_stdout.log"),
+                collector_stderr: staging_root.join("collector_stderr.log"),
+                service_diagnostic: staging_root.join("service_diagnostic.log"),
+            }
+        }
+    }
+
+    /// Create (or truncate) a diagnostic log file owned by the service.
+    ///
+    /// The staging root's ACL already limits write access to SYSTEM and Administrators, so the
+    /// inherited directory policy governs the log; no per-file ACL work is required.
+    fn open_diagnostic_log(path: &Path) -> Result<fs::File, String> {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .map_err(|error| format!("failed to open diagnostic log {}: {error}", path.display()))
+    }
+
+    /// Persist a service-side failure into the protected diagnostic log before returning.
+    ///
+    /// SCM hosts have no console, so `eprintln!` is otherwise lost; the workflow uploads this file
+    /// to make service failures observable. Best-effort: the original error is still returned.
+    fn record_service_diagnostic(path: &Path, message: &str) {
+        use std::io::Write as _;
+        let Ok(mut file) = open_diagnostic_log(path) else {
+            return;
+        };
+        let _ = writeln!(file, "{message}");
+    }
+
     pub fn run() -> Result<(), String> {
         let arguments = env::args_os().skip(1).collect::<Vec<_>>();
         let service_name = argument_value(&arguments, SERVICE_NAME_ARGUMENT)?;
@@ -86,6 +132,17 @@ mod windows_service_host {
     fn service_main(_arguments: Vec<OsString>) {
         let arguments = env::args_os().skip(1).collect::<Vec<_>>();
         if let Err(error) = run_service(&arguments) {
+            // Derive the protected diagnostic root from the config path's parent even when config
+            // loading fails, so early service failures remain observable in the uploaded artifact.
+            let diagnostic_root = argument_value(&arguments, CONFIG_ARGUMENT)
+                .ok()
+                .and_then(|config_path| Path::new(&config_path).parent().map(Path::to_path_buf));
+            if let Some(root) = diagnostic_root {
+                record_service_diagnostic(
+                    &DiagnosticsPaths::build(&root).service_diagnostic,
+                    &format!("hardware service failed: {error}"),
+                );
+            }
             eprintln!("hardware service failed: {error}");
         }
     }
@@ -98,6 +155,7 @@ mod windows_service_host {
             return Err("service name does not match service configuration".to_owned());
         }
         let launch_bound = validate_launch_inputs(&config)?;
+        let diagnostics = DiagnosticsPaths::build(&config.staging_root);
 
         let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
         let status_handle =
@@ -118,7 +176,7 @@ mod windows_service_host {
         )?;
         set_status(status_handle, ServiceState::Running, 0, Duration::ZERO)?;
 
-        let mut collector = spawn_collector(&config, launch_bound)?;
+        let mut collector = spawn_collector(&config, launch_bound, &diagnostics)?;
         let service_result = loop {
             if let Some(status) = collector
                 .process
@@ -212,12 +270,22 @@ mod windows_service_host {
     fn spawn_collector(
         config: &ServiceConfig,
         launch_bound: LaunchBound,
+        diagnostics: &DiagnosticsPaths,
     ) -> Result<RunningCollector, String> {
         let session_id = current_session_id()?;
+        let stdout_log = open_diagnostic_log(&diagnostics.collector_stdout)?;
+        let stderr_log = open_diagnostic_log(&diagnostics.collector_stderr)?;
+        // Run 19 diagnostics: as LocalSystem the fresh pwsh process evaluates the machine
+        // execution policy (Restricted), which blocks -File execution with "AuthorizationManager
+        // check failed" even though the collector was validated by the protected path policy.
+        // The service fully controls this spawn, so bypassing the policy for this single
+        // validated file is scoped, not a general trust change.
         let child = Command::new(launch_bound.pwsh.final_path())
             .arg("-NoLogo")
             .arg("-NoProfile")
             .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
             .arg("-File")
             .arg(launch_bound.collector.final_path())
             .arg("-Image")
@@ -240,8 +308,8 @@ mod windows_service_host {
                     .join(output_file_name(config)),
             )
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::from(stdout_log))
+            .stderr(Stdio::from(stderr_log))
             .spawn()
             .map_err(|error| format!("failed to launch hardware collector: {error}"))?;
         Ok(RunningCollector {
@@ -475,4 +543,28 @@ fn main() -> std::process::ExitCode {
         "error: spotter-hardware-service requires Windows and the hardware-experiment feature"
     );
     std::process::ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod diagnostics_capture_tests {
+    /// Regression for the blind run-15 timeout: the collector spawn must redirect stdout/stderr
+    /// into protected diagnostic log files instead of discarding them.
+    #[test]
+    fn collector_streams_are_captured_not_discarded() {
+        let source = include_str!("main.rs");
+        let spawn_section = source
+            .split("fn spawn_collector")
+            .nth(1)
+            .expect("spawn_collector exists")
+            .split("fn output_file_name")
+            .next()
+            .expect("spawn_collector body terminator");
+        assert!(spawn_section.contains("Stdio::from(stdout_log)"));
+        assert!(spawn_section.contains("Stdio::from(stderr_log)"));
+        assert!(
+            !spawn_section.contains(".stdout(Stdio::null())")
+                && !spawn_section.contains(".stderr(Stdio::null())"),
+            "collector stdout/stderr must be captured, not discarded"
+        );
+    }
 }

@@ -26,6 +26,10 @@ pub use command_line::executable_from_command_line;
 use spotter_win32::pipe::{NativeServerIdentityQuery, ServerIdentityQuery, ServiceIdentityError};
 
 #[cfg(all(windows, feature = "test-support"))]
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(unused_imports, reason = "the only use site is the crate test module")
+)]
 use spotter_win32::pipe::SameAccountServerIdentityQuery;
 
 /// Exit status used when the Windows service IPC endpoint is unavailable.

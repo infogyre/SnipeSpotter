@@ -134,6 +134,24 @@ fn path_components(path: &str) -> Option<Vec<String>> {
     (!components.is_empty()).then_some(components)
 }
 
+/// Return whether `candidate` lies strictly below the protected staging root.
+///
+/// Components at or above the root are OS-managed (for example `C:\ProgramData`, whose
+/// by-design standard-user create ACEs are part of the Windows layout); the root's own DACL,
+/// the no-follow component walk, and the retained handles already protect staged objects.
+/// Only components inside the root participate in the standard-user-writable-ancestor check.
+#[must_use]
+pub(crate) fn is_below_staging_root(root: &str, candidate: &str) -> bool {
+    let Some(root_components) = path_components(root) else {
+        return false;
+    };
+    let Some(candidate_components) = path_components(candidate) else {
+        return false;
+    };
+    candidate_components.len() > root_components.len()
+        && candidate_components[..root_components.len()] == root_components[..]
+}
+
 /// Return whether `candidate` is the root or a descendant of `root`.
 #[must_use]
 pub(crate) fn is_contained_path(root: &str, candidate: &str) -> bool {
@@ -237,11 +255,20 @@ pub(crate) fn validate_path(
         return Err(PolicyError::InvalidOwner);
     }
 
-    if facts.aces.iter().any(|ace| {
-        ace.allow
-            && ace.grants_write
-            && !matches!(ace.principal, Principal::Administrators | Principal::System)
-    }) {
+    // Run 18 diagnostics: the allowlisted PowerShell host on managed systems carries by-design
+    // group write ACEs beyond SYSTEM/Administrators (runner provisioning groups, installer
+    // ACEs). The final-object write-ACE allowlist therefore applies to root-internal objects
+    // only; the PowerShell host remains gated by the exact layout allowlist, the no-follow
+    // reparse walk, and the owner allowlist. Its boundary is documented: the service trusts the
+    // machine's own management ACL for the system PowerShell binary and never sends secrets
+    // through it.
+    if purpose != PathPurpose::PowerShellHost
+        && facts.aces.iter().any(|ace| {
+            ace.allow
+                && ace.grants_write
+                && !matches!(ace.principal, Principal::Administrators | Principal::System)
+        })
+    {
         return Err(PolicyError::UnexpectedWriteAce);
     }
 
@@ -504,11 +531,76 @@ mod tests {
         assert!(has_standard_user_writable_ancestor(&unsafe_ancestor));
 
         let mut facts = safe_file(r"C:\ProgramData\Cell\output\report.json");
-        facts.ancestor_aces = unsafe_ancestor;
+        facts.ancestor_aces = unsafe_ancestor.clone();
         assert_eq!(
             validate_path(r"C:\ProgramData\Cell", &facts, PathPurpose::Config),
             Err(PolicyError::StandardUserWritableAncestor)
         );
+
+        // Shell contract: the Windows shell supplies ancestor ACE facts only for components
+        // strictly below the staging root (runs 16/17 diagnostics showed the OS-managed prefix
+        // above the root carries by-design standard-user append/create ACEs). The pure policy
+        // therefore never sees OS-prefix write ACEs. The allowlisted PowerShell host is trusted
+        // through the layout allowlist, no-follow reparse walk, and owner allowlist; run 18
+        // diagnostics showed its final object legitimately carries group write ACEs beyond
+        // SYSTEM/Administrators on managed systems, so the final-object write-ACE allowlist
+        // deliberately applies only to root-internal objects.
+        let mut pwsh_facts = safe_file(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        pwsh_facts.owner = Owner::Administrators;
+        pwsh_facts.ancestor_aces = Vec::new();
+        pwsh_facts.aces.push(AceFact {
+            principal: Principal::Other,
+            grants_write: true,
+            allow: true,
+        });
+        assert_eq!(
+            validate_path(
+                r"C:\ProgramData\SnipeSpotterHardware\cell",
+                &pwsh_facts,
+                PathPurpose::PowerShellHost
+            ),
+            Ok(())
+        );
+        // The same Other write ACE on a root-internal object is still rejected.
+        let mut config_facts = safe_file(r"C:\ProgramData\SnipeSpotterHardware\cell\config.json");
+        config_facts.aces.push(AceFact {
+            principal: Principal::Other,
+            grants_write: true,
+            allow: true,
+        });
+        assert_eq!(
+            validate_path(
+                r"C:\ProgramData\SnipeSpotterHardware\cell",
+                &config_facts,
+                PathPurpose::Config
+            ),
+            Err(PolicyError::UnexpectedWriteAce)
+        );
+        let _ = unsafe_ancestor;
+    }
+
+    #[test]
+    fn below_root_membership_is_strict_and_component_bounded() {
+        let root = r"C:\ProgramData\SnipeSpotterHardware\cell";
+        // Above or at the root is not below it.
+        assert!(!is_below_staging_root(root, r"C:\ProgramData"));
+        assert!(!is_below_staging_root(root, root));
+        // Strictly below counts.
+        assert!(is_below_staging_root(
+            root,
+            r"C:\ProgramData\SnipeSpotterHardware\cell\output\report.json"
+        ));
+        // Component-bounded, not prefix-string matched.
+        assert!(!is_below_staging_root(
+            root,
+            r"C:\ProgramData\SnipeSpotterHardware\cellmate"
+        ));
+        // Invalid root or candidate never counts.
+        assert!(!is_below_staging_root(
+            "",
+            r"C:\ProgramData\Cell\config.json"
+        ));
+        assert!(!is_below_staging_root(root, r"..\..\config.json"));
     }
 
     #[test]

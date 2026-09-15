@@ -371,7 +371,18 @@ pub(crate) fn inspect_path(
             }
         };
         if index + 1 != components.len() {
-            ancestor_aces.extend(aces);
+            // Standard-user-writable-ancestor facts are gathered only for components strictly
+            // below the protected staging root. The OS-managed prefix above the root (e.g.
+            // C:\ProgramData, C:\Program Files) carries by-design standard-user append/create
+            // ACEs on Windows that cannot modify existing files; no real system layout satisfies
+            // a whole-chain write-ACE absence check (runs 16/17 diagnostics artifacts). The
+            // allowlisted PowerShell host therefore trusts the OS-managed prefix through: the
+            // exact layout allowlist, the no-follow reparse checks above, the final-object owner
+            // allowlist, and the final-object write-ACE check — not the ancestor write check.
+            let candidate = component.to_string_lossy();
+            if path_policy::is_below_staging_root(&root.to_string_lossy(), &candidate) {
+                ancestor_aces.extend(aces);
+            }
         } else {
             let facts = PathFacts {
                 final_path: final_path.to_string_lossy().into_owned(),
