@@ -522,11 +522,30 @@ mod tests {
         assert!(has_standard_user_writable_ancestor(&unsafe_ancestor));
 
         let mut facts = safe_file(r"C:\ProgramData\Cell\output\report.json");
-        facts.ancestor_aces = unsafe_ancestor;
+        facts.ancestor_aces = unsafe_ancestor.clone();
         assert_eq!(
             validate_path(r"C:\ProgramData\Cell", &facts, PathPurpose::Config),
             Err(PolicyError::StandardUserWritableAncestor)
         );
+
+        // Shell contract: the Windows shell supplies ancestor ACE facts only for components
+        // strictly below the staging root (runs 16/17 diagnostics showed the OS-managed prefix
+        // above the root carries by-design standard-user append/create ACEs). The pure policy
+        // therefore never sees OS-prefix write ACEs and cannot reject the allowlisted PowerShell
+        // host for them; the host is still gated by the layout allowlist, reparse checks, owner
+        // allowlist, and its final-object write-ACE check.
+        let mut pwsh_facts = safe_file(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        pwsh_facts.owner = Owner::Administrators;
+        pwsh_facts.ancestor_aces = Vec::new();
+        assert_eq!(
+            validate_path(
+                r"C:\ProgramData\SnipeSpotterHardware\cell",
+                &pwsh_facts,
+                PathPurpose::PowerShellHost
+            ),
+            Ok(())
+        );
+        let _ = unsafe_ancestor;
     }
 
     #[test]
