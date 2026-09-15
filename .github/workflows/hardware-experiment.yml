@@ -239,6 +239,14 @@ jobs:
             }
             Invoke-ReportValidation -Context LocalSystem
           } finally {
+            $diagnosticsDirectory = Join-Path $env:GITHUB_WORKSPACE 'hardware-diagnostics'
+            New-Item -ItemType Directory -Force -Path $diagnosticsDirectory | Out-Null
+            foreach ($logName in @('collector_stdout.log', 'collector_stderr.log', 'service_diagnostic.log')) {
+              $logPath = Join-Path $cellRoot $logName
+              if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+                Copy-Item -LiteralPath $logPath -Destination (Join-Path $diagnosticsDirectory "$env:IMAGE-$env:REPETITION-$logName") -Force
+              }
+            }
             $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
             if ($null -ne $service -and $service.Status -ne 'Stopped') { Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue }
             & sc.exe delete $serviceName | Out-Null
@@ -253,6 +261,14 @@ jobs:
           name: hardware-report-${{ matrix.image }}-${{ matrix.repetition }}
           path: hardware-reports/${{ matrix.image }}-*.json
           if-no-files-found: error
+          retention-days: 7
+      - name: Upload protected service diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: hardware-diagnostics-${{ matrix.image }}-${{ matrix.repetition }}
+          path: hardware-diagnostics/*
+          if-no-files-found: ignore
           retention-days: 7
       - name: Cleanup ephemeral reports, service files, and key
         if: always()

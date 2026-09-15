@@ -35,6 +35,22 @@ class HardwareWorkflowContractTests(unittest.TestCase):
         self.assertIn("$configOutput -join", workflow)
         self.assertNotIn("Start-Service -Name $serviceName -ErrorAction Stop", workflow)
 
+    def test_localsystem_phase_uploads_service_diagnostics_before_cleanup(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("hardware-diagnostics", workflow)
+        for log_name in ("collector_stdout.log", "collector_stderr.log", "service_diagnostic.log"):
+            self.assertIn(log_name, workflow)
+        self.assertLess(
+            workflow.index("Upload protected service diagnostics"),
+            workflow.index("- name: Cleanup ephemeral reports"),
+            "diagnostics upload must run before the protected cell root is deleted",
+        )
+        diagnostics = workflow.split("- name: Upload protected service diagnostics", 1)[1]
+        self.assertIn("if: always()", diagnostics.splitlines()[1])
+        self.assertIn("hardware-diagnostics-${{ matrix.image }}-${{ matrix.repetition }}", diagnostics)
+        self.assertIn("if-no-files-found: ignore", diagnostics)
+
     def test_cleanup_waits_for_service_disappearance_and_is_idempotent(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
 
