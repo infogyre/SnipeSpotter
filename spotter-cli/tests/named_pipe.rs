@@ -411,8 +411,13 @@ async fn client_timeout_does_not_cancel_handler() -> Result<()> {
 
     let client_endpoint = endpoint;
     let client = tokio::task::spawn_blocking(move || {
-        let mut transport = fixture_transport(
+        // The transport's own request deadline (2 s) must sit inside the outer observation
+        // bound (5 s): when both were 5 s the expected client expiry raced the outer deadline
+        // and CI flaked with "deadline has elapsed" (PR #12 Windows workspace checks).
+        let mut transport = NamedPipeTransport::with_identity_query(
+            Duration::from_secs(2),
             client_endpoint,
+            "SnipeSpotter-fixture",
             FixtureIdentityQuery {
                 result: Ok(()),
                 calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
