@@ -27,3 +27,4 @@ __pycache__/
 
 # Generated hosted hardware experiment reports
 /hardware-reports/
+docs/plans/
