@@ -134,6 +134,24 @@ fn path_components(path: &str) -> Option<Vec<String>> {
     (!components.is_empty()).then_some(components)
 }
 
+/// Return whether `candidate` lies strictly below the protected staging root.
+///
+/// Components at or above the root are OS-managed (for example `C:\ProgramData`, whose
+/// by-design standard-user create ACEs are part of the Windows layout); the root's own DACL,
+/// the no-follow component walk, and the retained handles already protect staged objects.
+/// Only components inside the root participate in the standard-user-writable-ancestor check.
+#[must_use]
+pub(crate) fn is_below_staging_root(root: &str, candidate: &str) -> bool {
+    let Some(root_components) = path_components(root) else {
+        return false;
+    };
+    let Some(candidate_components) = path_components(candidate) else {
+        return false;
+    };
+    candidate_components.len() > root_components.len()
+        && candidate_components[..root_components.len()] == root_components[..]
+}
+
 /// Return whether `candidate` is the root or a descendant of `root`.
 #[must_use]
 pub(crate) fn is_contained_path(root: &str, candidate: &str) -> bool {
@@ -509,6 +527,30 @@ mod tests {
             validate_path(r"C:\ProgramData\Cell", &facts, PathPurpose::Config),
             Err(PolicyError::StandardUserWritableAncestor)
         );
+    }
+
+    #[test]
+    fn below_root_membership_is_strict_and_component_bounded() {
+        let root = r"C:\ProgramData\SnipeSpotterHardware\cell";
+        // Above or at the root is not below it.
+        assert!(!is_below_staging_root(root, r"C:\ProgramData"));
+        assert!(!is_below_staging_root(root, root));
+        // Strictly below counts.
+        assert!(is_below_staging_root(
+            root,
+            r"C:\ProgramData\SnipeSpotterHardware\cell\output\report.json"
+        ));
+        // Component-bounded, not prefix-string matched.
+        assert!(!is_below_staging_root(
+            root,
+            r"C:\ProgramData\SnipeSpotterHardware\cellmate"
+        ));
+        // Invalid root or candidate never counts.
+        assert!(!is_below_staging_root(
+            "",
+            r"C:\ProgramData\Cell\config.json"
+        ));
+        assert!(!is_below_staging_root(root, r"..\..\config.json"));
     }
 
     #[test]

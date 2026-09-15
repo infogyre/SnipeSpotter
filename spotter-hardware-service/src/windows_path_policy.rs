@@ -371,7 +371,18 @@ pub(crate) fn inspect_path(
             }
         };
         if index + 1 != components.len() {
-            ancestor_aces.extend(aces);
+            // Standard-user-writable-ancestor facts are gathered only for components strictly
+            // below the protected staging root. The OS-managed prefix above the root (e.g.
+            // C:\ProgramData) carries by-design standard-user create ACEs on Windows, and the
+            // root's own DACL plus this no-follow handle walk already protect staged objects.
+            // The allowlisted PowerShell host lives outside the root, so its entire chain is
+            // still checked.
+            let candidate = component.to_string_lossy();
+            let below_root =
+                path_policy::is_below_staging_root(&root.to_string_lossy(), &candidate);
+            if below_root || purpose == path_policy::PathPurpose::PowerShellHost {
+                ancestor_aces.extend(aces);
+            }
         } else {
             let facts = PathFacts {
                 final_path: final_path.to_string_lossy().into_owned(),
