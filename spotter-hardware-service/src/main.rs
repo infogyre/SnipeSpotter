@@ -275,10 +275,17 @@ mod windows_service_host {
         let session_id = current_session_id()?;
         let stdout_log = open_diagnostic_log(&diagnostics.collector_stdout)?;
         let stderr_log = open_diagnostic_log(&diagnostics.collector_stderr)?;
+        // Run 19 diagnostics: as LocalSystem the fresh pwsh process evaluates the machine
+        // execution policy (Restricted), which blocks -File execution with "AuthorizationManager
+        // check failed" even though the collector was validated by the protected path policy.
+        // The service fully controls this spawn, so bypassing the policy for this single
+        // validated file is scoped, not a general trust change.
         let child = Command::new(launch_bound.pwsh.final_path())
             .arg("-NoLogo")
             .arg("-NoProfile")
             .arg("-NonInteractive")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
             .arg("-File")
             .arg(launch_bound.collector.final_path())
             .arg("-Image")
