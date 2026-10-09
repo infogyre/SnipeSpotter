@@ -317,6 +317,43 @@ The blocked recovery result exposes no journal records, so ambiguous evidence ca
 
 Settings, state, keys, and journal compaction use same-directory replacement. The writer guarantees complete old-or-new destination content across the tested process-interruption points; it does not guarantee survival across physical power loss. It is a single-writer design. A failed write cleans up only its own temporary file, while startup cleanup removes stale temporary files only when the PID/nonce sidecar matches, the owner is dead, and the age threshold has elapsed. Leave files with missing or malformed metadata, a live/current owner, or insufficient age in place for diagnosis.
 
+### Policy-blocked legacy operations and ownerless monitor state
+
+An upgraded service also blocks structurally valid pending check-ins without a
+recorded expected owner and pending PATCH requests containing `asset_tag`.
+These are policy failures, not malformed-journal recovery markers. The pending
+operation may have been applied, not applied, or have an ambiguous outcome;
+absence of a marker does not mean it is safe to replay or discard it.
+
+1. Stop the service and preserve a consistent snapshot of signed state, keys,
+   configuration, journal, and relevant logs. Keep credential material private.
+2. Compare the original pending payload and evidence with the authoritative
+   Snipe-IT asset, assignment type/ID, status, and managed tag. Do not infer
+   permission or an outcome from a local checked-out flag.
+3. Escalate for a reviewed disposition that reconciles both remote outcome and
+   signed local state. Do not blindly reset state, delete the journal, strip
+   fields, or backfill an owner merely to permit replay. There is no automatic
+   migration or general-purpose repair command for these policy failures.
+4. Resume only after the reviewed disposition preserves a consistent state and
+   journal and the supported server behavior has been verified.
+
+Legacy monitor entries with `checked_out=true` and no `checkout_asset_id` cannot
+check in automatically or through forced check-in. Reconnecting the monitor
+alone does not restore ownership evidence: existing checked-out entries skip
+new checkout. Retain that restriction until ownership is reconciled through a
+reviewed recovery; a new confirmed checkout records the owner normally.
+
+Before upgrade, retain a stopped-service snapshot for rollback. New
+owner-bearing signed state cannot be authenticated by the old binary, which
+does not serialize the new owner field. A rollback must restore the matching
+binary and consistent stopped-data snapshot only after reconciling any remote
+changes since the snapshot. Do not reuse the newer state with the old binary.
+
+See [monitor check-in ownership](monitor-checkin-ownership.md) for the residual
+GET/write race and [asset-tag authority](asset-tag-authority.md) for managed-tag
+preservation. These restrictions are separate from the malformed-journal
+procedure above.
+
 ### After machine reinstallation
 
 DPAPI ciphertext is bound to the machine. After an OS reinstall:

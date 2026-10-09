@@ -14,7 +14,7 @@ pub struct Asset {
     pub serial: Option<String>,
     pub asset_tag: Option<String>,
     pub status_label: Option<NamedReference>,
-    pub assigned_to: Option<NamedReference>,
+    pub assigned_to: Option<AssignedTo>,
     pub model: Option<AssetModel>,
 }
 
@@ -23,6 +23,19 @@ pub struct Asset {
 pub struct NamedReference {
     pub id: u64,
     pub name: String,
+}
+
+/// A polymorphic assignment returned by Snipe-IT.
+///
+/// An absent type is deliberately unknown: numeric IDs can overlap between assets, users,
+/// and locations and must never be used alone to authorize an assignment mutation.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct AssignedTo {
+    pub id: u64,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub assignment_type: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -91,6 +104,9 @@ pub struct MonitorCheckout {
 pub struct MonitorCheckin {
     pub operation_id: String,
     pub source_asset_id: u64,
+    /// The computer asset this operation is authorized to check the monitor in from.
+    /// This is required when deserializing so legacy unbound operations fail closed.
+    pub expected_asset_id: u64,
     pub request: CheckinRequest,
 }
 
@@ -171,13 +187,18 @@ pub fn build_monitor_checkout(
 pub fn build_monitor_checkin(
     operation_id: impl Into<String>,
     source_asset_id: u64,
+    expected_asset_id: u64,
     checkin_status_id: u64,
 ) -> Result<MonitorCheckin, SnipeItError> {
     let operation_id = operation_id.into();
     validate_operation(&operation_id, source_asset_id, checkin_status_id)?;
+    if expected_asset_id == 0 {
+        return Err(validation("expected owner asset ID must be nonzero"));
+    }
     Ok(MonitorCheckin {
         operation_id,
         source_asset_id,
+        expected_asset_id,
         request: CheckinRequest {
             status_id: checkin_status_id,
         },
@@ -435,12 +456,55 @@ mod tests {
         assert_eq!(checkout.request.assigned_asset, 20);
         assert_eq!(checkout.request.status_id, 30);
         assert_eq!(checkout.request.checkout_to_type, "asset");
-        let checkin = build_monitor_checkin("checkin-1", 10, 40)?;
+        let checkin = build_monitor_checkin("checkin-1", 10, 20, 40)?;
         assert_eq!(checkin.source_asset_id, 10);
+        assert_eq!(checkin.expected_asset_id, 20);
         assert_eq!(checkin.request.status_id, 40);
         assert!(build_monitor_checkout("", 1, 2, 3).is_err());
-        assert!(build_monitor_checkin("x", 1, 0).is_err());
+        assert!(build_monitor_checkin("x", 1, 2, 0).is_err());
+        assert!(build_monitor_checkin("x", 1, 0, 3).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn assignment_types_are_preserved_and_missing_unknown() -> Result<(), SnipeItError> {
+        for assignment_type in ["asset", "user", "location"] {
+            let body = serde_json::json!({
+                "id": 10,
+                "assigned_to": {"id": 20, "name": "owner", "type": assignment_type},
+            })
+            .to_string();
+            let asset = parse_asset_by_serial(200, &body, None)?;
+            assert_eq!(asset.assigned_to.as_ref().map(|owner| owner.id), Some(20));
+            assert_eq!(
+                asset
+                    .assigned_to
+                    .as_ref()
+                    .and_then(|owner| owner.assignment_type.as_deref()),
+                Some(assignment_type)
+            );
+        }
+        let asset = parse_asset_by_serial(
+            200,
+            r#"{"id":10,"assigned_to":{"id":20,"name":"unknown"}}"#,
+            None,
+        )?;
+        assert!(
+            asset
+                .assigned_to
+                .is_some_and(|owner| owner.id == 20 && owner.assignment_type.is_none())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_checkin_without_expected_owner_is_rejected() {
+        let operation = serde_json::json!({
+            "operation_id": "checkin:10:40",
+            "source_asset_id": 10,
+            "request": {"status_id": 40},
+        });
+        assert!(serde_json::from_value::<MonitorCheckin>(operation).is_err());
     }
 
     #[test]

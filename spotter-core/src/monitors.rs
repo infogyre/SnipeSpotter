@@ -25,6 +25,10 @@ pub struct MonitorSyncEntry {
     pub last_seen: DateTime<Utc>,
     pub absent_since: Option<DateTime<Utc>>,
     pub checked_out: bool,
+    /// The computer asset named by the last confirmed checkout operation.
+    /// Omission preserves the canonical bytes of legacy signed states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_asset_id: Option<u64>,
 }
 
 /// Persisted monitor synchronization state.
@@ -40,6 +44,7 @@ pub enum ForcedCheckinIneligibility {
     Present,
     AlreadyCheckedIn,
     Unmapped,
+    UnknownOwner,
 }
 
 /// Classify whether a monitor can be forcibly checked in.
@@ -55,6 +60,9 @@ pub fn forced_checkin_ineligibility(
     }
     if entry.snipeit_asset_id.is_none_or(|asset_id| asset_id == 0) {
         return Some(ForcedCheckinIneligibility::Unmapped);
+    }
+    if entry.checkout_asset_id.is_none_or(|asset_id| asset_id == 0) {
+        return Some(ForcedCheckinIneligibility::UnknownOwner);
     }
     None
 }
@@ -81,6 +89,7 @@ pub fn apply_forced_checkin_serials(
     for entry in &mut candidate.entries {
         if serials.iter().any(|serial| serial == &entry.serial) {
             entry.checked_out = false;
+            entry.checkout_asset_id = None;
         }
     }
     candidate
@@ -139,6 +148,7 @@ pub fn diff_monitors(
                 last_seen: now,
                 absent_since: None,
                 checked_out: previous_entry.checked_out,
+                checkout_asset_id: previous_entry.checkout_asset_id,
             });
         } else {
             new_monitors.push(monitor.clone());
@@ -148,6 +158,7 @@ pub fn diff_monitors(
                 last_seen: now,
                 absent_since: None,
                 checked_out: false,
+                checkout_asset_id: None,
             });
         }
     }
@@ -240,6 +251,7 @@ mod tests {
             last_seen: at(1),
             absent_since: None,
             checked_out: true,
+            checkout_asset_id: Some(100),
         };
         assert_eq!(
             forced_checkin_ineligibility(&entry),
@@ -261,6 +273,17 @@ mod tests {
         );
 
         entry.snipeit_asset_id = Some(1);
+        entry.checkout_asset_id = None;
+        assert_eq!(
+            forced_checkin_ineligibility(&entry),
+            Some(ForcedCheckinIneligibility::UnknownOwner)
+        );
+        entry.checkout_asset_id = Some(0);
+        assert_eq!(
+            forced_checkin_ineligibility(&entry),
+            Some(ForcedCheckinIneligibility::UnknownOwner)
+        );
+        entry.checkout_asset_id = Some(100);
         assert_eq!(forced_checkin_ineligibility(&entry), None);
     }
 
@@ -274,6 +297,7 @@ mod tests {
                     last_seen: at(1),
                     absent_since: Some(at(1)),
                     checked_out: true,
+                    checkout_asset_id: Some(100),
                 },
                 MonitorSyncEntry {
                     serial: String::from("MON-2"),
@@ -281,6 +305,7 @@ mod tests {
                     last_seen: at(1),
                     absent_since: Some(at(1)),
                     checked_out: true,
+                    checkout_asset_id: Some(100),
                 },
             ],
         };
@@ -288,7 +313,45 @@ mod tests {
         let candidate = apply_forced_checkin_serials(&state, &[String::from("MON-1")]);
 
         assert!(!candidate.entries[0].checked_out);
+        assert_eq!(candidate.entries[0].checkout_asset_id, None);
         assert!(candidate.entries[1].checked_out);
+        assert_eq!(candidate.entries[1].checkout_asset_id, Some(100));
         assert!(state.entries[0].checked_out);
+        assert_eq!(state.entries[0].checkout_asset_id, Some(100));
+    }
+
+    #[test]
+    fn checkout_owner_survives_presence_changes() {
+        let previous = MonitorSyncState {
+            entries: vec![MonitorSyncEntry {
+                serial: String::from("MON-1"),
+                snipeit_asset_id: Some(1),
+                last_seen: at(1),
+                absent_since: None,
+                checked_out: true,
+                checkout_asset_id: Some(100),
+            }],
+        };
+        let absent = diff_monitors(&[], &previous, at(2));
+        assert_eq!(absent.removed_monitors[0].checkout_asset_id, Some(100));
+        assert_eq!(absent.next_state.entries[0].checkout_asset_id, Some(100));
+        let present = diff_monitors(&[monitor("MON-1")], &absent.next_state, at(3));
+        assert_eq!(present.next_state.entries[0].checkout_asset_id, Some(100));
+        assert!(present.next_state.entries[0].absent_since.is_none());
+    }
+
+    #[test]
+    fn legacy_monitor_owner_defaults_to_none_and_is_omitted() -> Result<(), serde_json::Error> {
+        let legacy = serde_json::json!({
+            "serial": "MON-1",
+            "snipeit_asset_id": 1,
+            "last_seen": "2026-01-01T01:00:00Z",
+            "absent_since": null,
+            "checked_out": true,
+        });
+        let entry: MonitorSyncEntry = serde_json::from_value(legacy.clone())?;
+        assert_eq!(entry.checkout_asset_id, None);
+        assert_eq!(serde_json::to_value(entry)?, legacy);
+        Ok(())
     }
 }

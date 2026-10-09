@@ -141,9 +141,21 @@ pub fn plan_sync(
             if !eligible {
                 continue;
             }
+            let Some(expected_asset_id) = entry.checkout_asset_id.filter(|id| *id != 0) else {
+                warnings.push(format!(
+                    "monitor {} has no recorded checkout owner; check-in suppressed",
+                    entry.serial
+                ));
+                continue;
+            };
             if let Some(source_id) = entry.snipeit_asset_id {
                 let operation_id = format!("checkin:{source_id}:{}", statuses.checkin);
-                match build_monitor_checkin(operation_id, source_id, statuses.checkin) {
+                match build_monitor_checkin(
+                    operation_id,
+                    source_id,
+                    expected_asset_id,
+                    statuses.checkin,
+                ) {
                     Ok(operation) => checkins.push(operation),
                     Err(error) => warnings.push(error.to_string()),
                 }
@@ -182,20 +194,27 @@ fn apply_planned_monitor_state(
                 .iter()
                 .find(|resolved| resolved.monitor.serial == entry.serial)
             {
+                if entry.snipeit_asset_id != resolved.asset_id {
+                    // Checkout ownership only proves authority over the exact recorded monitor.
+                    // A new serial match must not inherit another monitor asset's owner.
+                    entry.checkout_asset_id = None;
+                }
                 entry.snipeit_asset_id = resolved.asset_id;
             }
         }
-        if checkouts
+        if let Some(operation) = checkouts
             .iter()
-            .any(|operation| Some(operation.source_asset_id) == entry.snipeit_asset_id)
+            .find(|operation| Some(operation.source_asset_id) == entry.snipeit_asset_id)
         {
             entry.checked_out = true;
+            entry.checkout_asset_id = Some(operation.request.assigned_asset);
         }
         if checkins
             .iter()
             .any(|operation| Some(operation.source_asset_id) == entry.snipeit_asset_id)
         {
             entry.checked_out = false;
+            entry.checkout_asset_id = None;
         }
     }
 }
@@ -253,9 +272,8 @@ fn plan_system_update(
     if asset.serial.as_deref() != Some(system.serial.as_str()) {
         changes.serial = Some(system.serial.clone());
     }
-    if asset.asset_tag.as_deref() != Some(system.asset_tag.as_str()) {
-        changes.asset_tag = Some(system.asset_tag.clone());
-    }
+    // Snipe-IT owns the managed asset tag. Firmware tags are discovery data, not
+    // update authority, even when they are nonempty and appear legitimate.
     if asset.model.as_ref().map(|model| model.id) != Some(model_id) {
         changes.model_id = Some(model_id);
     }
@@ -329,6 +347,90 @@ mod tests {
         }
     }
 
+    const FIRMWARE_ASSET_TAGS: &[&str] = &[
+        "",
+        " \t\r\n",
+        "To Be Filled By O.E.M.",
+        "To Be Filled By OEM",
+        "Default string",
+        "System Asset Tag",
+        "Not Specified",
+        "None",
+        "00000000",
+        "FIRMWARE-123",
+        "MANAGED-456",
+    ];
+
+    #[test]
+    fn firmware_asset_tags_never_create_an_asset_update() {
+        for firmware_tag in FIRMWARE_ASSET_TAGS {
+            for managed_tag in [None, Some(""), Some(" \t "), Some("MANAGED-456")] {
+                let mut system = system(3);
+                system.asset_tag = String::from(*firmware_tag);
+                let asset = Asset {
+                    asset_tag: managed_tag.map(String::from),
+                    ..matching_asset()
+                };
+                let plan = plan_sync(
+                    &system,
+                    &taxonomy(4),
+                    &[],
+                    Some(&asset),
+                    &MonitorSyncState::default(),
+                    &MonitorSettings::default(),
+                    &ResolvedStatusIds {
+                        checkout: 5,
+                        checkin: 6,
+                    },
+                    now(),
+                );
+
+                assert!(
+                    plan.asset_update.is_none(),
+                    "firmware {firmware_tag:?} must not replace managed tag {managed_tag:?}"
+                );
+                assert!(plan.warnings.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn other_asset_updates_serialize_without_firmware_asset_tags() {
+        for firmware_tag in FIRMWARE_ASSET_TAGS {
+            for managed_tag in [None, Some(""), Some(" \t "), Some("MANAGED-456")] {
+                let mut system = system(3);
+                system.asset_tag = String::from(*firmware_tag);
+                let asset = Asset {
+                    asset_tag: managed_tag.map(String::from),
+                    ..asset()
+                };
+                let plan = plan_sync(
+                    &system,
+                    &taxonomy(4),
+                    &[],
+                    Some(&asset),
+                    &MonitorSyncState::default(),
+                    &MonitorSettings::default(),
+                    &ResolvedStatusIds {
+                        checkout: 5,
+                        checkin: 6,
+                    },
+                    now(),
+                );
+
+                let patch = plan.asset_update.expect("serial and model need updates");
+                assert!(patch.asset_tag.is_none());
+                let body = serde_json::to_value(patch).expect("asset patch serializes");
+                assert_eq!(
+                    body,
+                    serde_json::json!({"serial": "SYS", "model_id": 4}),
+                    "firmware {firmware_tag:?} must not replace managed tag {managed_tag:?}"
+                );
+                assert!(plan.warnings.is_empty());
+            }
+        }
+    }
+
     fn monitor(serial: &str) -> MonitorInfo {
         MonitorInfo {
             manufacturer_code: String::from("DEL"),
@@ -356,6 +458,7 @@ mod tests {
                 last_seen: DateTime::<Utc>::UNIX_EPOCH,
                 absent_since: Some(DateTime::<Utc>::UNIX_EPOCH),
                 checked_out: true,
+                checkout_asset_id: Some(100),
             }],
         };
         let plan = plan_sync(
@@ -385,6 +488,10 @@ mod tests {
         );
         assert!(plan.next_monitor_state.entries[0].absent_since.is_none());
         assert!(plan.next_monitor_state.entries[0].checked_out);
+        assert_eq!(
+            plan.next_monitor_state.entries[0].checkout_asset_id,
+            Some(100)
+        );
         assert_eq!(
             plan.warnings,
             vec![String::from(
@@ -431,6 +538,10 @@ mod tests {
             Some(200)
         );
         assert!(plan.next_monitor_state.entries[0].checked_out);
+        assert_eq!(
+            plan.next_monitor_state.entries[0].checkout_asset_id,
+            Some(100)
+        );
     }
 
     #[test]
@@ -442,6 +553,7 @@ mod tests {
                 last_seen: now(),
                 absent_since: None,
                 checked_out: true,
+                checkout_asset_id: Some(100),
             }],
         };
         let plan = plan_sync(
@@ -493,6 +605,7 @@ mod tests {
             Some(200)
         );
         assert!(!plan.next_monitor_state.entries[0].checked_out);
+        assert_eq!(plan.next_monitor_state.entries[0].checkout_asset_id, None);
     }
 
     #[test]
@@ -530,6 +643,7 @@ mod tests {
                 last_seen: now(),
                 absent_since: None,
                 checked_out: true,
+                checkout_asset_id: Some(100),
             }],
         };
         let plan = plan_sync(
@@ -561,6 +675,7 @@ mod tests {
                 last_seen: absent_since,
                 absent_since: Some(absent_since),
                 checked_out: true,
+                checkout_asset_id: Some(100),
             }],
         };
         let policy = MonitorSettings {
@@ -593,6 +708,11 @@ mod tests {
             now(),
         );
         assert_eq!(desktop.monitor_checkins.len(), 1);
+        assert_eq!(desktop.monitor_checkins[0].expected_asset_id, 100);
+        assert_eq!(
+            desktop.next_monitor_state.entries[0].checkout_asset_id,
+            None
+        );
         let above = plan_sync(
             &system(3),
             &taxonomy(3),
@@ -655,5 +775,116 @@ mod tests {
         );
         assert!(plan.asset_update.is_none());
         assert!(!plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn checkin_uses_recorded_owner_instead_of_new_computer_match() {
+        let state = MonitorSyncState {
+            entries: vec![MonitorSyncEntry {
+                serial: String::from("MON"),
+                snipeit_asset_id: Some(200),
+                last_seen: DateTime::<Utc>::UNIX_EPOCH,
+                absent_since: Some(DateTime::<Utc>::UNIX_EPOCH),
+                checked_out: true,
+                checkout_asset_id: Some(50),
+            }],
+        };
+        let plan = plan_sync(
+            &system(3),
+            &taxonomy(4),
+            &[],
+            Some(&matching_asset()),
+            &state,
+            &MonitorSettings {
+                checkin_policy: CheckinPolicy::AutoNonPortable,
+                checkin_threshold_hours: 24,
+            },
+            &ResolvedStatusIds {
+                checkout: 5,
+                checkin: 6,
+            },
+            now(),
+        );
+
+        assert_eq!(plan.monitor_checkins.len(), 1);
+        assert_eq!(plan.monitor_checkins[0].expected_asset_id, 50);
+        assert_eq!(plan.next_monitor_state.entries[0].checkout_asset_id, None);
+        assert!(!plan.next_monitor_state.entries[0].checked_out);
+    }
+
+    #[test]
+    fn checkin_without_recorded_owner_is_suppressed_and_preserves_state() {
+        for checkout_asset_id in [None, Some(0)] {
+            let state = MonitorSyncState {
+                entries: vec![MonitorSyncEntry {
+                    serial: String::from("MON"),
+                    snipeit_asset_id: Some(200),
+                    last_seen: DateTime::<Utc>::UNIX_EPOCH,
+                    absent_since: Some(DateTime::<Utc>::UNIX_EPOCH),
+                    checked_out: true,
+                    checkout_asset_id,
+                }],
+            };
+            let plan = plan_sync(
+                &system(3),
+                &taxonomy(4),
+                &[],
+                Some(&matching_asset()),
+                &state,
+                &MonitorSettings {
+                    checkin_policy: CheckinPolicy::AutoNonPortable,
+                    checkin_threshold_hours: 24,
+                },
+                &ResolvedStatusIds {
+                    checkout: 5,
+                    checkin: 6,
+                },
+                now(),
+            );
+
+            assert!(plan.monitor_checkins.is_empty());
+            assert_eq!(plan.next_monitor_state, state);
+            assert_eq!(
+                plan.warnings,
+                vec![String::from(
+                    "monitor MON has no recorded checkout owner; check-in suppressed"
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn remapping_checked_out_monitor_does_not_transfer_checkout_owner() {
+        let state = MonitorSyncState {
+            entries: vec![MonitorSyncEntry {
+                serial: String::from("MON"),
+                snipeit_asset_id: Some(200),
+                last_seen: now(),
+                absent_since: None,
+                checked_out: true,
+                checkout_asset_id: Some(50),
+            }],
+        };
+        let plan = plan_sync(
+            &system(3),
+            &taxonomy(4),
+            &[resolved_monitor("MON", Some(201))],
+            Some(&matching_asset()),
+            &state,
+            &MonitorSettings::default(),
+            &ResolvedStatusIds {
+                checkout: 5,
+                checkin: 6,
+            },
+            now(),
+        );
+
+        assert!(plan.monitor_checkouts.is_empty());
+        assert_eq!(
+            plan.next_monitor_state.entries[0].snipeit_asset_id,
+            Some(201)
+        );
+        assert!(plan.next_monitor_state.entries[0].checked_out);
+        assert_eq!(plan.next_monitor_state.entries[0].checkout_asset_id, None);
     }
 }
