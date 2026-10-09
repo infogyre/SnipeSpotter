@@ -56,6 +56,7 @@ impl RemoteMutations for crate::snipeit_client::SnipeItClient {
         request: &'a AssetPatchRequest,
     ) -> Pin<Box<dyn Future<Output = Result<Asset>> + Send + 'a>> {
         Box::pin(async move {
+            validate_asset_patch_authority(request)?;
             let current = self.get_asset(asset_id).await?;
             if patch_is_applied(&current, request) {
                 return Ok(current);
@@ -72,8 +73,20 @@ impl RemoteMutations for crate::snipeit_client::SnipeItClient {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
             let current = self.get_asset(operation.source_asset_id).await?;
+            if current.id != operation.source_asset_id {
+                anyhow::bail!("monitor checkout suppressed: remote asset identity mismatch");
+            }
             if checkout_is_applied(&current, operation) {
                 return Ok(());
+            }
+            if current.assigned_to.as_ref().is_some_and(|assigned| {
+                assigned.assignment_type.as_deref() != Some("asset")
+                    || assigned.id != operation.request.assigned_asset
+            }) {
+                anyhow::bail!(
+                    "monitor {} checkout suppressed: ownership is unknown or conflicting; operator reconciliation required",
+                    operation.source_asset_id,
+                );
             }
             self.checkout_asset(operation.source_asset_id, &operation.request)
                 .await
@@ -86,15 +99,50 @@ impl RemoteMutations for crate::snipeit_client::SnipeItClient {
         operation: &'a MonitorCheckin,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
+            validate_checkin_owner(operation)?;
             let current = self.get_asset(operation.source_asset_id).await?;
+            if current.id != operation.source_asset_id {
+                anyhow::bail!("monitor check-in suppressed: remote asset identity mismatch");
+            }
             if checkin_is_applied(&current, operation) {
                 return Ok(());
             }
+            if !current.assigned_to.as_ref().is_some_and(|assigned| {
+                assigned.assignment_type.as_deref() == Some("asset")
+                    && assigned.id == operation.expected_asset_id
+            }) {
+                anyhow::bail!(
+                    "monitor {} check-in suppressed: expected assignment to asset {}; ownership is absent, unknown, or conflicting; operator reconciliation required",
+                    operation.source_asset_id,
+                    operation.expected_asset_id,
+                );
+            }
+            // The API has no verified conditional check-in contract. This fresh ownership
+            // check narrows, but cannot close, the concurrent GET/write race.
             self.checkin_asset(operation.source_asset_id, &operation.request)
                 .await
                 .map_err(anyhow::Error::from)
         })
     }
+}
+
+fn validate_asset_patch_authority(request: &AssetPatchRequest) -> Result<()> {
+    if request.asset_tag.is_some() {
+        anyhow::bail!(
+            "asset-tag PATCH suppressed: Snipe-IT owns managed asset tags; operator reconciliation required for pending legacy updates"
+        );
+    }
+    Ok(())
+}
+
+fn validate_checkin_owner(operation: &MonitorCheckin) -> Result<()> {
+    if operation.expected_asset_id == 0 {
+        anyhow::bail!("monitor check-in suppressed: expected asset owner must be nonzero");
+    }
+    if operation.source_asset_id == 0 || operation.request.status_id == 0 {
+        anyhow::bail!("monitor check-in suppressed: asset and status IDs must be nonzero");
+    }
+    Ok(())
 }
 
 fn patch_is_applied(asset: &Asset, request: &AssetPatchRequest) -> bool {
@@ -116,14 +164,13 @@ fn patch_is_applied(asset: &Asset, request: &AssetPatchRequest) -> bool {
 }
 
 fn checkout_is_applied(asset: &Asset, operation: &MonitorCheckout) -> bool {
-    asset
-        .assigned_to
+    asset.assigned_to.as_ref().is_some_and(|assigned| {
+        assigned.assignment_type.as_deref() == Some("asset")
+            && assigned.id == operation.request.assigned_asset
+    }) && asset
+        .status_label
         .as_ref()
-        .is_some_and(|assigned| assigned.id == operation.request.assigned_asset)
-        && asset
-            .status_label
-            .as_ref()
-            .is_some_and(|status| status.id == operation.request.status_id)
+        .is_some_and(|status| status.id == operation.request.status_id)
 }
 
 fn checkin_is_applied(asset: &Asset, operation: &MonitorCheckin) -> bool {
@@ -301,6 +348,12 @@ async fn execute_plan_inner<R: RemoteMutations + ?Sized>(
 }
 
 fn validate_unique_operation_ids(plan: &SyncPlan, computer_asset_id: Option<u64>) -> Result<()> {
+    if let Some(request) = &plan.asset_update {
+        validate_asset_patch_authority(request)?;
+    }
+    for operation in &plan.monitor_checkins {
+        validate_checkin_owner(operation)?;
+    }
     let mut operation_ids = std::collections::HashSet::new();
     if let (Some(request), Some(asset_id)) = (&plan.asset_update, computer_asset_id) {
         let operation_id = format!("patch:{asset_id}:{}", serialize_operation(request)?);
@@ -363,13 +416,18 @@ fn state_after_operation_with_asset(
     }
 
     for operation in &plan.monitor_checkouts {
-        apply_monitor_transition(&mut state, final_state, operation.source_asset_id, true);
+        apply_monitor_transition(
+            &mut state,
+            final_state,
+            operation.source_asset_id,
+            Some(operation.request.assigned_asset),
+        );
         if operation.operation_id == operation_id {
             return state;
         }
     }
     for operation in &plan.monitor_checkins {
-        apply_monitor_transition(&mut state, final_state, operation.source_asset_id, false);
+        apply_monitor_transition(&mut state, final_state, operation.source_asset_id, None);
         if operation.operation_id == operation_id {
             return state;
         }
@@ -423,7 +481,7 @@ fn apply_monitor_transition(
     state: &mut spotter_core::state::ServiceState,
     final_state: &spotter_core::state::ServiceState,
     asset_id: u64,
-    checked_out: bool,
+    checkout_asset_id: Option<u64>,
 ) {
     let prior_serial = state
         .known_monitors
@@ -454,7 +512,8 @@ fn apply_monitor_transition(
         return;
     };
     let mut entry = final_entry.clone();
-    entry.checked_out = checked_out;
+    entry.checked_out = checkout_asset_id.is_some();
+    entry.checkout_asset_id = checkout_asset_id;
     state.known_monitors.retain(|candidate| {
         candidate.serial != entry.serial && candidate.snipeit_asset_id != Some(asset_id)
     });
@@ -705,6 +764,7 @@ fn apply_legacy_operation_delta(
     if let Some(asset_id) = patch_asset_id(operation_id)? {
         let request: AssetPatchRequest = serde_json::from_value(operation.clone())
             .context("invalid legacy prepared asset patch operation")?;
+        validate_asset_patch_authority(&request)?;
         let Some(asset) = state.matched_asset.as_mut() else {
             anyhow::bail!("legacy patch recovery requires a matched asset: {operation_id}");
         };
@@ -729,16 +789,21 @@ fn apply_legacy_operation_delta(
         if operation.operation_id != operation_id {
             anyhow::bail!("legacy checkout operation ID does not match payload");
         }
-        apply_monitor_delta(state, operation.source_asset_id, true)?;
+        apply_monitor_delta(
+            state,
+            operation.source_asset_id,
+            Some(operation.request.assigned_asset),
+        )?;
         return Ok(());
     }
     if operation_id.starts_with("checkin:") {
         let operation: MonitorCheckin = serde_json::from_value(operation.clone())
-            .context("invalid legacy prepared monitor check-in operation")?;
+            .context("invalid legacy prepared monitor check-in operation: recorded expected owner required; operator reconciliation required")?;
+        validate_checkin_owner(&operation)?;
         if operation.operation_id != operation_id {
             anyhow::bail!("legacy check-in operation ID does not match payload");
         }
-        apply_monitor_delta(state, operation.source_asset_id, false)?;
+        apply_monitor_delta(state, operation.source_asset_id, None)?;
         return Ok(());
     }
     anyhow::bail!("unknown legacy prepared operation kind: {operation_id}")
@@ -747,7 +812,7 @@ fn apply_legacy_operation_delta(
 fn apply_monitor_delta(
     state: &mut spotter_core::state::ServiceState,
     asset_id: u64,
-    checked_out: bool,
+    checkout_asset_id: Option<u64>,
 ) -> Result<()> {
     let Some(entry) = state
         .known_monitors
@@ -756,7 +821,8 @@ fn apply_monitor_delta(
     else {
         anyhow::bail!("legacy monitor recovery found no asset mapping: {asset_id}");
     };
-    entry.checked_out = checked_out;
+    entry.checked_out = checkout_asset_id.is_some();
+    entry.checkout_asset_id = checkout_asset_id;
     Ok(())
 }
 
@@ -789,6 +855,7 @@ fn validate_operation_id_binding(operation_id: &str, operation: &serde_json::Val
     if let Some(asset_id) = patch_asset_id(operation_id)? {
         let request: AssetPatchRequest = serde_json::from_value(operation.clone())
             .context("invalid prepared asset patch operation")?;
+        validate_asset_patch_authority(&request)?;
         let expected = format!("patch:{asset_id}:{}", serialize_operation(&request)?);
         if expected != operation_id {
             anyhow::bail!("prepared patch operation ID does not match payload");
@@ -805,7 +872,8 @@ fn validate_operation_id_binding(operation_id: &str, operation: &serde_json::Val
     }
     if operation_id.starts_with("checkin:") {
         let operation: MonitorCheckin = serde_json::from_value(operation.clone())
-            .context("invalid prepared monitor check-in operation")?;
+            .context("invalid prepared monitor check-in operation: recorded expected owner required; operator reconciliation required")?;
+        validate_checkin_owner(&operation)?;
         if operation.operation_id != operation_id {
             anyhow::bail!("prepared check-in operation ID does not match payload");
         }
@@ -816,8 +884,9 @@ fn validate_operation_id_binding(operation_id: &str, operation: &serde_json::Val
 
 fn validate_legacy_operation(operation_id: &str, operation: &serde_json::Value) -> Result<()> {
     if let Some(asset_id) = patch_asset_id(operation_id)? {
-        serde_json::from_value::<AssetPatchRequest>(operation.clone())
+        let request = serde_json::from_value::<AssetPatchRequest>(operation.clone())
             .context("invalid legacy prepared asset patch operation")?;
+        validate_asset_patch_authority(&request)?;
         if operation.get("operation_id").is_some() {
             anyhow::bail!("ambiguous legacy patch operation payload: {operation_id}");
         }
@@ -836,7 +905,8 @@ fn validate_legacy_operation(operation_id: &str, operation: &serde_json::Value) 
     }
     if operation_id.starts_with("checkin:") {
         let operation: MonitorCheckin = serde_json::from_value(operation.clone())
-            .context("invalid legacy prepared monitor check-in operation")?;
+            .context("invalid legacy prepared monitor check-in operation: recorded expected owner required; operator reconciliation required")?;
+        validate_checkin_owner(&operation)?;
         if operation.operation_id != operation_id {
             anyhow::bail!("legacy check-in operation ID does not match payload");
         }
@@ -916,6 +986,7 @@ async fn replay_one<R: RemoteMutations + ?Sized>(
     if let Some(asset_id) = patch_asset_id(operation_id)? {
         let request: AssetPatchRequest =
             serde_json::from_value(operation).context("invalid prepared asset patch operation")?;
+        validate_asset_patch_authority(&request)?;
         return remote.patch_asset(asset_id, &request).await.map(Some);
     }
     if operation_id.starts_with("checkout:") {
@@ -929,7 +1000,8 @@ async fn replay_one<R: RemoteMutations + ?Sized>(
     }
     if operation_id.starts_with("checkin:") {
         let operation: MonitorCheckin = serde_json::from_value(operation)
-            .context("invalid prepared monitor check-in operation")?;
+            .context("invalid prepared monitor check-in operation: recorded expected owner required; operator reconciliation required")?;
+        validate_checkin_owner(&operation)?;
         if operation.operation_id != operation_id {
             anyhow::bail!("prepared check-in operation ID does not match payload")
         }
@@ -1038,6 +1110,7 @@ mod tests {
         MonitorCheckin {
             operation_id: String::from("checkin:1"),
             source_asset_id: 1,
+            expected_asset_id: 2,
             request: CheckinRequest { status_id: 4 },
         }
     }
@@ -1197,6 +1270,7 @@ mod tests {
             &MonitorCheckin {
                 operation_id: String::from("checkin"),
                 source_asset_id: 1,
+                expected_asset_id: 2,
                 request: CheckinRequest { status_id: 4 },
             }
         ));
@@ -1259,6 +1333,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: true,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -1337,6 +1412,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: false,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -1448,6 +1524,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: false,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -1474,6 +1551,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: false,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -1757,7 +1835,7 @@ mod tests {
             .and(path("/api/v1/hardware/1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": 1,
-                "assigned_to": {"id": 2, "name": "computer"},
+                "assigned_to": {"id": 2, "type": "asset", "name": "computer"},
                 "status_label": {"id": 3, "name": "deployed"}
             })))
             .expect(1)
@@ -1867,7 +1945,8 @@ mod tests {
 
         let checkout = checkout_plan().monitor_checkouts[0].clone();
         let assigned_only = Asset {
-            assigned_to: Some(NamedReference {
+            assigned_to: Some(spotter_core::snipeit::AssignedTo {
+                assignment_type: Some(String::from("asset")),
                 id: 2,
                 name: String::from("computer"),
             }),
@@ -1875,7 +1954,8 @@ mod tests {
         };
         assert!(!checkout_is_applied(&assigned_only, &checkout));
         let checked_out = Asset {
-            assigned_to: Some(NamedReference {
+            assigned_to: Some(spotter_core::snipeit::AssignedTo {
+                assignment_type: Some(String::from("asset")),
                 id: 2,
                 name: String::from("computer"),
             }),
@@ -1928,6 +2008,7 @@ mod tests {
                     last_seen: chrono::DateTime::UNIX_EPOCH,
                     absent_since: None,
                     checked_out: true,
+                    checkout_asset_id: None,
                 },
                 spotter_core::monitors::MonitorSyncEntry {
                     serial: String::from("MON-2"),
@@ -1935,6 +2016,7 @@ mod tests {
                     last_seen: chrono::DateTime::UNIX_EPOCH,
                     absent_since: None,
                     checked_out: true,
+                    checkout_asset_id: None,
                 },
             ],
         };
@@ -1975,6 +2057,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: Some(chrono::DateTime::UNIX_EPOCH),
                 checked_out: false,
+                checkout_asset_id: None,
             }],
         };
         let mut remote = FakeRemote::default();
@@ -2028,6 +2111,7 @@ mod tests {
                     last_seen: chrono::DateTime::UNIX_EPOCH,
                     absent_since: None,
                     checked_out: true,
+                    checkout_asset_id: None,
                 },
                 spotter_core::monitors::MonitorSyncEntry {
                     serial: String::from("MON-2"),
@@ -2035,6 +2119,7 @@ mod tests {
                     last_seen: chrono::DateTime::UNIX_EPOCH,
                     absent_since: None,
                     checked_out: true,
+                    checkout_asset_id: None,
                 },
             ],
         };
@@ -2056,6 +2141,7 @@ mod tests {
                     last_seen: chrono::DateTime::UNIX_EPOCH,
                     absent_since: None,
                     checked_out: false,
+                    checkout_asset_id: None,
                 }],
                 ..spotter_core::state::ServiceState::default()
             },
@@ -2111,6 +2197,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: false,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -2121,6 +2208,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: true,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -2159,6 +2247,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: false,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -2169,6 +2258,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: false,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -2279,6 +2369,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: false,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -2295,6 +2386,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: true,
+                checkout_asset_id: Some(9),
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -2313,11 +2405,7 @@ mod tests {
                     status_id: 3,
                 },
             }],
-            monitor_checkins: vec![MonitorCheckin {
-                operation_id: String::from("checkin:1"),
-                source_asset_id: 1,
-                request: CheckinRequest { status_id: 4 },
-            }],
+            monitor_checkins: vec![checkin_operation()],
             next_monitor_state: MonitorSyncState {
                 entries: final_state.known_monitors.clone(),
             },
@@ -2377,7 +2465,6 @@ mod tests {
         let plan = SyncPlan {
             asset_update: Some(AssetPatchRequest {
                 serial: Some(String::from("PATCHED-SYS")),
-                asset_tag: Some(String::from("PATCHED-TAG")),
                 ..AssetPatchRequest::default()
             }),
             monitor_checkouts: Vec::new(),
@@ -2564,6 +2651,7 @@ mod tests {
                     last_seen: chrono::DateTime::UNIX_EPOCH,
                     absent_since: None,
                     checked_out: false,
+                    checkout_asset_id: None,
                 },
                 spotter_core::monitors::MonitorSyncEntry {
                     serial: String::from("MON-2"),
@@ -2571,6 +2659,7 @@ mod tests {
                     last_seen: chrono::DateTime::UNIX_EPOCH,
                     absent_since: None,
                     checked_out: true,
+                    checkout_asset_id: None,
                 },
             ],
             ..spotter_core::state::ServiceState::default()
@@ -2625,6 +2714,7 @@ mod tests {
                 last_seen: chrono::DateTime::UNIX_EPOCH,
                 absent_since: None,
                 checked_out: true,
+                checkout_asset_id: None,
             }],
             ..spotter_core::state::ServiceState::default()
         };
@@ -2694,3 +2784,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod ownership_tests;

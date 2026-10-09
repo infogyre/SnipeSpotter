@@ -471,6 +471,7 @@ mod tests {
                 last_seen: seen,
                 absent_since: None,
                 checked_out: true,
+                checkout_asset_id: Some(100),
             }],
             ..PersistedServiceState::default()
         };

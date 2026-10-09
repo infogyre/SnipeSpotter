@@ -440,6 +440,7 @@ async fn saved_candidate_survives_journal_commit_failure() -> Result<()> {
                 last_seen: DateTime::UNIX_EPOCH,
                 absent_since: Some(DateTime::UNIX_EPOCH),
                 checked_out: true,
+                checkout_asset_id: Some(100),
             }],
             ..ServiceState::default()
         },
@@ -1229,6 +1230,7 @@ fn append_pending_checkin_with_evidence(
     let operation = spotter_core::snipeit::MonitorCheckin {
         operation_id: String::from(operation_id),
         source_asset_id: 11,
+        expected_asset_id: 100,
         request: spotter_core::snipeit::CheckinRequest { status_id: 2 },
     };
     let operation_json = if with_evidence {
@@ -1275,6 +1277,7 @@ fn single_monitor_state(
             last_seen: DateTime::UNIX_EPOCH,
             absent_since,
             checked_out,
+            checkout_asset_id: checked_out.then_some(100),
         }],
         ..ServiceState::default()
     }
@@ -1329,6 +1332,7 @@ fn monitor_entry(
         last_seen: DateTime::UNIX_EPOCH,
         absent_since,
         checked_out,
+        checkout_asset_id: checked_out.then_some(100),
     }
 }
 
@@ -1533,6 +1537,10 @@ async fn checkin_reports_state_save_failure_and_retains_remote_evidence() -> Res
         serde_json::json!(11)
     );
     assert_eq!(
+        pending[0].operation["operation"]["expected_asset_id"],
+        serde_json::json!(100)
+    );
+    assert_eq!(
         pending[0]
             .remote_outcome
             .as_ref()
@@ -1548,6 +1556,11 @@ async fn checkin_reports_state_save_failure_and_retains_remote_evidence() -> Res
         !candidate_state["known_monitors"][0]["checked_out"]
             .as_bool()
             .unwrap_or(true)
+    );
+    assert!(
+        candidate_state["known_monitors"][0]
+            .get("checkout_asset_id")
+            .is_none()
     );
     Ok(())
 }
@@ -1749,6 +1762,40 @@ async fn checkin_serial_rejects_unmapped_monitor() -> Result<()> {
         matches!(response, IpcResponse::Error { ref message } if message == "monitor MON-1 has no Snipe-IT asset mapping")
     );
     assert_no_remote_or_decrypt_calls(&calls)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forced_checkin_rejects_unknown_owner_before_remote_boundaries() -> Result<()> {
+    for checkout_asset_id in [None, Some(0)] {
+        for command in [
+            ServiceCommand::CheckinAll,
+            ServiceCommand::CheckinSerial {
+                serial: String::from("MON-1"),
+            },
+        ] {
+            let directory = tempfile::tempdir()?;
+            let journal_path = directory.path().join("operations.jsonl");
+            let calls = Arc::new(Mutex::new(BoundaryCalls::default()));
+            let mut state =
+                single_monitor_state("MON-1", Some(11), Some(DateTime::UNIX_EPOCH), true);
+            state.known_monitors[0].checkout_asset_id = checkout_asset_id;
+            let fsm = spawn_owner(
+                4,
+                journal_path.clone(),
+                checkin_settings(),
+                state,
+                rejecting_checkin_ports(Arc::clone(&calls)),
+            )?;
+
+            let response = fsm.request(command).await?;
+            assert!(
+                matches!(response, IpcResponse::Error { ref message } if message == "monitor MON-1 has no recorded checkout owner")
+            );
+            assert_no_remote_or_decrypt_calls(&calls)?;
+            assert!(spotter_svc::operation_journal::load(&journal_path)?.is_empty());
+        }
+    }
     Ok(())
 }
 

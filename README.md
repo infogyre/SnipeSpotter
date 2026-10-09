@@ -15,6 +15,8 @@ SnipeSpotter synchronizes Windows system and monitor inventory with an existing 
 
 - **Signed state**: Service state is HMAC-SHA256 signed with constant-time verification to detect tampering.
 - **WiX 6 MSI installer**: Installs binaries and CycloneDX SBOMs; registers the service as automatic LocalSystem without starting it; adds `bin\` to system PATH; creates ProgramData with restricted ACLs. PDB debug symbols are not installed; they ship only in the separately published public symbols ZIP.
+- **Managed asset-tag preservation**: Firmware tags never overwrite Snipe-IT asset tags; pending legacy tag-changing updates require operator reconciliation.
+- **Owner-bound monitor check-in**: Automatic, forced, and recovered check-ins require the recorded checkout owner and a fresh matching typed remote assignment.
 - **Configurable monitor check-in**: `Manual` policy never auto-checks in; `AutoNonPortable` checks in absent monitors on non-portable chassis after a configurable threshold.
 
 ## Workspace
@@ -68,6 +70,8 @@ SnipeSpotter does not create Snipe-IT assets, manufacturers, categories, or mode
 - [Architecture](docs/architecture.md) -- crate layout, FCIS boundaries, FSM states, sync flow, security model
 - [Operator guide](docs/operator-guide.md) -- installation, configuration, CLI reference, troubleshooting, recovery
 - [CI and release guide](docs/ci-guide.md) -- CI topology, release process, manual MSI build, lifecycle validation
+- [Monitor check-in ownership](docs/monitor-checkin-ownership.md) -- owner binding, upgrade behavior, and residual concurrency limits
+- [Asset-tag authority](docs/asset-tag-authority.md) -- managed-tag preservation and legacy journal handling
 - [Hardware report template](docs/hardware-report-template.md) -- diagnostic report format and evidence limits
 
 Validation has separate boundaries: the installed product lifecycle is validated by the elevated MSI/SCM checks, while hosted hardware observations are diagnostic evidence only. The Windows checks already run the hosted-hardware integration tests; a manual experiment does not establish physical-hardware coverage or a release gate. See the [architecture](docs/architecture.md), [operator guide](docs/operator-guide.md), and [CI and release guide](docs/ci-guide.md) for the implemented contracts.

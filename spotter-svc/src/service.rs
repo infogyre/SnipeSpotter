@@ -296,8 +296,18 @@ impl CommandOwner {
                 Some(spotter_core::monitors::ForcedCheckinIneligibility::Unmapped) => {
                     anyhow::bail!("monitor {serial} has no Snipe-IT asset mapping")
                 }
+                Some(spotter_core::monitors::ForcedCheckinIneligibility::UnknownOwner) => {
+                    anyhow::bail!("monitor {serial} has no recorded checkout owner")
+                }
                 None => {}
             }
+        }
+        if let Some(entry) = self.persisted_state.known_monitors.iter().find(|entry| {
+            requested_serial.is_none_or(|serial| serial == entry.serial)
+                && spotter_core::monitors::forced_checkin_ineligibility(entry)
+                    == Some(spotter_core::monitors::ForcedCheckinIneligibility::UnknownOwner)
+        }) {
+            anyhow::bail!("monitor {} has no recorded checkout owner", entry.serial)
         }
         let token = self
             .secret_protector
@@ -320,10 +330,18 @@ impl CommandOwner {
             if entry.absent_since.is_none() || !entry.checked_out {
                 continue;
             }
+            let expected_asset_id =
+                entry
+                    .checkout_asset_id
+                    .filter(|id| *id != 0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("monitor {} has no recorded checkout owner", entry.serial)
+                    })?;
             let operation_id = format!("checkin:{asset_id}:{}", decrypted.checkin_status_id);
             operations.push(spotter_core::snipeit::build_monitor_checkin(
                 operation_id,
                 asset_id,
+                expected_asset_id,
                 decrypted.checkin_status_id,
             )?);
             checked_in.push(spotter_core::ipc::CheckinEntry {
@@ -1445,6 +1463,7 @@ mod tests {
         let operation = MonitorCheckin {
             operation_id: operation_id.clone(),
             source_asset_id: 7,
+            expected_asset_id: 100,
             request: CheckinRequest { status_id: 2 },
         };
         crate::operation_journal::append(
@@ -1544,6 +1563,7 @@ mod tests {
                     last_seen: seen,
                     absent_since: None,
                     checked_out: true,
+                    checkout_asset_id: Some(100),
                 }],
                 ..PersistedServiceState::default()
             },

@@ -240,4 +240,30 @@ mod tests {
             assert!(state.hmac.is_empty());
         }
     }
+
+    #[test]
+    fn legacy_monitor_state_keeps_signature() -> Result<(), Box<dyn std::error::Error>> {
+        let canonical = concat!(
+            "{\"known_monitors\":[{\"serial\":\"MON-1\",\"snipeit_asset_id\":1,",
+            "\"last_seen\":\"2026-01-01T01:00:00Z\",\"absent_since\":null,",
+            "\"checked_out\":true}]}"
+        );
+        let mut state: ServiceState = serde_json::from_str(canonical)?;
+        state.hmac =
+            String::from("56e8a8a71871207ddf790710b97aa3b989ab6aa3ee6485f7e391063f9472eccf");
+
+        assert_eq!(state.known_monitors[0].checkout_asset_id, None);
+        assert_eq!(state.canonical_bytes()?, canonical.as_bytes());
+        assert!(state.verify(b"legacy-key")?);
+        let encoded = serde_json::to_string(&state)?;
+        assert!(!encoded.contains("checkout_asset_id"));
+
+        state.known_monitors[0].checkout_asset_id = Some(100);
+        assert!(!state.verify(b"legacy-key")?);
+        state.sign(b"legacy-key")?;
+        let persisted: ServiceState = serde_json::from_str(&serde_json::to_string(&state)?)?;
+        assert_eq!(persisted.known_monitors[0].checkout_asset_id, Some(100));
+        assert!(persisted.verify(b"legacy-key")?);
+        Ok(())
+    }
 }
